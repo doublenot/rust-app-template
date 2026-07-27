@@ -228,7 +228,7 @@ Key crates: `tray-icon`, `muda`, `tao`, `rfd` (dialogs), `axum`, `tokio`,
 ## Testing
 
 - Config parsing/validation: good + every invalid case above.
-- Chrome detection: injectable lookup trait with fake paths/registry.
+- Chrome detection: injected existence-check closure with fake paths.
 - Health-check polling: against a throwaway local HTTP server (success, slow-start,
   timeout).
 - Settings round-trip: schema → rendered form model → POST → `settings.json` →
