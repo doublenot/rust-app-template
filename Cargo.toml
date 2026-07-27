@@ -11,6 +11,7 @@ anyhow = "1"
 axum = "0.8"
 dirs = "6"
 fd-lock = "4"
+image = { version = "0.25", default-features = false, features = ["png"] }
 open = "5"
 rand = "0.9"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
