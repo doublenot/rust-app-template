@@ -86,6 +86,12 @@ companion process before showing the app.
 | `height` | integer | `800` | Initial Chrome app-mode window height, in pixels. |
 | `on_close` | string: `"quit"` \| `"tray"` | `"quit"` | What happens when the main app window is closed. `"quit"` exits the whole host (and any supervised server). `"tray"` keeps the host and tray icon running in the background; the app can be reopened from the tray menu without paying the `[server]` startup cost again. Any other string is rejected at load time. |
 
+Window close is observed indirectly, as the exit of the Chrome *process* the
+host owns — so under `on_close = "quit"` the host quits only when the **last**
+window of that Chrome instance closes: if a Settings window (or any other
+extra window on the same profile) is still open, closing the app window alone
+does not exit the app.
+
 ### `[menu]`
 
 | key | type | default | behavior |
@@ -100,7 +106,7 @@ on the settings page.
 
 | key | type | behavior |
 |---|---|---|
-| `key` | string | Field identifier. Must match `[A-Za-z0-9_]+` and be unique across all fields — anything else fails validation. Also used to build the field's environment-variable name (see §5). |
+| `key` | string | Field identifier. Must match `[A-Za-z0-9_]+` and be unique across all fields *ignoring case* (`theme` and `Theme` collide, because both become `APP_SETTING_THEME`) — anything else fails validation. Also used to build the field's environment-variable name (see §5). |
 | `label` | string | Human-readable label shown on the settings page. |
 | `type` | string: `"text"` \| `"boolean"` \| `"select"` | Controls both the rendered input and the constraints on `default`/`options` below. |
 | `default` | string, bool, or (for `select`) string | Default value used until the user saves a settings change. Type must match `type`: `text` requires a string default, `boolean` requires a `true`/`false` default, `select` requires a string default. |
@@ -128,10 +134,12 @@ If `[server]` is configured, the host:
    previous `.old`) and a fresh empty log is started.
 4. Polls `health_check_url` every 500ms (2s per-request timeout) until it
    returns an HTTP status below 400, or `startup_timeout_secs` elapses
-   (default 60s) — whichever comes first. Chrome is not shown until this
-   check succeeds; while waiting, the host serves its own `/loading` page.
-   If the timeout is hit, the host shows an error page linking to
-   `server.log` instead of opening the target URL.
+   (default 60s) — whichever comes first. Chrome opens immediately on the
+   host's own `/loading` page; that page polls `/api/status` and only
+   redirects to the target URL once the health check succeeds. If the
+   timeout is hit, the loading page flips to an error view linking to
+   `server.log`, with a Retry button; the server child is left running until
+   you retry (which restarts it) or quit from the tray.
 
 The host's own log (its own diagnostics, not the child server's) is
 written to `<data-dir>/logs/host.log` under the same rotation rule.
@@ -152,7 +160,12 @@ supervised `[server]` process in place — it saves the new values to
 `[server]` (and the `APP_SETTING_*` variables it receives) picks them up.
 Mutating settings endpoints on the internal server additionally require the
 `x-host-token` header to match a random token generated fresh for each
-launch, so nothing outside this host process instance can drive it.
+launch. That stops other *web pages* the user has open from driving the
+host: the token is only embedded in pages the host itself serves, and the
+browser's same-origin policy keeps other origins from reading it. It is not
+an isolation boundary against other local processes — anything running as
+the same user can fetch the unauthenticated `/loading` or `/settings` page
+and read the token out of it.
 
 ## 6. Data locations
 
@@ -204,6 +217,7 @@ are a per-app TODO:
 ## 8. Releasing
 
 Pushing a tag matching `v*` (e.g. `v1.0.0`) triggers the GitHub Actions
-release workflow (see Task 10), which runs `cargo packager --release` on
+release workflow (`.github/workflows/release.yml`), which runs
+`cargo build --release --locked` followed by `cargo packager --release` on
 each supported OS runner and attaches the resulting installers to the
 GitHub release for that tag.

@@ -107,7 +107,8 @@ Validation rules:
 - `identifier` must be non-empty reverse-domain form.
 - If `[server]` is present, `command` (non-empty) and `health_check_url` are required.
 - If `menu.settings = true`, at least one `[[settings.fields]]` entry is required.
-- `settings.fields[].key` must be unique, `[A-Za-z0-9_]+`.
+- `settings.fields[].key` must be `[A-Za-z0-9_]+` and unique ignoring case
+  (keys are uppercased into `APP_SETTING_<KEY>`).
 - `on_close` must be `"quit"` or `"tray"`.
 
 Path resolution for `server.cwd`: absolute paths used as-is; relative paths
@@ -143,8 +144,8 @@ Launch flags:
 --window-size=<width>,<height>
 ```
 
-Detection is behind a small trait so tests can inject fake filesystem/registry
-lookups.
+Detection takes an injected existence-check closure so tests can supply fake
+filesystem/registry lookups.
 
 ## Internal server routes
 
@@ -155,7 +156,7 @@ lookups.
 | `GET /settings` | Auto-generated settings form from the schema (only when enabled). |
 | `POST /api/settings` | Validates against schema, writes `settings.json`, responds with "restart to apply" state. |
 | `POST /api/restart` | Restarts children (Chrome + server) to apply settings. |
-| `GET /api/status` | `{ state: "starting" \| "ready" \| "error", target_url, error?, log_path? }` |
+| `GET /api/status` | `{ state: "starting" \| "ready" \| "error", target_url, message?, log_path? }` |
 
 The internal server binds `127.0.0.1` only. Mutating endpoints require a per-launch
 random token (embedded in the pages the host serves) so other local processes
@@ -180,7 +181,7 @@ can't drive them.
 | Chrome not installed | Dialog → [Download Chrome] opens download page in default browser → exit |
 | Invalid embedded config | Dialog with validation error → exit |
 | Server command fails to spawn | Dialog with error + log path → exit |
-| Health check timeout | Loading page flips to error view with [Retry] + log path; server child killed |
+| Health check timeout | Loading page flips to error view with [Retry] + log path; the server child is left running until the user retries (which restarts the children) or quits from the tray |
 | Server crashes mid-session | Dialog: "local server stopped unexpectedly" → [Restart] / [Quit] |
 | Chrome window closed | Per `on_close`: quit (default) or keep running in tray with "Open <App>" |
 | Second app launch | Dialog: "already running" → exit (lock file in app-data dir) |
@@ -206,20 +207,20 @@ rust-app-template/
 ├── icons/                    # source icons for installers
 ├── .github/workflows/
 │   ├── ci.yml                # fmt + clippy + test on 3-OS matrix
-│   └── release.yml           # tag push → cargo-packager → MSI/NSIS, DMG, deb/AppImage
+│   └── release.yml           # tag push → cargo-packager → NSIS, DMG, deb/AppImage
 ├── README.md                 # clone → edit app.toml → build walkthrough
 └── LICENSE
 ```
 
 Key crates: `tray-icon`, `muda`, `tao`, `rfd` (dialogs), `axum`, `tokio`,
-`serde`/`toml`, `reqwest` (health poll), `directories` (app-data paths),
+`serde`/`toml`, `reqwest` (health poll), `dirs` (app-data paths),
 `cargo-packager` (packaging tool, not a dependency).
 
 ## Packaging & CI
 
 - `cargo run` on a fresh clone: placeholder page in a Chrome app window, working tray.
 - `ci.yml`: rustfmt, clippy (deny warnings), tests on ubuntu/macos/windows runners.
-- `release.yml`: on tag push, build with `cargo-packager` → MSI/NSIS (Windows),
+- `release.yml`: on tag push, build with `cargo-packager` → NSIS (Windows),
   DMG/.app (macOS), deb/AppImage (Linux); upload as GitHub release artifacts.
 - Code signing & notarization: out of scope; documented as per-app TODOs in README.
 - Linux runtime dependency: `libayatana-appindicator` for the tray (documented).
