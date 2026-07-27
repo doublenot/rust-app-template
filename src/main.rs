@@ -2,6 +2,8 @@
 
 #[allow(dead_code)]
 mod config;
+#[allow(dead_code)]
+mod settings;
 
 fn main() {
     println!("chrome-host-app scaffold");
