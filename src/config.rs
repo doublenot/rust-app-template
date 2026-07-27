@@ -180,8 +180,17 @@ impl AppConfig {
                 {
                     return Err(format!("settings key {:?} must match [A-Za-z0-9_]+", f.key));
                 }
-                if !seen.insert(&f.key) {
-                    return Err(format!("duplicate settings key {:?}", f.key));
+                // Compared case-insensitively: `settings::env_vars` projects
+                // every key to `APP_SETTING_<KEY>` by uppercasing it, so
+                // "theme" and "Theme" would collide into one env var whose
+                // value depends on map iteration order.
+                if !seen.insert(f.key.to_uppercase()) {
+                    return Err(format!(
+                        "settings key {:?} collides with another key (settings keys must be \
+                         unique ignoring case, because each is exported as APP_SETTING_{})",
+                        f.key,
+                        f.key.to_uppercase()
+                    ));
                 }
                 match f.field_type {
                     FieldType::Select => {
@@ -347,6 +356,23 @@ mod tests {
         let c = AppConfig::from_str(&s).unwrap();
         assert!(c.settings_enabled());
         assert_eq!(c.settings.unwrap().fields[0].field_type, FieldType::Select);
+    }
+
+    #[test]
+    fn settings_keys_collide_case_insensitively() {
+        // "theme" and "Theme" both project to APP_SETTING_THEME, so they must
+        // be rejected even though they differ as raw strings.
+        let base = format!("{}[menu]\nsettings = true\n", minimal());
+        let s = format!(
+            "{base}[[settings.fields]]\nkey = \"theme\"\nlabel = \"A\"\ntype = \"text\"\ndefault = \"\"\n[[settings.fields]]\nkey = \"Theme\"\nlabel = \"B\"\ntype = \"text\"\ndefault = \"\"\n"
+        );
+        let err = AppConfig::from_str(&s).unwrap_err();
+        assert!(err.contains("APP_SETTING_THEME"), "unexpected error: {err}");
+        // differing keys that do not collide are still accepted
+        let ok = format!(
+            "{base}[[settings.fields]]\nkey = \"theme\"\nlabel = \"A\"\ntype = \"text\"\ndefault = \"\"\n[[settings.fields]]\nkey = \"Theme_2\"\nlabel = \"B\"\ntype = \"text\"\ndefault = \"\"\n"
+        );
+        assert!(AppConfig::from_str(&ok).is_ok());
     }
 
     #[test]
