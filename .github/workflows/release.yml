@@ -30,6 +30,8 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Install cargo-packager
         run: cargo install cargo-packager --locked
+      - name: Build release binary
+        run: cargo build --release --locked
       - name: Package
         run: cargo packager --release --formats ${{ matrix.formats }} --verbose
       - name: Upload to release
