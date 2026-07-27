@@ -1,0 +1,42 @@
+name: Release
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  package:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            formats: deb,appimage
+          - os: macos-latest
+            formats: dmg
+          - os: windows-latest
+            formats: nsis
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Linux system deps
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libgtk-3-dev libayatana-appindicator3-dev libxdo-dev
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install cargo-packager
+        run: cargo install cargo-packager --locked
+      - name: Package
+        run: cargo packager --release --formats ${{ matrix.formats }} --verbose
+      - name: Upload to release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            target/release/*.deb
+            target/release/*.AppImage
+            target/release/*.dmg
+            target/release/*-setup.exe
