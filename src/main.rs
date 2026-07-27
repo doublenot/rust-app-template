@@ -40,7 +40,17 @@ struct App {
     port: u16,
     status: Arc<RwLock<AppStatus>>,
     children: Arc<Mutex<Children>>,
-    generation: Arc<AtomicU64>,
+    /// Bumped whenever the Chrome child is killed on purpose, so its watcher
+    /// (and any exit event already in flight) is recognized as intentional.
+    /// Kept separate from `server_generation` because tray "Open" replaces
+    /// only the Chrome child: bumping a shared counter there would also
+    /// retire the still-valid server watcher and make the in-flight
+    /// `wait_healthy` task discard its result, stranding the status at
+    /// `Starting`.
+    chrome_generation: Arc<AtomicU64>,
+    /// Bumped whenever the server child is killed on purpose. Guards the
+    /// server watcher and the `wait_healthy` status write.
+    server_generation: Arc<AtomicU64>,
     host_log: std::fs::File,
     rt: tokio::runtime::Handle,
     proxy: tao::event_loop::EventLoopProxy<UserEvent>,
@@ -97,8 +107,12 @@ impl App {
         }
     }
 
-    fn current_generation(&self) -> u64 {
-        self.generation.load(Ordering::SeqCst)
+    fn chrome_generation(&self) -> u64 {
+        self.chrome_generation.load(Ordering::SeqCst)
+    }
+
+    fn server_generation(&self) -> u64 {
+        self.server_generation.load(Ordering::SeqCst)
     }
 
     /// Build (first call) or rebuild (later calls) the tray menu so it always
@@ -154,7 +168,7 @@ impl App {
     fn spawn_chrome_watcher(&self, generation: u64) {
         let children = self.children.clone();
         let proxy = self.proxy.clone();
-        let gen_counter = self.generation.clone();
+        let gen_counter = self.chrome_generation.clone();
         self.rt.spawn(async move {
             loop {
                 tokio::time::sleep(Duration::from_millis(300)).await;
@@ -183,7 +197,7 @@ impl App {
     fn spawn_server_watcher(&self, generation: u64) {
         let children = self.children.clone();
         let proxy = self.proxy.clone();
-        let gen_counter = self.generation.clone();
+        let gen_counter = self.server_generation.clone();
         self.rt.spawn(async move {
             loop {
                 tokio::time::sleep(Duration::from_millis(300)).await;
@@ -210,7 +224,8 @@ impl App {
 
     /// Spawn server (if configured) + Chrome; watch both for exit.
     fn start_children(&mut self) {
-        let generation = self.current_generation();
+        let chrome_gen = self.chrome_generation();
+        let server_gen = self.server_generation();
 
         if let Some(server_cfg) = self.cfg.server.clone() {
             self.rt.block_on(async {
@@ -242,10 +257,10 @@ impl App {
                     let health_url = server_cfg.health_check_url.clone();
                     let timeout = Duration::from_secs(server_cfg.startup_timeout_secs);
                     let log_display = log_path.display().to_string();
-                    let gen_counter = self.generation.clone();
+                    let gen_counter = self.server_generation.clone();
                     self.rt.spawn(async move {
                         let result = supervisor::wait_healthy(&health_url, timeout).await;
-                        if gen_counter.load(Ordering::SeqCst) != generation {
+                        if gen_counter.load(Ordering::SeqCst) != server_gen {
                             // A restart happened while we were polling; this
                             // server generation is gone — don't clobber the
                             // status of whatever generation replaced it.
@@ -266,7 +281,7 @@ impl App {
                     self.rt.block_on(async {
                         self.children.lock().await.server = Some(handle);
                     });
-                    self.spawn_server_watcher(generation);
+                    self.spawn_server_watcher(server_gen);
                 }
                 Err(e) => {
                     dialog(
@@ -302,7 +317,7 @@ impl App {
                 self.rt.block_on(async {
                     self.children.lock().await.chrome = Some(child);
                 });
-                self.spawn_chrome_watcher(generation);
+                self.spawn_chrome_watcher(chrome_gen);
             }
             Err(e) => {
                 dialog(
@@ -320,8 +335,9 @@ impl App {
     }
 
     fn kill_children(&mut self) {
-        // bump generation so watchers' exit events are recognized as intentional
-        self.generation.fetch_add(1, Ordering::SeqCst);
+        // bump generations so watchers' exit events are recognized as intentional
+        self.chrome_generation.fetch_add(1, Ordering::SeqCst);
+        self.server_generation.fetch_add(1, Ordering::SeqCst);
         self.rt.block_on(async {
             let mut guard = self.children.lock().await;
             if let Some(mut chrome) = guard.chrome.take() {
@@ -349,17 +365,29 @@ impl App {
 
     /// Relaunch only Chrome, pointing at the current target — used by tray
     /// "Open" when the host is in tray mode (server, if any, is still
-    /// running). No-ops if a Chrome child is already owned: displacing it
-    /// here would drop (and kill_on_drop) a window the user is still using.
+    /// running).
+    ///
+    /// In tray mode the only Chrome child we can own is a secondary window we
+    /// launched ourselves (tray "Settings…" with no main window open), never
+    /// the app window the user is working in — the host reaches tray mode
+    /// precisely because that window closed. So "Open" *replaces* any owned
+    /// child with the app window rather than no-opping, which would otherwise
+    /// leave the user with a settings window and no way back to the app.
+    /// The replaced child is killed intentionally: the Chrome generation is
+    /// bumped first, so its watcher retires and any exit event already in
+    /// flight is discarded instead of being reported as a user close. Only
+    /// the Chrome generation moves — the server child keeps running, watched,
+    /// under its own untouched generation.
+    ///
+    /// Clears `in_tray_mode` only if Chrome actually launched; the caller
+    /// refreshes the menu from that flag afterwards.
     fn restart_chrome_only(&mut self) {
-        let already_running = self
-            .rt
-            .block_on(async { self.children.lock().await.chrome.is_some() });
-        if already_running {
-            self.log("open: ignored, a chrome window is already owned");
-            return;
-        }
-        let generation = self.current_generation();
+        let generation = self.chrome_generation.fetch_add(1, Ordering::SeqCst) + 1;
+        self.rt.block_on(async {
+            if let Some(mut chrome) = self.children.lock().await.chrome.take() {
+                let _ = chrome.start_kill();
+            }
+        });
         let url = self.rt.block_on(async {
             match &*self.status.read().await {
                 AppStatus::Ready { target_url } => target_url.clone(),
@@ -382,7 +410,10 @@ impl App {
                     self.children.lock().await.chrome = Some(child);
                 });
                 self.spawn_chrome_watcher(generation);
+                self.in_tray_mode = false;
             }
+            // Stay in tray mode on failure: there is still no app window, so
+            // the menu must keep offering "Open" for another try.
             Err(e) => self.log(&format!("chrome: relaunch failed: {e}")),
         }
     }
@@ -395,6 +426,13 @@ impl App {
     /// process holding the profile dir. Branch on ownership instead: launch
     /// (and track) a Chrome instance when none is owned, hand off to the
     /// existing one otherwise.
+    ///
+    /// The launched window is a *secondary* window (settings), sized like the
+    /// one `open_extra_window` would have produced — it is emphatically not
+    /// the app's main window, so `in_tray_mode` stays `true` and the tray
+    /// keeps its "Open <app>" entry. Otherwise the settings window would
+    /// claim the slot of the main window and the user would have no way left
+    /// to get the app back.
     fn open_settings(&mut self) {
         let url = format!("http://127.0.0.1:{}/settings", self.port);
         let already_running = self
@@ -408,15 +446,15 @@ impl App {
             }
             return;
         }
-        let generation = self.current_generation();
+        let generation = self.chrome_generation();
         let launch_result = {
             let _guard = self.rt.enter();
             chrome::launch(
                 &self.chrome_exe,
                 &url,
                 &self.paths.chrome_profile,
-                self.cfg.window.width,
-                self.cfg.window.height,
+                chrome::EXTRA_WINDOW_SIZE.0,
+                chrome::EXTRA_WINDOW_SIZE.1,
             )
         };
         match launch_result {
@@ -425,7 +463,6 @@ impl App {
                     self.children.lock().await.chrome = Some(child);
                 });
                 self.spawn_chrome_watcher(generation);
-                self.in_tray_mode = false;
             }
             Err(e) => self.log(&format!("settings: failed to launch chrome: {e}")),
         }
@@ -557,7 +594,8 @@ fn run(
             chrome: None,
             server: None,
         })),
-        generation: Arc::new(AtomicU64::new(1)),
+        chrome_generation: Arc::new(AtomicU64::new(1)),
+        server_generation: Arc::new(AtomicU64::new(1)),
         host_log,
         rt: rt.handle().clone(),
         proxy,
@@ -587,17 +625,22 @@ fn run(
                         app.refresh_tray(&mut tray_handle, app.in_tray_mode);
                     }
                     // "Open" only makes sense (and is only advertised in the
-                    // menu) while in tray mode; a stray/duplicate event must
-                    // not be allowed to relaunch Chrome and potentially
-                    // displace an already-owned window.
+                    // menu) while in tray mode. The guard is what keeps
+                    // `restart_chrome_only`'s replace-the-owned-child
+                    // behavior safe: outside tray mode the owned child is the
+                    // user's app window, and a stray/duplicate event must not
+                    // kill and relaunch it underneath them.
                     Some(tray::TrayAction::Open) if app.in_tray_mode => {
-                        app.in_tray_mode = false;
                         app.restart_chrome_only();
                         app.refresh_tray(&mut tray_handle, app.in_tray_mode);
                     }
                     Some(tray::TrayAction::Open) => {
                         app.log("tray: ignored Open action while not in tray mode");
                     }
+                    // Settings never changes tray mode — a settings window is
+                    // not the app window — so the menu keeps its "Open" entry
+                    // when we were in tray mode. Refreshed anyway so the menu
+                    // is always rebuilt from the (unchanged) source of truth.
                     Some(tray::TrayAction::Settings) => {
                         app.open_settings();
                         app.refresh_tray(&mut tray_handle, app.in_tray_mode);
@@ -613,7 +656,7 @@ fn run(
                 app.refresh_tray(&mut tray_handle, app.in_tray_mode);
             }
             Event::UserEvent(UserEvent::ChromeExited { generation }) => {
-                if generation != app.current_generation() {
+                if generation != app.chrome_generation() {
                     return; // intentional kill
                 }
                 app.log("chrome: window closed by user");
@@ -626,7 +669,7 @@ fn run(
                 }
             }
             Event::UserEvent(UserEvent::ServerExited { generation }) => {
-                if generation != app.current_generation() {
+                if generation != app.server_generation() {
                     return; // intentional kill
                 }
                 app.log("server: exited unexpectedly");

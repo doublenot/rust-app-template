@@ -3,6 +3,13 @@ use std::path::{Path, PathBuf};
 
 pub const DOWNLOAD_URL: &str = "https://www.google.com/chrome/";
 
+/// Size of a secondary window (settings, etc.), used both by
+/// `open_extra_window` and by the host when it has to *launch* Chrome for a
+/// secondary window because no instance is owned yet (tray mode). Keeping the
+/// two paths on one constant means a settings window looks the same however
+/// it was opened.
+pub const EXTRA_WINDOW_SIZE: (u32, u32) = (700, 560);
+
 #[cfg(target_os = "windows")]
 pub fn candidates() -> Vec<PathBuf> {
     use winreg::enums::{HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE};
@@ -86,7 +93,12 @@ pub fn open_extra_window(exe: &Path, url: &str, profile_dir: &Path) -> std::io::
     // Same profile dir → this process hands the URL to the Chrome instance we
     // already own and exits on its own; never kill_on_drop it.
     std::process::Command::new(exe)
-        .args(launch_args(url, profile_dir, 700, 560))
+        .args(launch_args(
+            url,
+            profile_dir,
+            EXTRA_WINDOW_SIZE.0,
+            EXTRA_WINDOW_SIZE.1,
+        ))
         .spawn()
         .map(drop)
 }
@@ -130,6 +142,25 @@ mod tests {
         assert!(args.contains(&"--no-first-run".to_string()));
         assert!(args.contains(&"--no-default-browser-check".to_string()));
         assert!(args.contains(&"--window-size=1280,900".to_string()));
+    }
+
+    /// The host launches a *tracked* Chrome for a secondary window when it
+    /// owns no instance yet (tray "Settings…" with no app window open). That
+    /// path goes through `launch` + `EXTRA_WINDOW_SIZE` rather than
+    /// `open_extra_window`, so both must produce the same geometry.
+    #[test]
+    fn extra_window_size_is_shared_by_both_secondary_window_paths() {
+        let args = launch_args(
+            "http://127.0.0.1:9/settings",
+            Path::new("/data/profile"),
+            EXTRA_WINDOW_SIZE.0,
+            EXTRA_WINDOW_SIZE.1,
+        );
+        let args: Vec<String> = args
+            .iter()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        assert!(args.contains(&"--window-size=700,560".to_string()));
     }
 
     #[test]
