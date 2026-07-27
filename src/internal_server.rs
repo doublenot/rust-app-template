@@ -331,6 +331,21 @@ options = ["light", "dark"]
     }
 
     #[tokio::test]
+    async fn settings_post_404_with_valid_token_but_no_schema() {
+        // A valid token gets past the auth gate; the missing schema is what
+        // decides the response.
+        let (_state, port, _rx) = spawn_state(false).await;
+        let r = reqwest::Client::new()
+            .post(format!("http://127.0.0.1:{port}/api/settings"))
+            .header("x-host-token", "tok123")
+            .json(&json!({"theme": "dark"}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 404);
+    }
+
+    #[tokio::test]
     async fn restart_endpoint_sends_event() {
         let (_state, port, mut rx) = spawn_state(false).await;
         let client = reqwest::Client::new();
