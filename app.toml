@@ -1,0 +1,31 @@
+# ── Chrome Host App configuration ─────────────────────────────
+# Edit this file, then `cargo build`. Full reference in README.md.
+
+[app]
+name = "Chrome Host App"                # window title, tray tooltip
+identifier = "com.example.chromehost"   # reverse-domain; names the app-data dir
+url = ""                                # target URL; empty → built-in placeholder page
+
+# Uncomment to start a local server before showing the app.
+# [server]
+# command = ["node", "server.js"]       # argv array, no shell
+# cwd = "server"                        # relative: exe dir (release) / repo root (debug)
+# env = { PORT = "8080" }
+# health_check_url = "http://127.0.0.1:8080/"
+# startup_timeout_secs = 60
+
+[window]
+width = 1200
+height = 800
+on_close = "quit"                       # "quit" | "tray"
+
+[menu]
+settings = false                        # true requires [[settings.fields]] below
+items = []                              # e.g. [{ id = "docs", label = "Docs", open_url = "https://example.com" }]
+
+# [[settings.fields]]
+# key = "theme"
+# label = "Theme"
+# type = "select"                       # "text" | "boolean" | "select"
+# default = "light"
+# options = ["light", "dark"]

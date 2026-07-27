@@ -1,0 +1,34 @@
+[package]
+name = "chrome-host-app"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+description = "Desktop app template: Rust host rendering a configured URL in Google Chrome"
+license = "MIT"
+
+[dependencies]
+anyhow = "1"
+axum = "0.8"
+dirs = "6"
+fd-lock = "4"
+open = "5"
+rand = "0.9"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
+rfd = { version = "0.15", default-features = false, features = ["gtk3"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tao = "0.31"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "process", "net", "time", "sync"] }
+toml = "0.8"
+tray-icon = "0.21"
+
+[target.'cfg(windows)'.dependencies]
+winreg = "0.55"
+
+[dev-dependencies]
+tempfile = "3"
+
+[package.metadata.packager]
+product-name = "Chrome Host App"
+identifier = "com.example.chromehost"
+icons = ["icons/icon.png"]
