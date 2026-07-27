@@ -91,6 +91,21 @@ impl App {
         let _ = writeln!(self.host_log, "{msg}");
     }
 
+    /// Log file capturing Chrome's own stdout/stderr (GPU probes, GCM
+    /// chatter, ML init lines), rotated like the other logs. `None` when it
+    /// can't be opened — Chrome's output is then discarded rather than
+    /// inherited, so the host's terminal stays clean either way.
+    fn chrome_log(&mut self) -> Option<std::fs::File> {
+        let path = self.paths.logs_dir.join("chrome.log");
+        match supervisor::open_log(&path, supervisor::LOG_MAX_BYTES) {
+            Ok(f) => Some(f),
+            Err(e) => {
+                self.log(&format!("chrome: cannot open chrome.log: {e}"));
+                None
+            }
+        }
+    }
+
     fn target_url(&self) -> String {
         match &self.cfg.server {
             Some(s) if self.cfg.app.url.is_empty() => s.health_check_url.clone(),
@@ -301,6 +316,7 @@ impl App {
             });
         }
 
+        let chrome_log = self.chrome_log();
         let launch_result = {
             let _guard = self.rt.enter();
             chrome::launch(
@@ -309,6 +325,7 @@ impl App {
                 &self.paths.chrome_profile,
                 self.cfg.window.width,
                 self.cfg.window.height,
+                chrome_log,
             )
         };
         match launch_result {
@@ -394,6 +411,7 @@ impl App {
                 _ => format!("http://127.0.0.1:{}/loading", self.port),
             }
         });
+        let chrome_log = self.chrome_log();
         let launch_result = {
             let _guard = self.rt.enter();
             chrome::launch(
@@ -402,6 +420,7 @@ impl App {
                 &self.paths.chrome_profile,
                 self.cfg.window.width,
                 self.cfg.window.height,
+                chrome_log,
             )
         };
         match launch_result {
@@ -439,14 +458,19 @@ impl App {
             .rt
             .block_on(async { self.children.lock().await.chrome.is_some() });
         if already_running {
-            if let Err(e) =
-                chrome::open_extra_window(&self.chrome_exe, &url, &self.paths.chrome_profile)
-            {
+            let chrome_log = self.chrome_log();
+            if let Err(e) = chrome::open_extra_window(
+                &self.chrome_exe,
+                &url,
+                &self.paths.chrome_profile,
+                chrome_log,
+            ) {
                 self.log(&format!("settings: failed to open extra window: {e}"));
             }
             return;
         }
         let generation = self.chrome_generation();
+        let chrome_log = self.chrome_log();
         let launch_result = {
             let _guard = self.rt.enter();
             chrome::launch(
@@ -455,6 +479,7 @@ impl App {
                 &self.paths.chrome_profile,
                 chrome::EXTRA_WINDOW_SIZE.0,
                 chrome::EXTRA_WINDOW_SIZE.1,
+                chrome_log,
             )
         };
         match launch_result {

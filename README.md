@@ -184,11 +184,40 @@ startup):
 | path | contents |
 |---|---|
 | `chrome-profile/` | Chrome's dedicated user-data-dir for this app — kept separate from the user's normal Chrome profile. |
-| `logs/` | `server.log` (+ `.old`) for the supervised `[server]` child, `host.log` (+ `.old`) for the host itself. |
+| `logs/` | `server.log` (+ `.old`) for the supervised `[server]` child, `host.log` (+ `.old`) for the host itself, `chrome.log` (+ `.old`) for Chrome's own stdout/stderr (GPU probes, service chatter — kept out of the host's terminal). All three rotate at 5 MB. |
 | `settings.json` | Persisted settings values, keyed by settings field `key`. |
 | `app.lock` | Single-instance lock file; prevents two copies of the app running against the same identifier at once. |
 
-## 7. Packaging
+## 7. Building and packaging
+
+### Building on each OS
+
+The same commands build everywhere once the per-OS prerequisites are in
+place:
+
+```bash
+cargo build --release   # optimized binary in target/release/
+cargo run               # debug build + launch (development)
+```
+
+The release binary lands at `target/release/chrome-host-app`
+(`chrome-host-app.exe` on Windows) and embeds `app.toml`, the internal
+pages, and the icon — it is self-contained apart from Google Chrome itself
+and, on Linux, the tray runtime library.
+
+| OS | toolchain | extra build dependencies |
+|---|---|---|
+| Linux (Debian/Ubuntu) | Rust 1.85+ via [rustup](https://rustup.rs) | `sudo apt-get install libgtk-3-dev libayatana-appindicator3-dev libxdo-dev` (same list as §2) |
+| macOS | Rust 1.85+ via rustup, plus Xcode Command Line Tools (`xcode-select --install`) | none |
+| Windows | Rust 1.85+ via rustup with the default MSVC toolchain (requires [Visual Studio Build Tools](https://visualstudio.microsoft.com/visual-cpp-build-tools/) with "Desktop development with C++") | none |
+
+Google Chrome is a **runtime** requirement on every OS, never a build-time
+one. Cross-compiling between OSes is not supported — build on each target
+OS, or let CI do it: `.github/workflows/ci.yml` builds and tests all three
+platforms on every push, and the release workflow packages installers for
+all three on every `v*` tag (see §8).
+
+### Installers
 
 Build local installers with [`cargo-packager`](https://github.com/crabnebula-dev/cargo-packager):
 

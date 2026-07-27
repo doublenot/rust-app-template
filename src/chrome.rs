@@ -1,5 +1,6 @@
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
+use std::process::Stdio;
 
 pub const DOWNLOAD_URL: &str = "https://www.google.com/chrome/";
 
@@ -76,22 +77,42 @@ pub fn launch_args(url: &str, profile_dir: &Path, width: u32, height: u32) -> Ve
     ]
 }
 
+/// stdout/stderr for a spawned Chrome: into the given log file when one is
+/// available, discarded otherwise — never inherited, so Chrome's own chatter
+/// (GPU probes, GCM registration, ML init) stays out of the host's terminal.
+fn chrome_stdio(log: Option<std::fs::File>) -> (Stdio, Stdio) {
+    match log.and_then(|f| f.try_clone().ok().map(|clone| (clone, f))) {
+        Some((out, err)) => (Stdio::from(out), Stdio::from(err)),
+        None => (Stdio::null(), Stdio::null()),
+    }
+}
+
 pub fn launch(
     exe: &Path,
     url: &str,
     profile_dir: &Path,
     width: u32,
     height: u32,
+    log: Option<std::fs::File>,
 ) -> std::io::Result<tokio::process::Child> {
+    let (stdout, stderr) = chrome_stdio(log);
     tokio::process::Command::new(exe)
         .args(launch_args(url, profile_dir, width, height))
+        .stdout(stdout)
+        .stderr(stderr)
         .kill_on_drop(true)
         .spawn()
 }
 
-pub fn open_extra_window(exe: &Path, url: &str, profile_dir: &Path) -> std::io::Result<()> {
+pub fn open_extra_window(
+    exe: &Path,
+    url: &str,
+    profile_dir: &Path,
+    log: Option<std::fs::File>,
+) -> std::io::Result<()> {
     // Same profile dir → this process hands the URL to the Chrome instance we
     // already own and exits on its own; never kill_on_drop it.
+    let (stdout, stderr) = chrome_stdio(log);
     std::process::Command::new(exe)
         .args(launch_args(
             url,
@@ -99,6 +120,8 @@ pub fn open_extra_window(exe: &Path, url: &str, profile_dir: &Path) -> std::io::
             EXTRA_WINDOW_SIZE.0,
             EXTRA_WINDOW_SIZE.1,
         ))
+        .stdout(stdout)
+        .stderr(stderr)
         .spawn()
         .map(drop)
 }
