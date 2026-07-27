@@ -10,6 +10,8 @@ mod internal_server;
 mod settings;
 #[allow(dead_code)]
 mod supervisor;
+#[allow(dead_code)]
+mod tray;
 
 fn main() {
     println!("chrome-host-app scaffold");
