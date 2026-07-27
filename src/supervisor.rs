@@ -5,6 +5,10 @@ use std::time::Duration;
 
 pub struct ServerHandle {
     pub child: tokio::process::Child,
+    // Not read back by the host (main.rs recomputes the log path from
+    // RuntimePaths); kept on the handle for API completeness/callers that
+    // don't have RuntimePaths in scope.
+    #[allow(dead_code)]
     pub log_path: PathBuf,
 }
 

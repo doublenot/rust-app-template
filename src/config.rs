@@ -93,6 +93,9 @@ pub struct MenuSection {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct MenuItemCfg {
+    // Not read at runtime (tray_icon assigns its own MenuId); kept for config
+    // schema completeness and future menu-editing tooling.
+    #[allow(dead_code)]
     pub id: String,
     pub label: String,
     pub open_url: String,
