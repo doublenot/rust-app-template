@@ -1,0 +1,34 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>{{APP_NAME}}</title>
+<link rel="stylesheet" href="/style.css">
+<main>
+  <div class="spinner" id="spinner"></div>
+  <h1>Starting {{APP_NAME}}…</h1>
+  <div id="err" hidden>
+    <p class="error" id="err-msg"></p>
+    <p class="muted" id="err-log"></p>
+    <button onclick="retry()">Retry</button>
+  </div>
+</main>
+<script>
+  const TOKEN = "{{TOKEN}}";
+  async function tick() {
+    try {
+      const s = await (await fetch("/api/status")).json();
+      if (s.state === "ready") { location.replace(s.target_url); return; }
+      if (s.state === "error") {
+        document.getElementById("spinner").hidden = true;
+        document.getElementById("err").hidden = false;
+        document.getElementById("err-msg").textContent = s.message;
+        document.getElementById("err-log").textContent = s.log_path ? "Log: " + s.log_path : "";
+        return;
+      }
+    } catch (e) { /* host not ready yet; keep polling */ }
+    setTimeout(tick, 500);
+  }
+  async function retry() {
+    await fetch("/api/restart", { method: "POST", headers: { "x-host-token": TOKEN } });
+  }
+  tick();
+</script>

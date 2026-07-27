@@ -5,6 +5,8 @@ mod chrome;
 #[allow(dead_code)]
 mod config;
 #[allow(dead_code)]
+mod internal_server;
+#[allow(dead_code)]
 mod settings;
 #[allow(dead_code)]
 mod supervisor;

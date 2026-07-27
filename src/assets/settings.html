@@ -1,0 +1,46 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>{{APP_NAME}} — Settings</title>
+<link rel="stylesheet" href="/style.css">
+<main>
+  <h1>{{APP_NAME}} Settings</h1>
+  <form id="f" onsubmit="return save(event)">
+    {{FIELDS_HTML}}
+    <button type="submit">Save</button>
+  </form>
+  <div id="saved" hidden>
+    <p>Saved — restart the app to apply.</p>
+    <button onclick="restartApp()">Restart App</button>
+  </div>
+  <p class="error" id="save-err" hidden></p>
+</main>
+<script>
+  const TOKEN = "{{TOKEN}}";
+  function collect() {
+    const out = {};
+    for (const el of document.querySelectorAll("[data-key]")) {
+      out[el.dataset.key] = el.type === "checkbox" ? el.checked : el.value;
+    }
+    return out;
+  }
+  async function save(e) {
+    e.preventDefault();
+    const r = await fetch("/api/settings", {
+      method: "POST",
+      headers: { "content-type": "application/json", "x-host-token": TOKEN },
+      body: JSON.stringify(collect()),
+    });
+    const err = document.getElementById("save-err");
+    if (r.ok) {
+      document.getElementById("saved").hidden = false;
+      err.hidden = true;
+    } else {
+      err.textContent = await r.text();
+      err.hidden = false;
+    }
+    return false;
+  }
+  async function restartApp() {
+    await fetch("/api/restart", { method: "POST", headers: { "x-host-token": TOKEN } });
+  }
+</script>
