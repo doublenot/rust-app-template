@@ -3931,10 +3931,10 @@ pub(crate) fn authorized(headers: &HeaderMap, state: &HostState) -> bool {
 
 Run: `cargo test --bin chrome-host-app internal_server::tests`
 
-Expected: PASS — including the five pre-existing tests, unchanged.
+Expected: PASS — including the six pre-existing tests, unchanged.
 
 ```
-running 6 tests
+running 7 tests
 test internal_server::tests::every_git_route_is_git_disabled_without_the_section ... ok
 test internal_server::tests::pages_render_with_app_name ... ok
 test internal_server::tests::restart_endpoint_sends_event ... ok

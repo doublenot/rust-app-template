@@ -308,7 +308,9 @@ And three methods inside `impl App`, next to `log` (`src/host.rs:41`):
     }
 
     pub(crate) fn git_log_path(&self) -> PathBuf {
-        self.paths.logs_dir.join("git.log")
+        // `GIT_LOG_FILE` exists so this name has exactly one definition; hard-coding the
+        // literal here re-opens precisely the drift the constant prevents.
+        self.paths.logs_dir.join(crate::git::GIT_LOG_FILE)
     }
 ```
 
@@ -1489,13 +1491,11 @@ scope` for any of them, add the matching import to the test module
 
 Run: `cargo test --bin chrome-host-app git::tests::git_failed_is_emitted_only_on_an_ok_to_fail_transition -- --nocapture`
 
-This is a characterization test over task 9's `after_job`, so there are two legitimate
-outcomes and they need different responses.
+This is a characterization test over task 9's `after_job`. It must **PASS with no edit to
+`src/git/mod.rs`** — task 9 already implements the gate, and this test is what stops it
+regressing.
 
-**If it PASSES**, task 9 implemented the gate correctly; the test now prevents it from
-regressing. Skip Step 32 and go to Step 33.
-
-**If it FAILS**, the expected failure is:
+If it fails, the failure looks like:
 
 ```
 thread 'git::tests::git_failed_is_emitted_only_on_an_ok_to_fail_transition' panicked at src/git/mod.rs:NNN:
@@ -1503,39 +1503,42 @@ a third event arrived: the ok -> fail gate is not holding, and a stuck repo will
 ```
 
 which means `after_job` is sending `GitFailed` on every failure rather than only on the edge.
-Apply Step 32.
+That is a regression in task 9 — fix it there, against the real code, rather than writing a
+second copy of the condition in this task. See Step 32 for what the code must say.
 
-- [ ] **Step 32: (only if Step 31 failed) Gate the emission on the transition**
+- [ ] **Step 32: Confirm the transition gate in task 9's `after_job`**
 
-In `GitService::after_job` in `src/git/mod.rs`, read the previous `LastSync` **before**
-`record_last_sync` overwrites it, and gate the send on it:
+A review check, not a patch. Read `GitService::after_job` in `src/git/mod.rs` and confirm it
+reads the previous `LastSync` **before** `record_last_sync` overwrites it, and gates the send on
+it. Task 9 writes this as:
 
 ```rust
         // GitFailed is a transition edge, not a level. `dialog()` is modal and
         // blocks the tao loop, so a repo that fails every five minutes must
         // produce one dialog per outage, not one per attempt.
-        let was_healthy = self
-            .state
-            .last_sync(repo_id)
-            .map(|prev| prev.ok)
-            .unwrap_or(true);
-        self.state.record_last_sync(repo_id, last);
-        if let Err(e) = &result {
-            if was_healthy {
-                let _ = self.events.send(HostEvent::GitFailed {
-                    repo_id: repo_id.to_string(),
-                    op: op.as_str().to_string(),
-                    code: e.code().as_str().to_string(),
-                    message: e.message.clone(),
-                });
-            }
-        }
+        let was_ok = self.state.last_sync(&repo_id).map(|last| last.ok);
 ```
 
-The `unwrap_or(true)` is the "or absent" half of the rule: the very first failure after a
-fresh start has no previous record and must still be reported.
+and, in the `Err(e)` arm:
 
-Re-run the command from Step 31. Expected: PASS.
+```rust
+                if was_ok != Some(false) {
+                    let _ = self.events.send(HostEvent::GitFailed {
+                        repo_id: repo_id.clone(),
+                        op: op.as_str().to_string(),
+                        code: e.code().as_str().to_string(),
+                        message: e.message.clone(),
+                    });
+                }
+```
+
+`was_ok != Some(false)` carries the "or absent" half of the rule: `was_ok` is `None` on the very
+first sync after a fresh start, and `None != Some(false)`, so that first failure is still
+reported. (An `unwrap_or(true)` spelling would be equivalent; do not "simplify" one into the
+other — just confirm the behaviour.)
+
+Run: `rg -n 'was_ok' src/git/mod.rs`
+Expected: two hits — the read before `record_last_sync`, and the gate in the `Err` arm.
 
 - [ ] **Step 33: Write and run the auto-sync restart test**
 

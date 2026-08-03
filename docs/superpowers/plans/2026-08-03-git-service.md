@@ -76,29 +76,36 @@ The fixes below are **non-blocking** — the plan compiles and executes as writt
 but each is a real finding and should be applied before or during the task it names. They are
 listed here rather than dropped because the fix pass was cut short by an account spend limit.
 
+### Already applied
+
+| task | finding |
+|---|---|
+| 3 | `GitErrorCode::SettingsInvalid` / `settings_invalid` deleted — invalid pulled settings are deliberately a warning on a *successful* job (§9.7), so nothing could ever emit the code |
+| 3 | `GitError::auth_missing`, `auth_unbound`, `canceled`, `timeout` deleted — zero call sites; the four *codes* remain and are reached via `record_cred_failure` and `error::classify` |
+| 6 | `percent` now computed from `indexed_objects`, per §6.4 — indexing lags receipt, so a received-based percent sits at 100% while indexing is still running |
+| 9 | Step 80's count corrected: six pre-existing `internal_server` tests, seven total (verified against the source) |
+| 10 | `git_log_path()` uses `crate::git::GIT_LOG_FILE` instead of a second `"git.log"` literal |
+| 10 | Step 32 was dead conditional text patching `after_job` with four locals that exist in no task; it is now a review check against task 9's real `was_ok != Some(false)` gate |
+| 11 | Step 18 had the same defect and the same fix — now a review check against task 9's real `decide_restart` |
+
+### Still to apply
+
 | task | finding | fix |
 |---|---|---|
 | 2 | Step 26's expected test count is wrong (says 42, should be 43); intermediate counts also drift | Recount against the steps; the task adds ten tests, `runtime_paths_layout` is extended not added |
-| 3 | `GitErrorCode::SettingsInvalid` / `settings_invalid` can never be emitted — invalid pulled settings are deliberately a warning on a *successful* job (§9.7) | Delete the variant and its wire string (contract already updated) |
-| 3 | `GitError::auth_missing`, `auth_unbound`, `canceled`, `timeout` have zero call sites | Delete all four (contract already updated) |
 | 4 | `#![allow(dead_code)]` in `registry.rs`/`state.rs` is redundant — task 3's attribute in `mod.rs` already propagates to child modules | Delete both, and the claim that task 9 removes them |
 | 5 | `JobStore::lookup` never evicts, so `/jobs/{id}` can return a record `/jobs` reports as gone (§6.5) | Add `inner.evict(now)` to `lookup`, with a failing test using the injected clock (keep zero `sleep`s) |
 | 5 | Test names diverge from the ones spec §10.2 names | Add a mapping table; do not rename the tests |
 | 6 | `push_transfer_progress` is never registered, so a push reports no progress at all (§6.4) | Register it; note in a comment that it returns `()` and cannot cancel |
-| 6 | `percent` is computed from `received_objects`; spec §6.4 specifies `indexed_objects` | Use `indexed_objects` — indexing lags receipt for the whole tail of a fetch |
 | 8 | §14 risk 7's `debug_assert!` half is missing | Add `debug_assert!(!idx.has_conflicts(), ...)` above the hard `merge_unresolvable` check |
 | 8 | Step 3's note suspends the `clippy -D warnings` gate for twenty steps across five commits | Add only `GitError`/`GitErrorCode` up front and the other four where first used |
 | 9 | `GitService` stores its own `repos_dir`, the second source of truth task 4 explicitly forbids | Call `self.registry.repos_dir()` and drop the field (contract already updated) |
 | 9 | `status_timeout` / HTTP 504 has no test at any level | Add a bounded-read test and a router test asserting 504 + `error.code == "status_timeout"` |
 | 9 | The `403 path_refused` purge refusal is tested only at the `ops` level, never over HTTP | Add a `#[cfg(unix)]` router test symlinking `repos/notes` outside the root |
-| 9 | Step 80 says "five pre-existing tests"; `internal_server.rs` has six | Change to six |
 | 9, 10 | Task 2's five `#[allow(dead_code)]` attributes have no removal step; `#[allow]` does not error when it stops firing, so they rot silently | Task 9 removes them from `GitSection` + the three `RuntimePaths` fields; task 10 from `git_enabled()` |
-| 10 | `git_log_path()` hard-codes `"git.log"`, re-opening the drift `GIT_LOG_FILE` exists to prevent | Use `crate::git::GIT_LOG_FILE` |
-| 10 | Step 32 is dead conditional text patching `after_job` with locals that exist in no task | Delete it; make Step 31 an unconditional regression test |
 | 10 | `quit()`'s ordering (the §14 risk 12 mitigation) has no machine check | Lift out `fn quit_sync_timeout(cfg: &AppConfig) -> Option<Duration>` and unit-test absent-`[git]` / 0 / 10 |
 | 10 | Only the `status_api = false` half of the `/api/status` guard is tested | Add the `status_api = true` case asserting the `git` key appears |
 | 10 | Definition of done says eight new tests; the steps sum to nine | Recount |
-| 11 | Step 18 is dead conditional text whose "match the shape rather than the text" instruction invites a divergent second implementation | Delete it; state the invariant and keep the two characterization tests |
 | 11 | §14 risk 11's accepted settings write race is undocumented | Add a WHY comment at the write-back call |
 | 12 | Step 16's expected grep count is a range ("accept two or three hits") and cannot fail usefully | Pin it to an exact count or grep two specific anchors |
 | 12 | §14 risk 3's consequence is never stated in the README | Bold warning: a validated settings change restarts the server child and relaunches Chrome, discarding scroll position and in-page state |

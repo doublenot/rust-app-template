@@ -1003,36 +1003,41 @@ assertion `left == right` failed: a restart caused by the settings mirror must s
  right: "settings"
 ```
 
-(the event fires but is attributed to the request). Apply Step 18.
+(the event fires but is attributed to the request). That means task 9's `decide_restart` was
+changed after it landed — see Step 18.
 
-- [ ] **Step 18: (only if Step 17 failed) Make `settings_changed` an OR-term in `after_job`**
+- [ ] **Step 18: Confirm task 9's `decide_restart` still treats `settings_changed` as an OR-term**
 
-Open `GitService::after_job` in `src/git/mod.rs` and find the expression that decides whether to
-send `HostEvent::GitRestartChildren`. Two properties must hold; the surrounding local names are
-task 9's, so match the shape rather than the text:
+Both tests in Step 17 must pass with **no edit to `src/git/mod.rs`**. Task 9 already implements
+this; this step is a review check, not a patch. Read `GitService::decide_restart` and confirm the
+two properties still hold:
 
-- `out.settings_changed` is an **independent OR-term** of §9.7's condition 1, never ANDed with the
-  request's `restart_children`. The `Some(false)` that `OpRequest::auto()` and
-  `OpRequest::manual()` both set must not be able to suppress it.
-- `reason` is `"settings"` when the settings change is what triggered the restart, and
-  `"requested"` when the caller asked. Both are `&'static str`s from §3.13.
+- `out.settings_changed` is an **independent OR-term**, never ANDed with the request's
+  `restart_children`. The `Some(false)` that `OpRequest::auto()` and `OpRequest::manual()` both set
+  must not be able to suppress it. Task 9 writes this as:
 
-The shape, with the two conditions §9.7 shares with the caller-requested path (HEAD actually moved
-or `settings.json` was actually rewritten, and the app status is `Ready`) left as they already are:
+  ```rust
+  let asked = ctx
+      .request
+      .restart_children
+      .unwrap_or(ctx.def.restart_children_on_pull);
+  let moved = out.head_after.is_some() && out.head_before != out.head_after;
+  if !((asked && moved) || out.settings_changed) {
+      return;
+  }
+  ```
 
-```rust
-        // A validated settings change restarts the children even when the
-        // request said not to: APP_SETTING_* is injected at spawn, so a child
-        // that keeps running keeps the stale values - and OpRequest::auto(),
-        // which every timer and every sync_on_start uses, always says not to.
-        let asked = req_restart_children.unwrap_or(def.restart_children_on_pull);
-        let reason = if out.settings_changed {
-            "settings"
-        } else {
-            "requested"
-        };
-        let wants_restart = out.settings_changed || (asked && moved_head);
-```
+- `reason` is `"settings"` when the settings change triggered the restart and `"requested"` when
+  the caller asked — both `&'static str`s from §3.13. Task 9 selects it with
+  `let reason = if out.settings_changed { "settings" } else { "requested" };`.
+
+Why this is a check and not a patch: this task is the first thing that ever sets
+`settings_changed` to `true`, so until now that OR-term has been dead code. If either test in
+Step 17 fails, the bug is a regression in task 9's `decide_restart` — fix it *there*, against the
+real code, rather than writing a second copy of the condition here.
+
+Run: `rg -n 'out\.settings_changed' src/git/mod.rs`
+Expected: two hits — the `decide_restart` guard and the `reason` selection.
 
 - [ ] **Step 19: Run the tests and watch them pass**
 

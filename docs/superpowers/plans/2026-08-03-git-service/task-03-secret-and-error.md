@@ -97,13 +97,15 @@ written. Do not re-wrap it — rustfmt will split it straight back.
       pub fn dirty_tree(what: &str) -> GitError;
       pub fn merge_path_type_conflict(path: &std::path::Path) -> GitError;
       pub fn merge_unresolvable() -> GitError;
-      pub fn auth_missing(message: impl Into<String>) -> GitError;
-      pub fn auth_unbound(bound_host: &str, remote_host: &str) -> GitError;
       pub fn push_rejected(refname: &str, status: &str) -> GitError;
       pub fn io(message: impl Into<String>) -> GitError;
-      pub fn canceled() -> GitError;
-      pub fn timeout(secs: u64) -> GitError;
   }
+  // NOTE: there are deliberately no `auth_missing`, `auth_unbound`, `canceled` or
+  // `timeout` constructors. The four *codes* exist and are reachable, but nothing
+  // ever builds a GitError from them by name: AuthMissing/AuthUnbound are recorded
+  // through task 6's `record_cred_failure`, and Canceled/Timeout arrive through
+  // `error::classify`. Adding a named constructor here would be dead code kept
+  // alive only by `#![allow(dead_code)]`.
   impl serde::Serialize for GitError;          // job shape: {code,message,retryable,git2?}
   impl std::fmt::Display for GitError;
   impl std::error::Error for GitError;
@@ -449,7 +451,6 @@ mod tests {
         ),
         (G::MergeUnresolvable, "merge_unresolvable", 409, false),
         (G::RepoLocked, "repo_locked", 409, true),
-        (G::SettingsInvalid, "settings_invalid", 422, false),
         (G::IoFailed, "io_failed", 500, false),
         (G::Internal, "internal", 500, false),
     ];
@@ -562,7 +563,10 @@ pub enum GitErrorCode {
     MergePathTypeConflict,
     MergeUnresolvable,
     RepoLocked,
-    SettingsInvalid,
+    // NOTE: no `SettingsInvalid`. Invalid settings pulled from a remote are
+    // deliberately a *warning on a successful job* (`settings_rejected`), never an
+    // error — a teammate's typo must not fail an entire git sync forever (§9.7).
+    // A stable wire string nothing can ever emit is a contract violation.
     IoFailed,
     Internal,
 }
@@ -612,7 +616,6 @@ impl GitErrorCode {
             GitErrorCode::MergePathTypeConflict => "merge_path_type_conflict",
             GitErrorCode::MergeUnresolvable => "merge_unresolvable",
             GitErrorCode::RepoLocked => "repo_locked",
-            GitErrorCode::SettingsInvalid => "settings_invalid",
             GitErrorCode::IoFailed => "io_failed",
             GitErrorCode::Internal => "internal",
         }
@@ -633,8 +636,7 @@ impl GitErrorCode {
             | GitErrorCode::InsecureRemote
             | GitErrorCode::SettingsSyncUnavailable
             | GitErrorCode::RemoteMissing
-            | GitErrorCode::ConfirmRequired
-            | GitErrorCode::SettingsInvalid => StatusCode::UNPROCESSABLE_ENTITY,
+            | GitErrorCode::ConfirmRequired => StatusCode::UNPROCESSABLE_ENTITY,
             GitErrorCode::RegistryReadOnly | GitErrorCode::PathRefused => StatusCode::FORBIDDEN,
             GitErrorCode::RepoBusy
             | GitErrorCode::NotFastForward
@@ -1488,20 +1490,6 @@ impl GitError {
         )
     }
 
-    pub fn auth_missing(message: impl Into<String>) -> GitError {
-        GitError::new(GitErrorCode::AuthMissing, message)
-    }
-
-    pub fn auth_unbound(bound_host: &str, remote_host: &str) -> GitError {
-        GitError::new(
-            GitErrorCode::AuthUnbound,
-            format!(
-                "the stored credential is bound to {bound_host:?} but this remote is \
-                 {remote_host:?}: send the credential with the request or re-define the repo"
-            ),
-        )
-    }
-
     pub fn push_rejected(refname: &str, status: &str) -> GitError {
         GitError::new(
             GitErrorCode::PushRejected,
@@ -1513,16 +1501,6 @@ impl GitError {
         GitError::new(GitErrorCode::IoFailed, message)
     }
 
-    pub fn canceled() -> GitError {
-        GitError::new(GitErrorCode::Canceled, "the operation was canceled")
-    }
-
-    pub fn timeout(secs: u64) -> GitError {
-        GitError::new(
-            GitErrorCode::Timeout,
-            format!("the operation exceeded the {secs}s network timeout"),
-        )
-    }
 }
 
 /// The **job-error** shape: `{"code","message","retryable","git2"?}`.

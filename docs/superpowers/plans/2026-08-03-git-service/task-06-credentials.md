@@ -1728,7 +1728,10 @@ impl OpCtx {
             total_objects: p.total_objects() as u32,
             indexed_objects: p.indexed_objects() as u32,
             received_bytes: p.received_bytes() as u64,
-            percent: percent_of(p.received_objects(), p.total_objects()),
+            // Spec §6.4 specifies `indexed_objects * 100 / total_objects`, not received.
+            // Indexing lags receipt, so the two diverge for the whole tail of a fetch and
+            // a received-based percent would sit at 100% while indexing is still running.
+            percent: percent_of(p.indexed_objects(), p.total_objects()),
         });
         true
     }
