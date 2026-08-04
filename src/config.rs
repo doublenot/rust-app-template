@@ -668,4 +668,43 @@ mod tests {
         );
         assert!(AppConfig::from_str(&ok).is_ok());
     }
+
+    #[test]
+    fn shipped_git_block_is_commented_out_but_valid() {
+        assert!(!AppConfig::load().unwrap().git_enabled());
+        // The shipped `[git]` block is documentation users uncomment. Rename a key
+        // without updating the comment and `deny_unknown_fields` bites the user on
+        // their first run, not us. Uncomment it here and parse it instead.
+        let mut out = String::new();
+        let mut in_git = false;
+        for line in EMBEDDED_CONFIG.lines() {
+            let body = line.strip_prefix("# ").unwrap_or("").trim();
+            if body == "[git]" {
+                in_git = true;
+            } else if in_git && !line.starts_with('#') {
+                in_git = false;
+            }
+            if in_git && !body.is_empty() && !body.starts_with('#') {
+                out.push_str(body);
+                out.push('\n');
+            }
+        }
+        assert!(
+            out.starts_with("[git]\n"),
+            "app.toml has no commented-out [git] block"
+        );
+        // `[git]` plus one line per GitSection field. Every shipped value is its own
+        // serde default, so the assertions below would still pass if the block lost
+        // keys — a field added to GitSection but never documented would slip through.
+        // Pinning the count is what makes this test bidirectional.
+        assert_eq!(out.lines().count(), 12, "expected [git] + 11 keys:\n{out}");
+        let s = format!("{}{out}", minimal());
+        let c = AppConfig::from_str(&s).unwrap_or_else(|e| panic!("{e}\n--- built from ---\n{s}"));
+        let g = c.git.unwrap();
+        assert!(g.registry_writes);
+        assert_eq!(g.default_branch, "main");
+        assert_eq!(g.network_timeout_secs, 120);
+        assert_eq!(g.quit_sync_timeout_secs, 10);
+        assert_eq!(g.ssh_host_key_policy, SshHostKeyPolicy::Tofu);
+    }
 }

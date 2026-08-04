@@ -23,6 +23,24 @@ on_close = "quit"                       # "quit" | "tray"
 settings = false                        # true requires [[settings.fields]] below
 items = []                              # e.g. [{ id = "docs", label = "Docs", open_url = "https://example.com" }]
 
+# Uncomment to give the host a git service. The [server] child reaches it at
+# $APP_HOST_URL/api/git/* with header  x-host-token: $APP_HOST_TOKEN.
+# Repos are defined in <data-dir>/repos.json; trees live in <data-dir>/repos/<id>/.
+# See README §9.
+# [git]
+# tray_sync = false                     # add a "Sync now" tray entry
+# error_dialogs = false                 # native dialog when a sync starts failing,
+#                                       # and when a sync overwrote a remote edit
+# status_api = false                    # add a "git" key to /api/status
+# registry_writes = true                # false → repos.json is author-owned; PUT/DELETE 403
+# default_branch = "main"
+# author_name = ""                      # "" → [app].name
+# author_email = ""                     # "" → "<identifier>@<hostname>"
+# network_timeout_secs = 120            # 5..=3600
+# quit_sync_timeout_secs = 10           # 0 disables sync_on_quit entirely
+# allow_http = false                    # permit plaintext http:// remotes
+# ssh_host_key_policy = "tofu"          # "tofu" | "accept"
+
 # [[settings.fields]]
 # key = "theme"
 # label = "Theme"
