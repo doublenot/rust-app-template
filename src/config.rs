@@ -239,14 +239,9 @@ impl AppConfig {
         self.menu.settings && self.settings.is_some()
     }
 
-    // Read by `host::App::start_children`, which does not exist yet. (Not by
+    // Read by `host::App::start_children`, to fill `HostAccess.git_enabled`. (Not by
     // `GitService::new`, which destructures `cfg.git` directly, and not by
-    // `supervisor::build_env`, which receives a pre-computed bool.)
-    //
-    // `allow`, not the `expect` used for `main::notice`: the tests below call this,
-    // so dead_code does not fire under `cfg(test)` and `expect` would be unfulfilled.
-    // Task 10 deletes the attribute when it adds the real caller.
-    #[allow(dead_code)]
+    // `supervisor::build_env`, which receives the pre-computed bool.)
     pub fn git_enabled(&self) -> bool {
         self.git.is_some()
     }

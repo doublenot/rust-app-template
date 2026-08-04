@@ -56,6 +56,25 @@ pub enum AppStatus {
     },
 }
 
+/// `/api/status` with an optional `git` block. `#[serde(flatten)]` over the
+/// internally-tagged `AppStatus` keeps the handler typed instead of degrading
+/// to `Json<Value>`, and `skip_serializing_if` makes the response
+/// byte-identical to the bare `AppStatus` whenever git is off or
+/// `[git].status_api` is false.
+///
+/// `assets/loading.html` polls this in a tight loop, so whatever fills `git`
+/// must stay cheap: `GitService::status_summary()` reads the registry, the job
+/// store and the in-memory state file and touches neither libgit2 nor the
+/// filesystem. Live tree state is deliberately absent for that reason — use
+/// `GET /api/git/repos/{id}/status` for it.
+#[derive(serde::Serialize)]
+pub(crate) struct StatusResponse {
+    #[serde(flatten)]
+    pub app: AppStatus,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub git: Option<crate::git::GitStatusSummary>,
+}
+
 #[derive(Clone)]
 pub struct HostState {
     pub app_name: String,
@@ -192,8 +211,16 @@ async fn settings_page(State(s): State<HostState>) -> impl IntoResponse {
     .into_response()
 }
 
-async fn api_status(State(s): State<HostState>) -> Json<AppStatus> {
-    Json(s.status.read().await.clone())
+async fn api_status(State(s): State<HostState>) -> Json<StatusResponse> {
+    let git = s
+        .git
+        .as_ref()
+        .filter(|g| g.status_api())
+        .map(|g| g.status_summary());
+    Json(StatusResponse {
+        app: s.status.read().await.clone(),
+        git,
+    })
 }
 
 pub(crate) fn authorized(headers: &HeaderMap, state: &HostState) -> bool {
@@ -1065,5 +1092,93 @@ options = ["light", "dark"]
             .await
             .unwrap();
         assert_eq!(still.status(), 200);
+    }
+
+    #[test]
+    fn status_response_is_byte_identical_to_app_status_when_git_is_off() {
+        // loading.html and any external poller parse this shape today. The
+        // flatten must add exactly nothing when there is no git block.
+        for st in [
+            AppStatus::Starting,
+            AppStatus::Ready {
+                target_url: "http://x/".to_string(),
+            },
+            AppStatus::Error {
+                message: "boom".to_string(),
+                log_path: Some("/tmp/server.log".to_string()),
+            },
+        ] {
+            let bare = serde_json::to_string(&st).unwrap();
+            let wrapped = serde_json::to_string(&StatusResponse { app: st, git: None }).unwrap();
+            assert_eq!(bare, wrapped);
+        }
+    }
+
+    #[tokio::test]
+    async fn status_endpoint_omits_the_git_block_when_git_is_disabled() {
+        let (_state, port, _rx) = spawn_state(false).await;
+        let body: serde_json::Value = reqwest::get(format!("http://127.0.0.1:{port}/api/status"))
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert!(body.get("git").is_none(), "unexpected git block: {body}");
+        assert_eq!(
+            body.as_object().unwrap().len(),
+            1,
+            "AppStatus::Starting must serialize to exactly {{\"state\":\"starting\"}}: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn status_endpoint_carries_the_git_block_when_status_api_is_on() {
+        // The other half of the guard. Without this a handler that never fills
+        // the block at all would still pass the absent-case test, because
+        // `status_api` is off by default — git is invisible until asked for.
+        let (_state, port, _dir) =
+            spawn_git_state_cfg("[git]\nstatus_api = true\n", Arc::new(StubOps)).await;
+        authed()
+            .put(git(port, "/repos/notes"))
+            .header("x-host-token", "tok123")
+            .json(&json!({"auto_sync_secs": 300}))
+            .send()
+            .await
+            .unwrap();
+
+        let body: serde_json::Value = reqwest::get(format!("http://127.0.0.1:{port}/api/status"))
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        // Unauthenticated, exactly as before: everything in the block is
+        // already visible to the loading page.
+        let g = body
+            .get("git")
+            .unwrap_or_else(|| panic!("no git block: {body}"));
+        assert_eq!(g["repos"].as_array().unwrap().len(), 1);
+        assert_eq!(g["repos"][0]["id"], "notes");
+        assert_eq!(g["repos"][0]["auto_sync_secs"], 300);
+        // …and never a credential, on an endpoint with no token check.
+        let text = serde_json::to_string(&body).unwrap();
+        assert!(
+            !text.contains("token"),
+            "credential material leaked: {text}"
+        );
+
+        // `status_api = false` — the default, and the author's opt-out — must
+        // remove the whole key rather than emptying it.
+        let (_state, port, _dir) = spawn_git_state(true, Arc::new(StubOps)).await;
+        let body: serde_json::Value = reqwest::get(format!("http://127.0.0.1:{port}/api/status"))
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert!(
+            body.get("git").is_none(),
+            "status_api = false still served a block: {body}"
+        );
     }
 }

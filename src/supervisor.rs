@@ -37,10 +37,24 @@ pub fn resolve_cwd(cwd: Option<&str>, base_dir: &Path) -> PathBuf {
     }
 }
 
+/// The `[server]` child's ticket back into the host: the loopback base URL and
+/// the bearer token the internal server checks as `x-host-token`.
+///
+/// This reaches the child process and NOTHING else. `chrome::launch` inherits
+/// the host's own environment, which never contains the token — so no page
+/// rendered in the browser can read it out of a child's `process.env`, and a
+/// compromised page cannot drive `/api/restart` or `/api/git/*`.
+pub struct HostAccess<'a> {
+    pub url: &'a str,
+    pub token: &'a str,
+    pub git_enabled: bool,
+}
+
 pub fn build_env(
     cfg_env: &BTreeMap<String, String>,
     settings_env: &[(String, String)],
     settings_file: &Path,
+    host: &HostAccess<'_>,
 ) -> Vec<(String, String)> {
     let mut env: Vec<(String, String)> = cfg_env
         .iter()
@@ -51,6 +65,13 @@ pub fn build_env(
         "APP_SETTINGS_FILE".to_string(),
         settings_file.to_string_lossy().into_owned(),
     ));
+    env.push(("APP_HOST_URL".to_string(), host.url.to_string()));
+    env.push(("APP_HOST_TOKEN".to_string(), host.token.to_string()));
+    // Pushed only when [git] is present, and absent (not "0") otherwise, so a
+    // child can branch on `"APP_GIT_ENABLED" in process.env` alone.
+    if host.git_enabled {
+        env.push(("APP_GIT_ENABLED".to_string(), "1".to_string()));
+    }
     env
 }
 
@@ -142,12 +163,44 @@ mod tests {
         let mut cfg_env = BTreeMap::new();
         cfg_env.insert("PORT".to_string(), "8080".to_string());
         let settings = vec![("APP_SETTING_THEME".to_string(), "dark".to_string())];
-        let env = build_env(&cfg_env, &settings, Path::new("/data/settings.json"));
+        let host = HostAccess {
+            url: "http://127.0.0.1:5051",
+            token: "tok",
+            git_enabled: false,
+        };
+        let env = build_env(&cfg_env, &settings, Path::new("/data/settings.json"), &host);
         assert!(env.contains(&("PORT".into(), "8080".into())));
         assert!(env.contains(&("APP_SETTING_THEME".into(), "dark".into())));
         assert!(env
             .iter()
             .any(|(k, v)| k == "APP_SETTINGS_FILE" && v.ends_with("settings.json")));
+    }
+
+    #[test]
+    fn build_env_exports_host_access_and_gates_the_git_flag() {
+        let cfg_env = BTreeMap::new();
+        let off = HostAccess {
+            url: "http://127.0.0.1:5051",
+            token: "s3cret",
+            git_enabled: false,
+        };
+        let env = build_env(&cfg_env, &[], Path::new("/d/settings.json"), &off);
+        assert!(env.contains(&("APP_HOST_URL".into(), "http://127.0.0.1:5051".into())));
+        assert!(env.contains(&("APP_HOST_TOKEN".into(), "s3cret".into())));
+        // Absent, not "0": a child that tests for the variable's presence and
+        // one that parses its value must agree about what "off" looks like.
+        assert!(
+            !env.iter().any(|(k, _)| k == "APP_GIT_ENABLED"),
+            "APP_GIT_ENABLED must not be exported when [git] is absent"
+        );
+
+        let on = HostAccess {
+            url: "http://127.0.0.1:5051",
+            token: "s3cret",
+            git_enabled: true,
+        };
+        let env = build_env(&cfg_env, &[], Path::new("/d/settings.json"), &on);
+        assert!(env.contains(&("APP_GIT_ENABLED".into(), "1".into())));
     }
 
     #[test]

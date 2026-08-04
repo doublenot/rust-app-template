@@ -1726,8 +1726,11 @@ Finally, `git checkout app.toml` to drop the smoke `[git]` block, and confirm
 
 ---
 
-**Definition of done:** `cargo test` green with the eight new tests
-(3 in `host::tests`, 1 new + 1 rewritten in `supervisor::tests`, 1 new tray test, 2 in
-`internal_server::tests`, 2 in `git::tests`); `cargo fmt --check` and
+**Definition of done:** `cargo test` green with the eleven new tests — 4 in `host::tests`
+(3 loop-safety + `quit_sync_timeout_is_none_without_git_and_none_at_zero`), 1 new +
+1 rewritten in `supervisor::tests`, 1 new tray test, 3 in `internal_server::tests`
+(byte-identical, git-off, and `status_endpoint_carries_the_git_block_when_status_api_is_on`),
+2 in `git::tests`. The original "eight" undercounted its own steps by one and predated the
+two tests the plan index's audit rows added; `cargo fmt --check` and
 `cargo clippy --all-targets -- -D warnings` clean; `/api/status` byte-identical with git off;
 `app.toml` unmodified in the final tree; and `grep -rn 'Children\|chrome_generation\|server_generation\|rt.enter\|tokio::process' src/git/` returns **nothing** — the one rule still holds.

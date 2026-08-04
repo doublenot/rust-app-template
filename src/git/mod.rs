@@ -2236,4 +2236,120 @@ mod tests {
         assert!(ops.calls().is_empty(), "0 disables the whole step");
         assert!(fx.svc.draining());
     }
+
+    /// A `GitOps` that replays a fixed script of successes and failures, so the
+    /// `after_job` notification path can be driven through an outage and back
+    /// with no network, no remote and no real work tree.
+    struct ScriptedOps {
+        script: Vec<bool>, // true = succeed
+        calls: std::sync::atomic::AtomicUsize,
+    }
+
+    impl GitOps for ScriptedOps {
+        fn run(&self, _op: JobOp, ctx: &OpCtx) -> Result<OpOutcome, GitError> {
+            let n = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if self.script[n] {
+                Ok(OpOutcome::new("no_changes", &ctx.def.branch))
+            } else {
+                Err(GitError::new(GitErrorCode::AuthFailed, "token expired"))
+            }
+        }
+    }
+
+    /// Start one job and wait until the repo's busy slot clears, which happens
+    /// when the `RepoLease` drops — i.e. after the job and its notification
+    /// have run. Keeps the four jobs strictly sequential so the event order is
+    /// deterministic.
+    async fn run_one_job(svc: &std::sync::Arc<GitService>, id: &str) {
+        match svc.start_job(id, JobOp::Commit, OpRequest::manual()) {
+            Ok(StartOutcome::Started(_)) => {}
+            Ok(_) => panic!("expected a freshly started job, got a replay or a busy repo"),
+            Err(e) => panic!("start_job refused the job: {e}"),
+        }
+        for _ in 0..400 {
+            if svc.jobs().busy(id).is_none() {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        panic!("job did not finish within 2s");
+    }
+
+    async fn next_git_failed(rx: &mut tokio::sync::mpsc::UnboundedReceiver<HostEvent>) -> String {
+        match tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv()).await {
+            Ok(Some(HostEvent::GitFailed { code, .. })) => code,
+            Ok(Some(other)) => panic!("unexpected event before GitFailed: {other:?}"),
+            Ok(None) => panic!("event channel closed"),
+            Err(_) => panic!("timed out waiting for GitFailed"),
+        }
+    }
+
+    #[tokio::test]
+    async fn git_failed_is_emitted_only_on_an_ok_to_fail_transition() {
+        // dialog() is modal and blocks the tao loop, menu clicks included. A
+        // repo whose token expired with auto_sync_secs = 300 must therefore
+        // produce ONE dialog per outage, not one every five minutes forever
+        // with the tray unreachable to turn it off. That is what this asserts:
+        // fail, fail, succeed, fail => exactly two events.
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = AppConfig::from_str(
+            "[app]\nname = \"X\"\nidentifier = \"com.example.x\"\n\
+             [git]\nerror_dialogs = true\n",
+        )
+        .unwrap();
+        let paths = RuntimePaths::under(dir.path(), "com.example.x");
+        paths.ensure().unwrap();
+
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let status = std::sync::Arc::new(tokio::sync::RwLock::new(AppStatus::Ready {
+            target_url: "http://x/".to_string(),
+        }));
+        let ops = std::sync::Arc::new(ScriptedOps {
+            script: vec![false, false, true, false],
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let svc = GitService::with_ops(
+            &cfg,
+            &paths,
+            tokio::runtime::Handle::current(),
+            tx,
+            status,
+            ops,
+        );
+        svc.start();
+        svc.put_repo(
+            "notes",
+            serde_json::from_value(serde_json::json!({ "id": "notes" })).unwrap(),
+        )
+        .unwrap();
+
+        for _ in 0..4 {
+            run_one_job(&svc, "notes").await;
+        }
+
+        assert_eq!(next_git_failed(&mut rx).await, "auth_failed");
+        assert_eq!(next_git_failed(&mut rx).await, "auth_failed");
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(200), rx.recv())
+                .await
+                .is_err(),
+            "a third event arrived: the ok -> fail gate is not holding, and a stuck repo \
+             will stack a modal per sync"
+        );
+    }
+
+    #[test]
+    fn an_automatic_sync_can_never_restart_the_children() {
+        // restart_children is hard-coded on OpRequest::auto(), and there is no
+        // config key anywhere that can flip it. Only an explicit HTTP call
+        // (PullBody/SyncBody.restart_children), a repo's
+        // restart_children_on_pull, or a real sync_settings change may tear
+        // down the user's window — never a timer. Without this, a 5-minute
+        // auto-sync on a repo with restart_children_on_pull would restart
+        // Chrome 288 times a day.
+        assert_eq!(OpRequest::auto().restart_children, Some(false));
+        // Tray "Sync now" and the quit sync take the same line: the user asked
+        // to sync, not to have their window replaced.
+        assert_eq!(OpRequest::manual().restart_children, Some(false));
+    }
 }

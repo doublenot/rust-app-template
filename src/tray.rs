@@ -8,6 +8,7 @@ pub enum TrayAction {
     Open,
     OpenUrl(String),
     Settings,
+    GitSync,
     Restart,
     Quit,
 }
@@ -23,6 +24,7 @@ pub fn menu_model(
     app_name: &str,
     settings_enabled: bool,
     show_open: bool,
+    show_sync: bool,
 ) -> Vec<Entry> {
     let mut out = Vec::new();
     if show_open {
@@ -36,6 +38,9 @@ pub fn menu_model(
     }
     if settings_enabled {
         out.push(Entry::Action(TrayAction::Settings, "Settings…".to_string()));
+    }
+    if show_sync {
+        out.push(Entry::Action(TrayAction::GitSync, "Sync now".to_string()));
     }
     out.push(Entry::Action(
         TrayAction::Restart,
@@ -121,7 +126,7 @@ mod tests {
 
     #[test]
     fn full_model_order() {
-        let m = menu_model(&menu_cfg(), "My App", true, true);
+        let m = menu_model(&menu_cfg(), "My App", true, true, true);
         let expected = vec![
             Entry::Action(TrayAction::Open, "Open My App".to_string()),
             Entry::Action(
@@ -129,6 +134,7 @@ mod tests {
                 "Docs".to_string(),
             ),
             Entry::Action(TrayAction::Settings, "Settings…".to_string()),
+            Entry::Action(TrayAction::GitSync, "Sync now".to_string()),
             Entry::Action(TrayAction::Restart, "Restart App".to_string()),
             Entry::Separator,
             Entry::Action(TrayAction::Quit, "Quit".to_string()),
@@ -142,12 +148,32 @@ mod tests {
             settings: false,
             items: vec![],
         };
-        let m = menu_model(&empty, "X", false, false);
+        let m = menu_model(&empty, "X", false, false, false);
         let expected = vec![
             Entry::Action(TrayAction::Restart, "Restart App".to_string()),
             Entry::Separator,
             Entry::Action(TrayAction::Quit, "Quit".to_string()),
         ];
         assert_eq!(m, expected);
+    }
+
+    #[test]
+    fn sync_entry_is_independent_of_settings_and_sits_above_restart() {
+        // show_sync is computed from [git].tray_sync AND repo_count > 0, so it
+        // must not be entangled with settings_enabled in either direction.
+        let empty = MenuSection {
+            settings: false,
+            items: vec![],
+        };
+        let m = menu_model(&empty, "X", false, false, true);
+        assert_eq!(
+            m,
+            vec![
+                Entry::Action(TrayAction::GitSync, "Sync now".to_string()),
+                Entry::Action(TrayAction::Restart, "Restart App".to_string()),
+                Entry::Separator,
+                Entry::Action(TrayAction::Quit, "Quit".to_string()),
+            ]
+        );
     }
 }

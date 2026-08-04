@@ -35,11 +35,84 @@ pub(crate) struct App {
     pub(crate) rt: tokio::runtime::Handle,
     pub(crate) proxy: tao::event_loop::EventLoopProxy<UserEvent>,
     pub(crate) in_tray_mode: bool,
+    /// The git subsystem, or `None` when the config has no `[git]` section.
+    ///
+    /// `App` may call `GitService`; `GitService` may only send `HostEvent`s back.
+    /// That asymmetry is load-bearing — see the module-level note on `HostEvent`.
+    pub(crate) git: Option<Arc<crate::git::GitService>>,
+    /// The loopback token, so `build_env` can hand it to the `[server]` child.
+    pub(crate) host_token: String,
+    /// When the last git-driven restart was accepted. See `RESTART_DEBOUNCE_MS`.
+    pub(crate) last_git_restart: Option<std::time::Instant>,
+    /// Merge commits already reported by a conflict notice, newest last.
+    pub(crate) git_notices: std::collections::VecDeque<String>,
+}
+
+/// Minimum gap between two git-driven child restarts. A pull that moves HEAD
+/// and a settings sync that lands a moment later are one user-visible event,
+/// not two — without this the window is torn down twice inside a second.
+pub(crate) const RESTART_DEBOUNCE_MS: u64 = 2_000;
+
+/// How many merge-commit ids the conflict-notice de-duplicator remembers.
+/// Bounded so a host that runs for weeks cannot grow the set without limit.
+pub(crate) const GIT_NOTICE_HISTORY: usize = 16;
+
+/// `true` when `now` is at least `RESTART_DEBOUNCE_MS` past the last accepted
+/// git restart, recording `now` as the new mark. Free function taking its state
+/// and its clock by argument so it is testable without an event loop, a tokio
+/// runtime or a Chrome binary.
+fn restart_debounce_ok(last: &mut Option<std::time::Instant>, now: std::time::Instant) -> bool {
+    if let Some(prev) = *last {
+        if now.duration_since(prev) < Duration::from_millis(RESTART_DEBOUNCE_MS) {
+            return false;
+        }
+    }
+    *last = Some(now);
+    true
+}
+
+/// `true` the first time a merge commit id is seen, remembering the last
+/// `GIT_NOTICE_HISTORY` ids, oldest evicted first.
+fn notice_is_new(seen: &mut std::collections::VecDeque<String>, merge_commit: &str) -> bool {
+    if seen.iter().any(|s| s == merge_commit) {
+        return false;
+    }
+    if seen.len() == GIT_NOTICE_HISTORY {
+        seen.pop_front();
+    }
+    seen.push_back(merge_commit.to_string());
+    true
+}
+
+/// How long `quit()` may spend on quit syncs, or `None` when it must not run any.
+///
+/// Lifted out of `quit()` so the §14 risk 12 ordering — quit syncs run on a bounded
+/// clock, and `0` means "do not sync at all" rather than "sync forever" — has a machine
+/// check that does not need an event loop.
+pub(crate) fn quit_sync_timeout(cfg: &AppConfig) -> Option<Duration> {
+    match cfg.git.as_ref()?.quit_sync_timeout_secs {
+        0 => None,
+        secs => Some(Duration::from_secs(secs)),
+    }
 }
 
 impl App {
     pub(crate) fn log(&mut self, msg: &str) {
         let _ = writeln!(self.host_log, "{msg}");
+    }
+
+    pub(crate) fn git_restart_ok(&mut self) -> bool {
+        restart_debounce_ok(&mut self.last_git_restart, std::time::Instant::now())
+    }
+
+    pub(crate) fn git_notice_is_new(&mut self, merge_commit: &str) -> bool {
+        notice_is_new(&mut self.git_notices, merge_commit)
+    }
+
+    pub(crate) fn git_log_path(&self) -> PathBuf {
+        // `GIT_LOG_FILE` exists so this name has exactly one definition; hard-coding the
+        // literal here re-opens precisely the drift the constant prevents.
+        self.paths.logs_dir.join(crate::git::GIT_LOG_FILE)
     }
 
     /// Log file capturing Chrome's own stdout/stderr (GPU probes, GCM
@@ -89,11 +162,17 @@ impl App {
     /// previously went stale after `HostEvent::RestartRequested`).
     pub(crate) fn refresh_tray(&mut self, tray_handle: &mut Option<tray::Tray>, show_open: bool) {
         let settings_enabled = self.cfg.settings_enabled();
+        // Hidden when there is nothing to sync: [git] absent, tray_sync off, or
+        // a registry with no repos in it. An entry that cannot do anything is
+        // worse than no entry.
+        let show_sync = self.cfg.git.as_ref().is_some_and(|g| g.tray_sync)
+            && self.git.as_ref().is_some_and(|g| g.repo_count() > 0);
         let model = tray::menu_model(
             &self.cfg.menu,
             &self.cfg.app.name,
             settings_enabled,
             show_open,
+            show_sync,
         );
         match tray_handle {
             Some(t) => {
@@ -203,8 +282,19 @@ impl App {
                 }
                 _ => Vec::new(),
             };
-            let env =
-                supervisor::build_env(&server_cfg.env, &settings_env, &self.paths.settings_file);
+            // Its own binding: `HostAccess` borrows the url, so it cannot be a temporary
+            // inside the struct literal.
+            let host_url = format!("http://127.0.0.1:{}", self.port);
+            let env = supervisor::build_env(
+                &server_cfg.env,
+                &settings_env,
+                &self.paths.settings_file,
+                &supervisor::HostAccess {
+                    url: &host_url,
+                    token: &self.host_token,
+                    git_enabled: self.cfg.git_enabled(),
+                },
+            );
             let cwd = supervisor::resolve_cwd(server_cfg.cwd.as_deref(), &supervisor::base_dir());
             let log_path = self.paths.logs_dir.join("server.log");
             // tokio::process::Command::spawn() needs runtime context (it
@@ -327,7 +417,17 @@ impl App {
 
     pub(crate) fn quit(&mut self) -> ! {
         self.log("quit");
+        // Children die FIRST, before any sync. A quit sync can take seconds on
+        // a slow network: leaving Chrome and the server alive through it means
+        // the user clicked Quit and then watched the window sit there. Worse,
+        // a live child could still be rewriting the very settings.json the
+        // sync is about to commit, so the pushed copy would be a torn read.
         self.kill_children();
+        // Bounded by [git].quit_sync_timeout_secs (0 disables it entirely), so
+        // an unreachable remote delays exit by that much and no more.
+        if let (Some(git), Some(timeout)) = (&self.git, quit_sync_timeout(&self.cfg)) {
+            git.run_quit_syncs(timeout);
+        }
         std::process::exit(0);
     }
 
@@ -442,5 +542,109 @@ impl App {
             }
             Err(e) => self.log(&format!("settings: failed to launch chrome: {e}")),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::VecDeque;
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn restart_debounce_drops_a_second_restart_inside_the_window() {
+        let t0 = Instant::now();
+        let mut last = None;
+        assert!(
+            restart_debounce_ok(&mut last, t0),
+            "the first restart is always allowed"
+        );
+        assert!(
+            !restart_debounce_ok(
+                &mut last,
+                t0 + Duration::from_millis(RESTART_DEBOUNCE_MS - 1)
+            ),
+            "a restart 1ms inside the window must be dropped"
+        );
+        assert!(
+            restart_debounce_ok(&mut last, t0 + Duration::from_millis(RESTART_DEBOUNCE_MS)),
+            "the window is closed, not open, at exactly RESTART_DEBOUNCE_MS"
+        );
+        // An accepted restart re-arms the window from its own timestamp, so a
+        // steady drip of events can never restart faster than the debounce.
+        assert!(
+            !restart_debounce_ok(
+                &mut last,
+                t0 + Duration::from_millis(RESTART_DEBOUNCE_MS + 1)
+            ),
+            "the accepted restart must become the new mark"
+        );
+    }
+
+    #[test]
+    fn conflict_notice_fires_once_per_merge_commit() {
+        let mut seen = VecDeque::new();
+        assert!(notice_is_new(&mut seen, "abc123"));
+        // A push that fails and is retried re-reports the SAME merge commit.
+        // One overwrite, at most one modal.
+        assert!(!notice_is_new(&mut seen, "abc123"));
+        assert!(
+            notice_is_new(&mut seen, "def456"),
+            "a different merge is a different event"
+        );
+        assert!(!notice_is_new(&mut seen, "abc123"));
+    }
+
+    #[test]
+    fn conflict_notice_history_is_bounded_and_evicts_oldest_first() {
+        let mut seen = VecDeque::new();
+        for i in 0..GIT_NOTICE_HISTORY {
+            assert!(notice_is_new(&mut seen, &format!("commit{i}")));
+        }
+        assert_eq!(seen.len(), GIT_NOTICE_HISTORY);
+        assert!(notice_is_new(&mut seen, "overflow"));
+        assert_eq!(
+            seen.len(),
+            GIT_NOTICE_HISTORY,
+            "the set must not grow past its bound"
+        );
+        // commit0 was evicted, so it reports as new again — the price of a
+        // bounded set, and 16 dismissals of distinct merges in one session is
+        // far outside anything a user does.
+        assert!(notice_is_new(&mut seen, "commit0"));
+        // …while a recent id is still remembered.
+        assert!(!notice_is_new(
+            &mut seen,
+            &format!("commit{}", GIT_NOTICE_HISTORY - 1)
+        ));
+    }
+
+    fn cfg(toml: &str) -> AppConfig {
+        AppConfig::from_str(&format!(
+            "[app]\nname = \"T\"\nidentifier = \"com.example.t\"\n{toml}"
+        ))
+        .unwrap()
+    }
+
+    #[test]
+    fn quit_sync_timeout_is_none_without_git_and_none_at_zero() {
+        // No `[git]` at all: `quit()` must not even reach the git branch.
+        assert_eq!(quit_sync_timeout(&cfg("")), None);
+        // `0` is the author's explicit "never hold quit for a sync", not "no ceiling".
+        assert_eq!(
+            quit_sync_timeout(&cfg("[git]\nquit_sync_timeout_secs = 0\n")),
+            None
+        );
+        assert_eq!(
+            quit_sync_timeout(&cfg("[git]\nquit_sync_timeout_secs = 10\n")),
+            Some(Duration::from_secs(10))
+        );
+        // And the shipped default is a bounded number of seconds, not zero and not
+        // something that would make quit feel hung.
+        let default = quit_sync_timeout(&cfg("[git]\n")).expect("the default must be a ceiling");
+        assert!(
+            (Duration::from_secs(1)..=Duration::from_secs(60)).contains(&default),
+            "{default:?} is outside the range a user will wait through"
+        );
     }
 }

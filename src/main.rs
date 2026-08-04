@@ -40,10 +40,6 @@ pub(crate) fn dialog(title: &str, description: &str) {
 
 /// Non-error modal: same shape as `dialog` at warning level, for outcomes the
 /// user should see that did not stop the app from working.
-///
-/// `expect` rather than `allow` so the attribute cannot outlive its reason —
-/// the first caller turns the unfulfilled expectation back into a warning.
-#[expect(dead_code)]
 pub(crate) fn notice(title: &str, description: &str) {
     rfd::MessageDialog::new()
         .set_level(rfd::MessageLevel::Warning)
@@ -127,9 +123,20 @@ fn main() {
     };
     let status = Arc::new(RwLock::new(AppStatus::Starting));
     let (host_tx, host_rx) = mpsc::unbounded_channel::<HostEvent>();
+    // Built before HostState so one token reaches both the HTTP guard and the
+    // [server] child's environment, and so HostState can carry the service the
+    // /api/git sub-router needs. `None` here is what makes /api/git answer
+    // git_disabled and keeps repos/ from ever being created.
+    let git_service = git::GitService::new(
+        &cfg,
+        &paths,
+        rt.handle().clone(),
+        host_tx.clone(),
+        status.clone(),
+    );
     let state = HostState {
         app_name: cfg.app.name.clone(),
-        token,
+        token: token.clone(),
         status: status.clone(),
         schema: if cfg.settings_enabled() {
             cfg.settings.clone()
@@ -138,7 +145,7 @@ fn main() {
         },
         settings_file: paths.settings_file.clone(),
         events: host_tx,
-        git: None,
+        git: git_service.clone(),
     };
     let port = rt
         .block_on(internal_server::start(state))
@@ -152,12 +159,34 @@ fn main() {
         let mut event_loop = event_loop; // shadow for set_activation_policy(&mut)
         event_loop.set_activation_policy(ActivationPolicy::Accessory);
         run(
-            event_loop, cfg, paths, chrome_exe, port, status, rt, guard, host_log, host_rx,
+            event_loop,
+            cfg,
+            paths,
+            chrome_exe,
+            port,
+            status,
+            rt,
+            guard,
+            host_log,
+            host_rx,
+            token,
+            git_service,
         );
     }
     #[cfg(not(target_os = "macos"))]
     run(
-        event_loop, cfg, paths, chrome_exe, port, status, rt, guard, host_log, host_rx,
+        event_loop,
+        cfg,
+        paths,
+        chrome_exe,
+        port,
+        status,
+        rt,
+        guard,
+        host_log,
+        host_rx,
+        token,
+        git_service,
     );
 }
 
@@ -173,6 +202,8 @@ fn run(
     _lock_guard: fd_lock::RwLockWriteGuard<'_, std::fs::File>,
     host_log: std::fs::File,
     mut host_rx: mpsc::UnboundedReceiver<HostEvent>,
+    host_token: String,
+    git: Option<std::sync::Arc<crate::git::GitService>>,
 ) -> ! {
     let proxy = event_loop.create_proxy();
     MenuEvent::set_event_handler(Some({
@@ -207,6 +238,10 @@ fn run(
         in_tray_mode: false,
         cfg,
         paths,
+        git,
+        host_token,
+        last_git_restart: None,
+        git_notices: std::collections::VecDeque::new(),
     };
     let mut tray_handle: Option<tray::Tray> = None;
 
@@ -217,6 +252,19 @@ fn run(
                 // tray must be created after the loop starts (macOS requirement)
                 app.refresh_tray(&mut tray_handle, app.in_tray_mode);
                 app.start_children();
+                // Git goes last, and sync_on_start last of all. Both orderings
+                // are deliberate: the child server is already up, so a
+                // sync_settings pull restarts a live child instead of racing
+                // the first spawn; and a wedged network at launch cannot make
+                // the app look dead before the first window appears, because
+                // both calls return immediately and do their work on the
+                // runtime. start() also creates repos/, applies the libgit2
+                // network timeouts, recovers stale index.lock files and spawns
+                // one auto-sync task per repo with auto_sync_secs > 0.
+                if let Some(git) = &app.git {
+                    git.start();
+                    git.sync_on_start();
+                }
             }
             Event::UserEvent(UserEvent::Menu(id)) => {
                 let action = tray_handle
@@ -250,6 +298,16 @@ fn run(
                         app.open_settings();
                         app.refresh_tray(&mut tray_handle, app.in_tray_mode);
                     }
+                    // Admits one sync per repo and returns instantly; busy
+                    // repos are skipped with a log line inside the service.
+                    // No refresh_tray: the menu did not change, and reflecting
+                    // busy state there would mean rebuilding the tray on every
+                    // job transition for a purely cosmetic gain.
+                    Some(tray::TrayAction::GitSync) => {
+                        if let Some(git) = &app.git {
+                            git.sync_all_manual();
+                        }
+                    }
                     Some(tray::TrayAction::OpenUrl(url)) => {
                         let _ = open::that(url);
                     }
@@ -259,6 +317,92 @@ fn run(
             Event::UserEvent(UserEvent::Host(HostEvent::RestartRequested)) => {
                 app.restart();
                 app.refresh_tray(&mut tray_handle, app.in_tray_mode);
+            }
+            Event::UserEvent(UserEvent::Host(HostEvent::GitRestartChildren {
+                repo_id,
+                reason,
+            })) => {
+                // A background sync must never steal focus from a user who
+                // deliberately minimised the app, and must not fight a restart
+                // that is already in flight.
+                if app.in_tray_mode {
+                    app.log(&format!(
+                        "git[{repo_id}]: restart suppressed ({reason}) — in tray mode"
+                    ));
+                } else if app.git_restart_ok() {
+                    app.log(&format!("git[{repo_id}]: restarting children ({reason})"));
+                    app.restart();
+                    app.refresh_tray(&mut tray_handle, app.in_tray_mode);
+                }
+            }
+            Event::UserEvent(UserEvent::Host(HostEvent::GitFailed {
+                repo_id,
+                op,
+                code,
+                message,
+            })) => {
+                app.log(&format!("git[{repo_id}]: {op} failed [{code}]: {message}"));
+                // GitService sends this only on an ok -> fail transition, and
+                // that gate is what makes a modal safe here: dialog() blocks
+                // this loop — menu clicks and ChromeExited included — so a repo
+                // whose token expired with auto_sync_secs = 300 would otherwise
+                // stack one modal every five minutes forever, with the tray
+                // unreachable to turn it off.
+                if app.cfg.git.as_ref().is_some_and(|g| g.error_dialogs) && !app.in_tray_mode {
+                    let log = app.git_log_path();
+                    dialog(
+                        &app.cfg.app.name,
+                        &format!(
+                            "Git {op} failed for \"{repo_id}\" ({code}).\n\n{message}\n\nLog: {}",
+                            log.display()
+                        ),
+                    );
+                }
+            }
+            Event::UserEvent(UserEvent::Host(HostEvent::GitConflictsResolved {
+                repo_id,
+                merge_commit,
+                paths,
+            })) => {
+                app.log(&format!(
+                    "git[{repo_id}]: {} file(s) resolved in favour of the local copy in \
+                     {merge_commit}: {}",
+                    paths.len(),
+                    paths.join(", ")
+                ));
+                // A prefer-local merge that resolved a conflict has, by
+                // definition, overwritten an edit made somewhere else. Silent
+                // data loss is the one thing worth breaking "git is invisible
+                // by default" for. Three guards keep the modal safe: tray-mode
+                // suppression, de-duplication on the merge commit (a push that
+                // fails and is retried re-reports the SAME merge), and the
+                // 10-path cap below so a large merge stays readable.
+                if app.cfg.git.as_ref().is_some_and(|g| g.error_dialogs)
+                    && !app.in_tray_mode
+                    && app.git_notice_is_new(&merge_commit)
+                {
+                    let log = app.git_log_path();
+                    // notice(), not dialog(): the sync SUCCEEDED. Painting it
+                    // red would misrepresent what happened and train the user
+                    // to dismiss the real failure dialogs too.
+                    notice(
+                        &app.cfg.app.name,
+                        &format!(
+                            "\"{repo_id}\" synced, but {n} file(s) had been changed both here \
+                             and remotely. The local version was kept:\n\n{list}\n\nThe remote \
+                             version is not lost — recover it with:\n  \
+                             git show {merge_commit}^2:<path>\n\nLog: {log}",
+                            n = paths.len(),
+                            list = paths
+                                .iter()
+                                .take(10)
+                                .map(|p| format!("  {p}"))
+                                .collect::<Vec<_>>()
+                                .join("\n"),
+                            log = log.display()
+                        ),
+                    );
+                }
             }
             Event::UserEvent(UserEvent::ChromeExited { generation }) => {
                 if generation != app.chrome_generation() {
