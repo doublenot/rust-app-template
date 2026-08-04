@@ -2416,6 +2416,31 @@ git commit -m "feat(git): forget a repo's terminal job records on delete"
 
 ---
 
+**Test names: this task versus spec §10.2.** The spec sketches its test list in prose and
+several names here are longer or split differently. The tests are **not** renamed to match —
+the names below say what they assert, which is what a name is for — so this table is the
+mapping. Every §10.2 item is covered.
+
+| spec §10.2 | this task |
+|---|---|
+| `second_op_on_busy_repo_is_409_with_the_running_job_id` | `second_op_on_a_busy_repo_is_refused_with_the_running_job` |
+| `replay_precedes_busy` | `replay_precedes_busy` (same) |
+| `replay_of_a_failed_job_admits_a_fresh_one` | same |
+| `different_repos_run_in_parallel` | same |
+| `lease_released_on_panic` | `lease_is_released_when_the_worker_panics` |
+| `eviction` | `eviction_respects_the_cap_the_live_job_and_the_age_floor` **+** `a_young_terminal_record_survives_a_burst` (the 60 s floor is split out, because it is the rule a naive `while len > cap` implementation breaks) |
+| `ttl_expiry` … `request_id` reusable after eviction | `ttl_expiry_drops_the_record_and_frees_the_request_id` |
+| state-machine invariants (`result.is_some() ⟺ Succeeded`; terminal never mutates) | `a_terminal_slot_never_mutates_again` **+** `a_failed_slot_carries_an_error_and_no_result` |
+| `foreign_host_instance_job_id_is_not_found` | `lookup_rejects_a_foreign_host_instance` |
+
+Six tests here have no §10.2 counterpart and are additions: `job_id_is_the_documented_format`,
+`random_host_instance_is_eight_lowercase_hex_chars`, `the_wire_vocabulary_is_fixed`,
+`abort_flag_keeps_the_first_reason`, `views_carry_the_wire_shape`,
+`progress_is_throttled_but_percent_changes_always_land`, `list_is_newest_first_and_honours_the_filter`,
+`draining_refuses_new_jobs`, `abort_all_trips_only_live_jobs`,
+`forget_repo_drops_terminal_records_and_leaves_a_live_job_alone`, and
+`lookup_evicts_before_it_answers`.
+
 - [ ] **Step 61: Prove the file is clean and the tests really do not sleep**
 
 Run, in order:
