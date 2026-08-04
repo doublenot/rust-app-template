@@ -18,6 +18,29 @@ const STYLE_CSS: &str = include_str!("assets/style.css");
 #[derive(Debug, Clone, PartialEq)]
 pub enum HostEvent {
     RestartRequested,
+    /// Git wants the children restarted (a pull moved HEAD, or settings changed).
+    ///
+    /// This MUST travel the channel rather than calling `App::restart()` directly:
+    /// `restart()` calls `kill_children()`, which calls `rt.block_on`, and `block_on`
+    /// panics when called from inside a runtime worker thread. The hop is load-bearing.
+    GitRestartChildren {
+        repo_id: String,
+        reason: &'static str,
+    },
+    GitFailed {
+        repo_id: String,
+        op: String,
+        code: String,
+        message: String,
+    },
+    /// A sync succeeded but resolved conflicts in favour of the local copy — it
+    /// overwrote someone else's edit. Carries the merge commit so the consumer can
+    /// de-duplicate: one data-loss event, at most one dialog, ever.
+    GitConflictsResolved {
+        repo_id: String,
+        merge_commit: String,
+        paths: Vec<String>,
+    },
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
