@@ -185,6 +185,35 @@ pub enum SshHostKeyPolicy {
     Accept,
 }
 
+pub const MAX_BRANCH_NAME_LEN: usize = 200;
+
+/// Single source of truth for every branch name this host will accept:
+/// `[git].default_branch`, `repos[].branch` in `repos.json`, and the body of
+/// `POST /api/git/repos/<id>/branch`.
+///
+/// Deliberately stricter than git's own `check_ref_format`, and a whitelist rather
+/// than a blacklist: `[A-Za-z0-9._/-]` already excludes ASCII control characters,
+/// whitespace, `@`, `~`, `^`, `:`, `?`, `*`, `[`, `\` and every shell metacharacter,
+/// so a future git relaxing its own rules cannot widen ours by accident.
+pub fn validate_branch_name(name: &str) -> bool {
+    if name.is_empty() || name.len() > MAX_BRANCH_NAME_LEN {
+        return false;
+    }
+    if !name
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '/' | '-'))
+    {
+        return false;
+    }
+    if name.contains("..") || name.contains("//") {
+        return false;
+    }
+    if name.starts_with('-') || name.starts_with('/') || name.ends_with('/') {
+        return false;
+    }
+    !name.ends_with(".lock")
+}
+
 impl AppConfig {
     pub fn from_str(s: &str) -> Result<Self, String> {
         let cfg: AppConfig = toml::from_str(s).map_err(|e| format!("app.toml parse error: {e}"))?;
@@ -292,6 +321,14 @@ impl AppConfig {
                         }
                     }
                 }
+            }
+        }
+        if let Some(git) = &self.git {
+            if !validate_branch_name(&git.default_branch) {
+                return Err(format!(
+                    "git.default_branch {:?} is not a valid branch name",
+                    git.default_branch
+                ));
             }
         }
         Ok(())
@@ -495,5 +532,35 @@ mod tests {
         assert_eq!(c.git.unwrap().ssh_host_key_policy, SshHostKeyPolicy::Accept);
         let s = format!("{}[git]\nssh_host_key_policy = \"strict\"\n", minimal());
         assert!(AppConfig::from_str(&s).is_err());
+    }
+
+    #[test]
+    fn branch_names() {
+        for good in [
+            "main",
+            "a",
+            "feature/x",
+            "v1.2.3",
+            "a-b_c",
+            "release/2026.08",
+        ] {
+            assert!(validate_branch_name(good), "rejected {good:?}");
+        }
+        for bad in [
+            "", "-x", "/x", "x/", "a..b", "a//b", "@", "x.lock", "a b", "a~b", "héllo", "a\tb",
+        ] {
+            assert!(!validate_branch_name(bad), "accepted {bad:?}");
+        }
+        assert!(validate_branch_name(&"a".repeat(MAX_BRANCH_NAME_LEN)));
+        assert!(!validate_branch_name(&"a".repeat(MAX_BRANCH_NAME_LEN + 1)));
+    }
+
+    #[test]
+    fn git_default_branch_message() {
+        let s = format!("{}[git]\ndefault_branch = \"bad branch\"\n", minimal());
+        assert_eq!(
+            AppConfig::from_str(&s).unwrap_err(),
+            "git.default_branch \"bad branch\" is not a valid branch name"
+        );
     }
 }
