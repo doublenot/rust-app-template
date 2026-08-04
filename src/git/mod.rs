@@ -16,6 +16,7 @@
 
 pub mod error;
 pub mod secret;
+pub mod util;
 
 #[cfg(test)]
 mod tests {
