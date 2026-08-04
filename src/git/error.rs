@@ -176,9 +176,81 @@ impl GitErrorCode {
     }
 }
 
+/// Why a job's abort flag was raised. Lives here, next to `classify`, because a bare
+/// `AtomicBool` cannot tell "the watchdog fired" from "the user quit" — and libgit2
+/// reports both as the same callback error.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AbortReason {
+    None,
+    Timeout,
+    Shutdown,
+}
+
+impl AbortReason {
+    pub fn as_u8(self) -> u8 {
+        match self {
+            AbortReason::None => 0,
+            AbortReason::Timeout => 1,
+            AbortReason::Shutdown => 2,
+        }
+    }
+
+    /// Any unknown byte reads back as `None`: the flag is only ever written by
+    /// `as_u8`, so an out-of-range value means memory we do not own and "not aborted"
+    /// is the answer that cannot invent a failure.
+    pub fn from_u8(v: u8) -> AbortReason {
+        match v {
+            1 => AbortReason::Timeout,
+            2 => AbortReason::Shutdown,
+            _ => AbortReason::None,
+        }
+    }
+}
+
+/// Map a libgit2 error onto our vocabulary.
+///
+/// The order of the arms is the whole design: code-first for the codes that are
+/// unambiguous, then the callback arm, then class-based fallbacks.
+pub fn classify(e: &git2::Error, abort: AbortReason) -> GitErrorCode {
+    use git2::{ErrorClass as K, ErrorCode as C};
+    use GitErrorCode as G;
+    match (e.code(), e.class()) {
+        (C::Auth, _) => G::AuthFailed,
+        (C::Certificate, K::Ssh) => G::HostKeyMismatch,
+        (C::Certificate, _) => G::CertificateInvalid,
+        (C::NotFastForward, _) => G::NotFastForward,
+        (C::Locked, _) => G::RepoLocked,
+        (C::Exists, _) => G::AlreadyExists,
+        (C::UnbornBranch, _) => G::UnbornBranch,
+        (C::Uncommitted, _) | (C::IndexDirty, _) => G::DirtyTree,
+        (C::Unmerged, _) | (C::Conflict, _) | (C::MergeConflict, _) => G::MergeUnresolvable,
+        // Verified against git2 0.21 / libgit2 1.9: a `transfer_progress` callback
+        // returning `false` surfaces as code = GenericError, class = Callback
+        // ("indexer progress callback returned -1") — NOT as `ErrorCode::User`, which
+        // is the intuitive guess and is wrong. Since the class is all libgit2 gives
+        // us, our own abort flag is the only thing that can tell a watchdog timeout
+        // from a shutdown from a genuine transport failure inside the callback.
+        (_, K::Callback) => match abort {
+            AbortReason::Timeout => G::Timeout,
+            AbortReason::Shutdown => G::Canceled,
+            AbortReason::None => G::NetworkFailed,
+        },
+        // libgit2's own connect/idle timeout. Its class is `Net`, so without this arm
+        // it would be reported as `network_failed` and lose the one distinction that
+        // tells a caller to raise `[git].network_timeout_secs`.
+        (C::Timeout, _) => G::Timeout,
+        (C::NotFound, K::Net) | (C::NotFound, K::Reference) => G::RemoteNotFound,
+        (C::NotFound, K::Repository) => G::NoWorktree,
+        (_, K::Net | K::Http | K::Ssl | K::Zlib | K::Indexer) => G::NetworkFailed,
+        (_, K::Os | K::Filesystem) => G::IoFailed,
+        _ => G::Internal,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use git2::{ErrorClass as K, ErrorCode as C};
     use GitErrorCode as G;
 
     /// Every variant, its wire string, its HTTP status, and its retryability.
@@ -282,5 +354,78 @@ mod tests {
     fn auth_failure_is_a_bad_gateway_not_an_unauthorized() {
         assert_eq!(G::AuthFailed.http_status(), StatusCode::BAD_GATEWAY);
         assert_eq!(G::Unauthorized.http_status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[test]
+    fn abort_reason_round_trips_through_a_byte() {
+        for r in [
+            AbortReason::None,
+            AbortReason::Timeout,
+            AbortReason::Shutdown,
+        ] {
+            assert_eq!(AbortReason::from_u8(r.as_u8()), r);
+        }
+        assert_eq!(AbortReason::from_u8(200), AbortReason::None);
+    }
+
+    fn err(code: C, class: K) -> git2::Error {
+        git2::Error::new(code, class, "synthetic")
+    }
+
+    #[test]
+    fn classify_covers_every_row_of_the_taxonomy() {
+        let cases: &[(C, K, GitErrorCode)] = &[
+            (C::Auth, K::Http, G::AuthFailed),
+            (C::Auth, K::Ssh, G::AuthFailed),
+            (C::Certificate, K::Ssh, G::HostKeyMismatch),
+            (C::Certificate, K::Ssl, G::CertificateInvalid),
+            (C::Certificate, K::Http, G::CertificateInvalid),
+            (C::NotFastForward, K::Reference, G::NotFastForward),
+            (C::Locked, K::Index, G::RepoLocked),
+            (C::Exists, K::Repository, G::AlreadyExists),
+            (C::UnbornBranch, K::Reference, G::UnbornBranch),
+            (C::Uncommitted, K::Checkout, G::DirtyTree),
+            (C::IndexDirty, K::Index, G::DirtyTree),
+            (C::Unmerged, K::Index, G::MergeUnresolvable),
+            (C::Conflict, K::Checkout, G::MergeUnresolvable),
+            (C::MergeConflict, K::Merge, G::MergeUnresolvable),
+            (C::Timeout, K::Net, G::Timeout),
+            (C::NotFound, K::Net, G::RemoteNotFound),
+            (C::NotFound, K::Reference, G::RemoteNotFound),
+            (C::NotFound, K::Repository, G::NoWorktree),
+            (C::GenericError, K::Net, G::NetworkFailed),
+            (C::GenericError, K::Http, G::NetworkFailed),
+            (C::GenericError, K::Ssl, G::NetworkFailed),
+            (C::GenericError, K::Zlib, G::NetworkFailed),
+            (C::GenericError, K::Indexer, G::NetworkFailed),
+            (C::GenericError, K::Os, G::IoFailed),
+            (C::GenericError, K::Filesystem, G::IoFailed),
+            // Nothing claims these: the tail must be `internal`, not a guess.
+            (C::NotFound, K::Object, G::Internal),
+            (C::GenericError, K::Config, G::Internal),
+        ];
+        for (code, class, want) in cases {
+            assert_eq!(
+                classify(&err(*code, *class), AbortReason::None),
+                *want,
+                "({code:?}, {class:?})"
+            );
+        }
+    }
+
+    #[test]
+    fn a_callback_abort_is_not_a_user_error() {
+        let e = err(C::GenericError, K::Callback);
+        assert_eq!(classify(&e, AbortReason::Timeout), G::Timeout);
+        assert_eq!(classify(&e, AbortReason::Shutdown), G::Canceled);
+        assert_eq!(classify(&e, AbortReason::None), G::NetworkFailed);
+    }
+
+    #[test]
+    fn the_abort_reason_never_overrides_a_classified_error() {
+        // A shutdown racing a genuine auth rejection must still report auth_failed:
+        // the operation did not fail *because* we aborted it.
+        let e = err(C::Auth, K::Http);
+        assert_eq!(classify(&e, AbortReason::Shutdown), G::AuthFailed);
     }
 }
