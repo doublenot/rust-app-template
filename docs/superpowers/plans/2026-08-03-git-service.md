@@ -124,14 +124,16 @@ listed here rather than dropped because the fix pass was cut short by an account
 | 11 | *(same)* Step 11's `mirror_job` helper takes `host_settings: &PathBuf`, which fails `clippy::ptr_arg` under `-D warnings`. Changed to `&std::path::Path` |
 | 11 | Steps 17/18 came out the way the plan predicted: both restart tests pass with **no** edit to `decide_restart`. Mutation-verified rather than assumed — deleting the `|| out.settings_changed` OR-term gives "expected exactly one restart request, got []", and pinning `reason` to `"requested"` gives "a restart caused by the settings mirror must say so" |
 | 11 | *(same)* The plan's claim that task 8 added `use crate::git::merge::testkit;` to `ops.rs`'s test module is wrong — task 8 put the testkit to work in `merge.rs`, not `ops.rs`. The import is added here |
+| 12 | Step 16's grep expectations were a range ("accept two or three hits") that could not fail. Replaced with exact measured counts and a one-line note per count saying which sections produce them: `perl make pkg-config` 2, `LIBGIT2_NO_VENDOR=1` 1, `APP_GIT_ENABLED` 2, `git-state.json` 3, `registry_writes` 3, `error_dialogs` 3 |
+| 12 | §14 risk 3 is now a blockquote in §9.6: a settings change arriving from the remote relaunches Chrome and discards scroll position and in-page state, which is why the restart is gated on a validated *value* differing rather than on the file changing |
+| 12 | §14 risk 11 is now a second blockquote there: the write-back races the settings page, last writer wins the whole file, it can never corrupt (the file is always written whole), worst case is one lost update — and the obvious "fix" would silently drop the *remote's* values instead |
+| 12 | *(found during execution)* Steps 8 and 36 both `grep -n 'TODO\|TBD\|FIXME' README.md` and expect **no output**, but §7 has always carried "code signing and notarization … are a per-app TODO" — deliberate prose telling the template user what they still owe. Neither grep could ever pass. Both are now scoped to §9 onward |
+| 12 | `registry_writes` appeared only twice (§3 table, §5 delta) against the plan's "at least three". §9.4 gained the paragraph that was actually missing: `PUT` answers 201 then 200 on replace, and `registry_writes = false` turns both `PUT` and `DELETE` into `403 registry_read_only` |
+| 12 | Two of the four network tests were run here and pass: `vendored_tls_trusts_public_ca` (17.3 s, a real clone of rust-lang/libc — the vendored OpenSSL build does find this platform's CA store) and `wrong_token_fails_once` (0.4 s to `auth_failed`, so the `MAX_CRED_ATTEMPTS` cap is holding rather than replaying fifteen times). `real_https_clone_and_push_and_server_rejection` and `real_ssh_clone_pins_the_host_key` need a scratch repository and credentials and are left for the maintainer |
 
 ### Still to apply
 
-| task | finding | fix |
-|---|---|---|
-| 12 | Step 16's expected grep count is a range ("accept two or three hits") and cannot fail usefully | Pin it to an exact count or grep two specific anchors |
-| 12 | §14 risk 3's consequence is never stated in the README | Bold warning: a validated settings change restarts the server child and relaunches Chrome, discarding scroll position and in-page state |
-| 12 | §14 risk 11's race is never stated in the README | One sentence: never corrupts, worst case one lost update |
+Nothing. Every row above was applied and re-measured during execution.
 
 Two contract-vs-task drifts were also flagged and left alone as additive rather than contradictory:
 task 9 consumes `Registry::notes() -> &[String]` and `StateStore::load_error() -> Option<&str>`,

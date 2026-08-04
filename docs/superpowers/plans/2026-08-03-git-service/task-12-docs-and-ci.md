@@ -1457,13 +1457,18 @@ amend the last commit rather than adding a formatting-only commit.
 Run:
 
 ```bash
-grep -n 'TODO\|TBD\|FIXME\|XXX' README.md
+sed -n '/^## 9\. Git service/,$p' README.md | grep -n 'TODO\|TBD\|FIXME\|XXX'
 grep -n 'GIT_TEST_HTTPS_URL\|GIT_TEST_TOKEN\|GIT_TEST_SSH_URL\|GIT_TEST_SSH_KEY' README.md
 grep -c '^## ' README.md
 git status --short
 ```
 
-Expected: the first grep produces **no output** (exit 1 — README has no
-placeholders left); the second shows all four test env vars documented in §9.7;
-the third prints `9` (§1 through §9); and `git status --short` prints nothing —
-every change from this task is committed.
+Expected: the first grep produces **no output** (exit 1 — §9 has no placeholders
+left); the second shows all four test env vars documented in §9.7 (five hits:
+the four assignments in the run block, plus the `GIT_TEST_SSH_KEY` sentence
+below it); the third prints `9` (§1 through §9); and `git status --short` prints
+nothing — every change from this task is committed.
+
+Scoped to §9 like step 8's, and for the same reason: §7's "code signing and
+notarization … are a per-app TODO" is deliberate prose, so grepping the whole
+file could never pass.
