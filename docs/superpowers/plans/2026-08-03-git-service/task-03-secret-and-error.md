@@ -44,7 +44,7 @@ written. Do not re-wrap it — rustfmt will split it straight back.
   // NO Serialize. NO Display. Both absences are load-bearing.
 
   // src/git/error.rs                                        — consumed by tasks 4-11
-  pub enum GitErrorCode { /* 43 variants, see the table in Step 6 */ }
+  pub enum GitErrorCode { /* 42 variants, see the table in Step 6 */ }
   impl GitErrorCode {
       pub fn as_str(self) -> &'static str;
       pub fn http_status(self) -> axum::http::StatusCode;
@@ -371,7 +371,7 @@ reachable from main until it is wired up, and GitError is 152 bytes."
 - [ ] **Step 6: Write the failing test — the error code table**
 
 Create `src/git/error.rs` with the module doc, the one import the codes need, and the
-first batch of tests. The 43-row `TABLE` is the contract surface: `code` strings are
+first batch of tests. The 42-row `TABLE` is the contract surface: `code` strings are
 what clients `match` on and the HTTP statuses are what their middleware reacts to.
 
 ```rust
@@ -455,9 +455,18 @@ mod tests {
         (G::Internal, "internal", 500, false),
     ];
 
+    /// 42, not 43: `SettingsInvalid` was cut before implementation because invalid
+    /// settings pulled from a remote are a warning on a *successful* job, never an
+    /// error, so nothing could ever emit the code (see the note on the enum).
+    const CODE_COUNT: usize = 42;
+
     #[test]
     fn code_table_matches_the_contract() {
-        assert_eq!(TABLE.len(), 43, "every GitErrorCode variant needs a row");
+        assert_eq!(
+            TABLE.len(),
+            CODE_COUNT,
+            "every GitErrorCode variant needs a row"
+        );
         for (code, wire, status, retryable) in TABLE {
             assert_eq!(code.as_str(), *wire, "{code:?}");
             assert_eq!(code.http_status().as_u16(), *status, "{code:?}");
@@ -471,7 +480,11 @@ mod tests {
         for (code, wire, _, _) in TABLE {
             assert!(seen.insert(*wire), "duplicate wire string for {code:?}");
         }
-        assert_eq!(seen.len(), 43);
+        // Distinct wire strings prove the rows are distinct *variants* — `as_str` is a
+        // function of the variant — so TABLE.len() == CODE_COUNT plus this assertion
+        // together prove the table covers every variant exactly once, without needing
+        // a way to enumerate the enum.
+        assert_eq!(seen.len(), CODE_COUNT);
     }
 
     #[test]
