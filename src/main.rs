@@ -37,6 +37,21 @@ pub(crate) fn dialog(title: &str, description: &str) {
         .show();
 }
 
+/// Non-error modal: same shape as `dialog` at warning level, for outcomes the
+/// user should see that did not stop the app from working.
+///
+/// `expect` rather than `allow` so the attribute cannot outlive its reason —
+/// the first caller turns the unfulfilled expectation back into a warning.
+#[expect(dead_code)]
+pub(crate) fn notice(title: &str, description: &str) {
+    rfd::MessageDialog::new()
+        .set_level(rfd::MessageLevel::Warning)
+        .set_title(title)
+        .set_description(description)
+        .set_buttons(rfd::MessageButtons::Ok)
+        .show();
+}
+
 pub(crate) fn missing_chrome_dialog(app_name: &str) {
     let choice = rfd::MessageDialog::new()
         .set_level(rfd::MessageLevel::Warning)
