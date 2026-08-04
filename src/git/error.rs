@@ -7,6 +7,7 @@
 //! exactly one file — this one.
 
 use axum::http::StatusCode;
+use axum::response::{IntoResponse, Response};
 use serde::ser::SerializeStruct;
 use serde::{Serialize, Serializer};
 use std::path::Path;
@@ -630,6 +631,56 @@ impl From<serde_json::Error> for GitError {
     }
 }
 
+/// The §5.4 envelope for the fields a bare `GitError` carries.
+///
+/// `api::ApiError` is the richer form — it wraps the same error and adds
+/// `host_instance` (always) and `job` (`repo_busy` only). This impl exists for the
+/// answers produced where no service, and therefore no host instance, exists: the
+/// `git_disabled` fallback and the auth layer's `unauthorized`.
+impl IntoResponse for GitError {
+    fn into_response(self) -> Response {
+        // Hand-rolled so the field order is the envelope's order and the optional
+        // fields vanish rather than serialising as null.
+        struct Body<'a>(&'a GitError);
+        impl Serialize for Body<'_> {
+            fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+                let e = self.0;
+                let len = 2
+                    + usize::from(e.repo_id.is_some())
+                    + usize::from(e.path.is_some())
+                    + usize::from(e.field.is_some());
+                let mut st = s.serialize_struct("error", len)?;
+                st.serialize_field("code", e.code.as_str())?;
+                st.serialize_field("message", &e.message)?;
+                if let Some(v) = &e.repo_id {
+                    st.serialize_field("repo_id", v)?;
+                }
+                if let Some(v) = &e.path {
+                    st.serialize_field("path", v)?;
+                }
+                if let Some(v) = &e.field {
+                    st.serialize_field("field", v)?;
+                }
+                st.end()
+            }
+        }
+        #[derive(Serialize)]
+        struct Envelope<'a> {
+            error: Body<'a>,
+        }
+
+        let status = self.http_status();
+        let mut response = (status, axum::Json(Envelope { error: Body(&self) })).into_response();
+        if status == StatusCode::CONFLICT {
+            response.headers_mut().insert(
+                axum::http::header::RETRY_AFTER,
+                axum::http::HeaderValue::from_static("1"),
+            );
+        }
+        response
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -920,6 +971,61 @@ mod tests {
         assert_eq!(
             GitError::repo_not_found("notes").to_string(),
             "repo_not_found: repo \"notes\" is not in the registry"
+        );
+    }
+
+    async fn body_of(r: Response) -> String {
+        let bytes = axum::body::to_bytes(r.into_body(), 64 * 1024)
+            .await
+            .expect("body");
+        String::from_utf8(bytes.to_vec()).expect("utf-8 body")
+    }
+
+    #[tokio::test]
+    async fn envelope_carries_status_repo_id_and_retry_after() {
+        let r = GitError::repo_busy("notes", "sync").into_response();
+        assert_eq!(r.status(), StatusCode::CONFLICT);
+        assert_eq!(
+            r.headers().get("retry-after").and_then(|v| v.to_str().ok()),
+            Some("1")
+        );
+        assert_eq!(
+            body_of(r).await,
+            r#"{"error":{"code":"repo_busy","message":"repo \"notes\" is busy running sync","repo_id":"notes"}}"#
+        );
+    }
+
+    #[tokio::test]
+    async fn envelope_omits_absent_fields_and_sets_no_retry_after() {
+        let r = GitError::new(
+            GitErrorCode::GitDisabled,
+            "the host was built without a [git] section in app.toml",
+        )
+        .into_response();
+        assert_eq!(r.status(), StatusCode::NOT_FOUND);
+        assert!(r.headers().get("retry-after").is_none());
+        assert_eq!(
+            body_of(r).await,
+            r#"{"error":{"code":"git_disabled","message":"the host was built without a [git] section in app.toml"}}"#
+        );
+    }
+
+    #[tokio::test]
+    async fn envelope_names_the_offending_field_and_path() {
+        let r = GitError::invalid_request("auto_sync_secs", "must be a positive integer")
+            .into_response();
+        assert_eq!(r.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(
+            body_of(r).await,
+            r#"{"error":{"code":"invalid_request","message":"must be a positive integer","field":"auto_sync_secs"}}"#
+        );
+
+        let r = GitError::path_refused(Path::new("/data/repos/../etc"), "outside the repos root")
+            .into_response();
+        assert_eq!(r.status(), StatusCode::FORBIDDEN);
+        assert_eq!(
+            body_of(r).await,
+            r#"{"error":{"code":"path_refused","message":"refusing to touch /data/repos/../etc: outside the repos root","path":"/data/repos/../etc"}}"#
         );
     }
 }
