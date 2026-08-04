@@ -330,6 +330,35 @@ impl AppConfig {
                     git.default_branch
                 ));
             }
+            if git.author_name.contains(['<', '>', '\n']) {
+                return Err(
+                    "git.author_name must not contain '<', '>' or newlines (git \
+                            signatures cannot represent them)"
+                        .into(),
+                );
+            }
+            if !git.author_email.is_empty()
+                && (!git.author_email.contains('@')
+                    || git.author_email.contains(['<', '>'])
+                    || git.author_email.chars().any(char::is_whitespace))
+            {
+                return Err(format!(
+                    "git.author_email {:?} must look like a plain address, e.g. app@example.com",
+                    git.author_email
+                ));
+            }
+            if !(5..=3600).contains(&git.network_timeout_secs) {
+                return Err(format!(
+                    "git.network_timeout_secs must be between 5 and 3600 (got {})",
+                    git.network_timeout_secs
+                ));
+            }
+            if git.quit_sync_timeout_secs > 120 {
+                return Err(
+                    "git.quit_sync_timeout_secs must be 120 or less (0 disables sync_on_quit)"
+                        .into(),
+                );
+            }
         }
         Ok(())
     }
@@ -562,5 +591,51 @@ mod tests {
             AppConfig::from_str(&s).unwrap_err(),
             "git.default_branch \"bad branch\" is not a valid branch name"
         );
+    }
+
+    #[test]
+    fn git_author_messages() {
+        let s = format!("{}[git]\nauthor_name = \"A <a@b.c>\"\n", minimal());
+        assert_eq!(
+            AppConfig::from_str(&s).unwrap_err(),
+            "git.author_name must not contain '<', '>' or newlines (git signatures cannot \
+             represent them)"
+        );
+        for bad in ["nobody", "a b@c.d", "<a@b.c>"] {
+            let s = format!("{}[git]\nauthor_email = \"{bad}\"\n", minimal());
+            assert_eq!(
+                AppConfig::from_str(&s).unwrap_err(),
+                format!(
+                    "git.author_email \"{bad}\" must look like a plain address, \
+                     e.g. app@example.com"
+                )
+            );
+        }
+        let ok = format!(
+            "{}[git]\nauthor_name = \"App\"\nauthor_email = \"app@example.com\"\n",
+            minimal()
+        );
+        assert!(AppConfig::from_str(&ok).is_ok());
+    }
+
+    #[test]
+    fn git_timeout_messages() {
+        for bad in [0u64, 4, 3601] {
+            let s = format!("{}[git]\nnetwork_timeout_secs = {bad}\n", minimal());
+            assert_eq!(
+                AppConfig::from_str(&s).unwrap_err(),
+                format!("git.network_timeout_secs must be between 5 and 3600 (got {bad})")
+            );
+        }
+        let s = format!("{}[git]\nquit_sync_timeout_secs = 121\n", minimal());
+        assert_eq!(
+            AppConfig::from_str(&s).unwrap_err(),
+            "git.quit_sync_timeout_secs must be 120 or less (0 disables sync_on_quit)"
+        );
+        let ok = format!(
+            "{}[git]\nnetwork_timeout_secs = 5\nquit_sync_timeout_secs = 0\n",
+            minimal()
+        );
+        assert!(AppConfig::from_str(&ok).is_ok());
     }
 }
