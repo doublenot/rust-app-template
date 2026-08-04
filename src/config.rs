@@ -16,6 +16,8 @@ pub struct AppConfig {
     pub menu: MenuSection,
     #[serde(default)]
     pub settings: Option<SettingsSection>,
+    #[serde(default)]
+    pub git: Option<GitSection>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -127,6 +129,62 @@ pub enum FieldType {
     Select,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+// Consumed by the git service and the host wiring, neither of which exists yet.
+// The section is parsed and validated here regardless of whether anything reads
+// it, so that turning a git feature on later can never surface a *new* config
+// error at an awkward moment.
+#[allow(dead_code)]
+pub struct GitSection {
+    #[serde(default)]
+    pub tray_sync: bool,
+    #[serde(default)]
+    pub error_dialogs: bool,
+    #[serde(default)]
+    pub status_api: bool,
+    #[serde(default = "default_registry_writes")]
+    pub registry_writes: bool,
+    #[serde(default = "default_branch_name")]
+    pub default_branch: String,
+    #[serde(default)]
+    pub author_name: String,
+    #[serde(default)]
+    pub author_email: String,
+    #[serde(default = "default_network_timeout_secs")]
+    pub network_timeout_secs: u64,
+    #[serde(default = "default_quit_sync_timeout_secs")]
+    pub quit_sync_timeout_secs: u64,
+    #[serde(default)]
+    pub allow_http: bool,
+    #[serde(default)]
+    pub ssh_host_key_policy: SshHostKeyPolicy,
+}
+
+fn default_registry_writes() -> bool {
+    true
+}
+
+fn default_branch_name() -> String {
+    "main".to_string()
+}
+
+fn default_network_timeout_secs() -> u64 {
+    120
+}
+
+fn default_quit_sync_timeout_secs() -> u64 {
+    10
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SshHostKeyPolicy {
+    #[default]
+    Tofu,
+    Accept,
+}
+
 impl AppConfig {
     pub fn from_str(s: &str) -> Result<Self, String> {
         let cfg: AppConfig = toml::from_str(s).map_err(|e| format!("app.toml parse error: {e}"))?;
@@ -140,6 +198,13 @@ impl AppConfig {
 
     pub fn settings_enabled(&self) -> bool {
         self.menu.settings && self.settings.is_some()
+    }
+
+    // Called by the git service constructor and by `supervisor::build_env`, neither
+    // of which exists yet.
+    #[allow(dead_code)]
+    pub fn git_enabled(&self) -> bool {
+        self.git.is_some()
     }
 
     fn validate(&self) -> Result<(), String> {
@@ -389,5 +454,46 @@ mod tests {
         assert_eq!(p.logs_dir, p.data_dir.join("logs"));
         assert_eq!(p.settings_file, p.data_dir.join("settings.json"));
         assert_eq!(p.lock_file, p.data_dir.join("app.lock"));
+    }
+
+    #[test]
+    fn git_section_defaults() {
+        let c = AppConfig::from_str(&format!("{}[git]\n", minimal())).unwrap();
+        let g = c.git.as_ref().unwrap();
+        assert!(!g.tray_sync);
+        assert!(!g.error_dialogs);
+        assert!(!g.status_api);
+        assert!(g.registry_writes);
+        assert_eq!(g.default_branch, "main");
+        assert_eq!(g.author_name, "");
+        assert_eq!(g.author_email, "");
+        assert_eq!(g.network_timeout_secs, 120);
+        assert_eq!(g.quit_sync_timeout_secs, 10);
+        assert!(!g.allow_http);
+        assert_eq!(g.ssh_host_key_policy, SshHostKeyPolicy::Tofu);
+        assert!(c.git_enabled());
+    }
+
+    #[test]
+    fn absent_git_section_is_none() {
+        let c = AppConfig::from_str(minimal()).unwrap();
+        assert!(c.git.is_none());
+        assert!(!c.git_enabled());
+    }
+
+    #[test]
+    fn git_section_rejects_unknown_key() {
+        let s = format!("{}[git]\ntray_synk = true\n", minimal());
+        let err = AppConfig::from_str(&s).unwrap_err();
+        assert!(err.contains("tray_synk"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn ssh_host_key_policy_parses_and_rejects_unknown() {
+        let s = format!("{}[git]\nssh_host_key_policy = \"accept\"\n", minimal());
+        let c = AppConfig::from_str(&s).unwrap();
+        assert_eq!(c.git.unwrap().ssh_host_key_policy, SshHostKeyPolicy::Accept);
+        let s = format!("{}[git]\nssh_host_key_policy = \"strict\"\n", minimal());
+        assert!(AppConfig::from_str(&s).is_err());
     }
 }
