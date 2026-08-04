@@ -2352,4 +2352,126 @@ mod tests {
         // to sync, not to have their window replaced.
         assert_eq!(OpRequest::manual().restart_children, Some(false));
     }
+
+    /// A `GitOps` that reports a settings outcome without touching a work tree,
+    /// so `after_job`'s restart decision can be driven directly with no remote,
+    /// no libgit2 and no filesystem.
+    struct SettingsOps {
+        changed: bool,
+    }
+
+    impl GitOps for SettingsOps {
+        fn run(&self, _op: JobOp, ctx: &OpCtx) -> Result<OpOutcome, GitError> {
+            let mut out = OpOutcome::new("merged", &ctx.def.branch);
+            // HEAD moved in both cases, so the only variable between the two
+            // tests is whether the settings values actually changed.
+            out.head_before = Some("1111111111111111111111111111111111111111".to_string());
+            out.head_after = Some("2222222222222222222222222222222222222222".to_string());
+            out.settings_synced = true;
+            out.settings_changed = self.changed;
+            Ok(out)
+        }
+    }
+
+    /// Run one auto-triggered sync on a `sync_settings` repo and return every
+    /// host event it produced.
+    ///
+    /// `OpRequest::auto()` is the point of the test: it hard-codes
+    /// `restart_children: Some(false)`, which is what every timer and every
+    /// `sync_on_start` uses.
+    async fn settings_sync_events(changed: bool) -> Vec<HostEvent> {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = AppConfig::from_str(
+            "[app]\nname = \"X\"\nidentifier = \"com.example.x\"\n\
+             [menu]\nsettings = true\n\
+             [[settings.fields]]\n\
+             key = \"theme\"\nlabel = \"Theme\"\ntype = \"select\"\n\
+             default = \"light\"\noptions = [\"light\", \"dark\"]\n\
+             [git]\n",
+        )
+        .unwrap();
+        let paths = RuntimePaths::under(dir.path(), "com.example.x");
+        paths.ensure().unwrap();
+
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let status = std::sync::Arc::new(tokio::sync::RwLock::new(AppStatus::Ready {
+            target_url: "http://x/".to_string(),
+        }));
+        let svc = GitService::with_ops(
+            &cfg,
+            &paths,
+            tokio::runtime::Handle::current(),
+            tx,
+            status,
+            std::sync::Arc::new(SettingsOps { changed }),
+        );
+        svc.start();
+        // A remote is required for `sync` to be admitted at all — `remote_missing`
+        // is refused before a job record exists. `SettingsOps` never opens it, so
+        // the URL only has to be well-formed.
+        svc.put_repo(
+            "notes",
+            serde_json::from_value(serde_json::json!({
+                "id": "notes",
+                "sync_settings": true,
+                "remote": dir.path().join("origin.git").display().to_string(),
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        match svc.start_job("notes", JobOp::Sync, OpRequest::auto()) {
+            Ok(StartOutcome::Started(_)) => {}
+            Ok(_) => panic!("expected a freshly started job, got a replay or a busy repo"),
+            Err(e) => panic!("start_job refused the job: {e}"),
+        }
+        // The busy slot clears when the RepoLease drops, which is after the job
+        // and its notification have both run.
+        let mut finished = false;
+        for _ in 0..400 {
+            if svc.jobs().busy("notes").is_none() {
+                finished = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        assert!(finished, "job did not finish within 2s");
+
+        let mut events = Vec::new();
+        while let Ok(Some(e)) =
+            tokio::time::timeout(std::time::Duration::from_millis(200), rx.recv()).await
+        {
+            events.push(e);
+        }
+        events
+    }
+
+    #[tokio::test]
+    async fn a_settings_change_restarts_children_even_when_the_request_said_no() {
+        let events = settings_sync_events(true).await;
+        assert_eq!(
+            events.len(),
+            1,
+            "expected exactly one restart request, got {events:?}"
+        );
+        match &events[0] {
+            HostEvent::GitRestartChildren { repo_id, reason } => {
+                assert_eq!(repo_id, "notes");
+                assert_eq!(
+                    *reason, "settings",
+                    "a restart caused by the settings mirror must say so"
+                );
+            }
+            other => panic!("expected GitRestartChildren, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_sync_that_changed_no_settings_restarts_nothing() {
+        // The auto-sync case: HEAD moved, the request said not to restart, and
+        // the settings were identical. A five-minute timer must not relaunch
+        // the user's window 288 times a day.
+        let events = settings_sync_events(false).await;
+        assert!(events.is_empty(), "expected no host events, got {events:?}");
+    }
 }
