@@ -12,6 +12,11 @@ anyhow = "1"
 axum = "0.8"
 dirs = "6"
 fd-lock = "4"
+gethostname = "1"
+# git2 0.21 has `default = []` — a bare `git2 = "0.21"` is LOCAL-ONLY: clone/fetch/push over
+# the network are silently unavailable and only fail at runtime. `vendored-libgit2` keeps the
+# shipped .deb/.dmg/.msi from depending on a system libgit2 that is not there.
+git2 = { version = "0.21", features = ["https", "ssh", "vendored-libgit2"] }
 image = { version = "0.25", default-features = false, features = ["png"] }
 open = "5"
 rand = "0.9"
@@ -23,6 +28,15 @@ tao = "0.31"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "process", "net", "time", "sync"] }
 toml = "0.8"
 tray-icon = "0.21"
+
+# libssh2-sys declares a NON-OPTIONAL openssl-sys dependency on cfg(unix) — and cfg(unix)
+# includes macOS. libgit2's own HTTPS backend on macOS is SecureTransport, so git2's
+# `vendored-openssl` feature (gated to cfg(all(unix, not(macos)))) does NOT cover libssh2's
+# copy. Declaring openssl-sys directly here unifies the `vendored` feature across the whole
+# graph on every unix target, so a clean machine with no system libssl builds. Windows uses
+# WinHTTP + WinCNG and pulls in no OpenSSL at all.
+[target.'cfg(unix)'.dependencies]
+openssl-sys = { version = "0.9", features = ["vendored"] }
 
 [target.'cfg(windows)'.dependencies]
 winreg = "0.55"

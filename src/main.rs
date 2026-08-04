@@ -2,6 +2,7 @@
 
 mod chrome;
 mod config;
+mod git;
 mod host;
 mod internal_server;
 mod settings;
