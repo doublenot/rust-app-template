@@ -49,7 +49,9 @@ The host process gains a git service backed by `git2` (vendored libgit2 + libssh
 `src/main.rs` is 731 LOC today and this feature adds ~110. **Land this as its own no-behaviour-change commit before any git code**, so the git PR's diff shows that `kill_children`, `restart`, and the generation counters are untouched.
 
 - **`src/host.rs`** (~600 LOC) ← `struct App`, `struct Children`, and every `impl App` method (`log`, `chrome_log`, `target_url`, `initial_chrome_url`, generation getters, `refresh_tray`, both watchers, `start_children`, `kill_children`, `restart`, `quit`, `restart_chrome_only`, `open_settings`) plus the four new git helpers. `App`'s fields become `pub(crate)`.
-- **`src/main.rs`** (~260 LOC) keeps `UserEvent`, `dialog`, `missing_chrome_dialog`, `main()`, `run()`, and the `event_loop.run` dispatch `match`.
+- **`src/main.rs`** (309 LOC — **measured**, see below) keeps `UserEvent`, `dialog`, `notice`, `missing_chrome_dialog`, `main()`, `run()`, and the `event_loop.run` dispatch `match`.
+
+> **Measured on the actual split** (commits `4c7d2f3` + `c9ee6a9`): `host.rs` is **446** LOC and `main.rs` **309**, not the ~600/~260 estimated here. 309 is the *floor* for a pure move, not slack: crate header + `UserEvent` (30) + `dialog` + `notice` + `missing_chrome_dialog` (44) + `main()` (86) + `run()` and the dispatch `match` (147). Getting under 280 would require moving `App`'s construction or the dispatch arms into `host.rs`, which is a restructure rather than a move and would invalidate task 10's `run()`-signature change. The `host.rs` estimate was high because it counted the four git helpers, which land in later slices.
 
 The cut is already latent: everything above `fn main()` is the host state machine, everything below is bootstrap + dispatch.
 
@@ -1869,7 +1871,7 @@ Each slice is independently shippable, compiles clean under `cargo fmt` + `clipp
 
 | # | slice | definition of done |
 |---|---|---|
-| **0** | **Split `main.rs` → `main.rs` + `host.rs`.** Pure move, no behaviour change. | `cargo test` passes unchanged; `git diff --stat` shows only moves; `main.rs` ≤ 270 LOC. |
+| **0** | **Split `main.rs` → `main.rs` + `host.rs`.** Pure move, no behaviour change. | `cargo test` passes unchanged; `git diff --stat` shows only moves; `main.rs` ≤ 310 LOC. |
 | **1** | **Build spine.** Add `git2` + target-gated `openssl-sys` + `gethostname`; a `src/git/mod.rs` stub that only prints `git2::Version::get()` behind a `#[test]`. | `cargo build --locked` succeeds on ubuntu, macos, and windows CI; the version test asserts `vendored && https && ssh && threads`. |
 | **2** | **Config + paths.** `GitSection`, `SshHostKeyPolicy`, `validate_branch_name`, the `validate()` arm, `RuntimePaths::{repos_dir, registry_file, git_state_file}`, the commented `[git]` block in `app.toml`. | Every validation rule has a test asserting the exact error string; an `app.toml` with no `[git]` still parses; `ensure()` is unchanged. |
 | **3** | **`secret.rs` + `error.rs`.** `Secret`, `GitError`, codes, `http_status()`, `retryable()`, `classify()`, `scrub()`, `IntoResponse`. | The classification table test covers every row of §5.6 including `(GenericError, Callback)`; `scrub` tests pass; `Secret` has no `Serialize`. |
