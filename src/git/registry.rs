@@ -466,6 +466,772 @@ pub fn validate_def(def: &RepoDef, d: &RegistryDefaults) -> Result<(), GitError>
     Ok(())
 }
 
+/// A repo definition as the HTTP API sees it.
+///
+/// The defence against leaking a token is that **there is no field to leak it through** — not a
+/// `#[serde(skip)]` somebody can forget, not a `Secret` somebody can make `Serialize`. Adding a
+/// secret-shaped field here is the only way to break it.
+#[derive(Debug, Clone, Serialize)]
+pub struct RepoView {
+    pub id: String,
+    pub path: String,
+    pub exists: bool,
+    pub remote: Option<String>,
+    pub remote_name: String,
+    pub branch: String,
+    pub credential: Option<CredentialView>,
+    pub has_credentials: bool,
+    pub author: Option<AuthorSpec>,
+    pub sync_settings: bool,
+    pub settings_path: String,
+    pub auto_sync_secs: Option<u64>,
+    pub sync_on_start: bool,
+    pub sync_on_quit: bool,
+    pub restart_children_on_pull: bool,
+    pub created_at_ms: u64,
+    pub updated_at_ms: u64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum CredentialView {
+    None,
+    Token {
+        username: String,
+        token_stored: bool,
+        bound_host: Option<String>,
+    },
+    SshKey {
+        username: String,
+        private_key_path: Option<String>,
+        private_key_stored: bool,
+        public_key_path: Option<String>,
+        passphrase_stored: bool,
+        bound_host: Option<String>,
+    },
+}
+
+impl CredentialView {
+    pub fn of(spec: &CredentialSpec) -> CredentialView {
+        match spec {
+            CredentialSpec::None => CredentialView::None,
+            CredentialSpec::Token {
+                username,
+                bound_host,
+                ..
+            } => CredentialView::Token {
+                username: username.clone(),
+                // `token` is a required field of the variant, so its presence is the shape,
+                // not a value that has to be read.
+                token_stored: true,
+                bound_host: bound_host.clone(),
+            },
+            CredentialSpec::SshKey {
+                username,
+                private_key_path,
+                private_key,
+                public_key_path,
+                passphrase,
+                bound_host,
+                ..
+            } => CredentialView::SshKey {
+                username: username.clone(),
+                private_key_path: private_key_path
+                    .as_ref()
+                    .map(|p| p.to_string_lossy().into_owned()),
+                private_key_stored: private_key.is_some(),
+                public_key_path: public_key_path
+                    .as_ref()
+                    .map(|p| p.to_string_lossy().into_owned()),
+                passphrase_stored: passphrase.is_some(),
+                bound_host: bound_host.clone(),
+            },
+        }
+    }
+}
+
+impl RepoView {
+    pub fn new(def: &RepoDef, repos_dir: &Path) -> RepoView {
+        let path = repos_dir.join(&def.id);
+        let credential = def.credential.as_ref().map(CredentialView::of);
+        RepoView {
+            id: def.id.clone(),
+            exists: path.exists(),
+            path: path.display().to_string(),
+            remote: def.remote.clone(),
+            remote_name: def.remote_name.clone(),
+            branch: def.branch.clone(),
+            has_credentials: !matches!(&credential, None | Some(CredentialView::None)),
+            credential,
+            author: def.author.clone(),
+            sync_settings: def.sync_settings,
+            settings_path: def.settings_path.clone(),
+            auto_sync_secs: def.auto_sync_secs,
+            sync_on_start: def.sync_on_start,
+            sync_on_quit: def.sync_on_quit,
+            restart_children_on_pull: def.restart_children_on_pull,
+            created_at_ms: def.created_at_ms,
+            updated_at_ms: def.updated_at_ms,
+        }
+    }
+}
+
+/// The whole of `repos.json`, in memory.
+#[derive(Debug, Clone)]
+pub struct RegistryFile {
+    pub version: u32,
+    pub repos: Vec<RepoDef>,
+    /// Entries we refused to load, kept exactly as they were read. They are written back on
+    /// every save so that fixing one typo never costs the author the rest of their file.
+    pub rejected_raw: Vec<Value>,
+}
+
+/// The only place a stored secret is turned back into JSON.
+///
+/// `RepoDef` cannot derive `Serialize` (it holds `Secret`, which has none), which is what forces
+/// every write through this one function — and makes "who can persist a token?" answerable by
+/// reading forty lines instead of auditing a derive.
+fn to_wire(file: &RegistryFile) -> Value {
+    let mut repos: Vec<Value> = file.repos.iter().map(def_to_wire).collect();
+    // Appended rather than re-interleaved: their original indices no longer exist once the good
+    // entries have been rewritten, and a stable tail is easier to explain than a shuffled file.
+    repos.extend(file.rejected_raw.iter().cloned());
+    json!({ "version": file.version, "repos": repos })
+}
+
+fn def_to_wire(def: &RepoDef) -> Value {
+    json!({
+        "id": def.id,
+        "remote": def.remote,
+        "remote_name": def.remote_name,
+        "branch": def.branch,
+        "credential": def.credential.as_ref().map(cred_to_wire),
+        "author": def.author,
+        "sync_settings": def.sync_settings,
+        "settings_path": def.settings_path,
+        "auto_sync_secs": def.auto_sync_secs,
+        "sync_on_start": def.sync_on_start,
+        "sync_on_quit": def.sync_on_quit,
+        "restart_children_on_pull": def.restart_children_on_pull,
+        "created_at_ms": def.created_at_ms,
+        "updated_at_ms": def.updated_at_ms,
+    })
+}
+
+fn cred_to_wire(spec: &CredentialSpec) -> Value {
+    match spec {
+        CredentialSpec::None => json!({ "kind": "none" }),
+        CredentialSpec::Token {
+            username,
+            token,
+            bound_host,
+        } => json!({
+            "kind": "token",
+            "username": username,
+            "token": token.expose_for_disk(),
+            "bound_host": bound_host,
+        }),
+        CredentialSpec::SshKey {
+            username,
+            private_key_path,
+            private_key,
+            public_key_path,
+            public_key,
+            passphrase,
+            bound_host,
+        } => json!({
+            "kind": "ssh_key",
+            "username": username,
+            "private_key_path": private_key_path.as_ref().map(|p| p.to_string_lossy().into_owned()),
+            "private_key": private_key.as_ref().map(Secret::expose_for_disk),
+            "public_key_path": public_key_path.as_ref().map(|p| p.to_string_lossy().into_owned()),
+            "public_key": public_key,
+            "passphrase": passphrase.as_ref().map(Secret::expose_for_disk),
+            "bound_host": bound_host,
+        }),
+    }
+}
+
+/// `create_new` + mode `0600` **at creation**, before a single byte exists.
+///
+/// Writing first and chmod-ing after leaves a window in which the token is world-readable, and
+/// that window is exactly long enough for a backup daemon to notice. On Windows the file
+/// inherits the `%APPDATA%` ACL; README §6 documents that as the weaker posture rather than
+/// implying it away.
+pub(crate) fn open_private(path: &Path) -> std::io::Result<std::fs::File> {
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    opts.open(path)
+}
+
+pub(crate) fn save(path: &Path, file: &RegistryFile) -> Result<(), GitError> {
+    use std::io::Write;
+
+    let tmp = path.with_extension("json.tmp");
+    // A leftover from an interrupted save would make `create_new` fail forever.
+    let _ = std::fs::remove_file(&tmp);
+
+    let bytes =
+        serde_json::to_string_pretty(&to_wire(file)).map_err(GitError::registry_write_failed)?;
+    let mut f = open_private(&tmp).map_err(GitError::registry_write_failed)?;
+    f.write_all(bytes.as_bytes())
+        .map_err(GitError::registry_write_failed)?;
+    // Durable BEFORE the rename: otherwise a power cut can publish an empty repos.json.
+    f.sync_all().map_err(GitError::registry_write_failed)?;
+    drop(f);
+    std::fs::rename(&tmp, path).map_err(GitError::registry_write_failed)?;
+    #[cfg(unix)]
+    if let Some(parent) = path.parent() {
+        // fsync the directory so the rename itself survives the same power cut. Best effort:
+        // the data is already durable, and no filesystem we ship to fails this in practice.
+        let _ = std::fs::File::open(parent).and_then(|d| d.sync_all());
+    }
+    Ok(())
+}
+
+/// Why a `repos.json` could not be used in full. Never fatal: it is reported through
+/// `GET /api/git`, through `/api/status`, and in `git.log` at startup, and the host starts
+/// normally either way — an optional feature must not brick the app.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct RegistryError {
+    /// `"registry_corrupt"` (file-level, quarantined) or `"registry_entries_rejected"`.
+    pub code: &'static str,
+    pub message: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub quarantined_to: Option<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub rejected: Vec<RejectedEntry>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct RejectedEntry {
+    pub index: usize,
+    /// `null` when the entry was too malformed to read an id out of.
+    pub id: Option<String>,
+    pub reason: &'static str,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct Warning {
+    pub code: &'static str,
+    pub message: String,
+}
+
+#[derive(Debug)]
+pub struct PutOutcome {
+    pub created: bool,
+    pub repo: RepoDef,
+    pub warnings: Vec<Warning>,
+}
+
+/// The in-memory registry. Read once at startup, written only by `put`/`remove`.
+pub struct Registry {
+    path: PathBuf,
+    repos_dir: PathBuf,
+    defaults: RegistryDefaults,
+    file: RwLock<RegistryFile>,
+    error: Option<RegistryError>,
+    notes: Vec<String>,
+}
+
+impl Registry {
+    /// Never fails. A file-level problem quarantines the file and yields an empty registry; an
+    /// entry-level problem keeps the good entries and retains the bad ones verbatim.
+    pub fn load(path: &Path, repos_dir: &Path, defaults: RegistryDefaults) -> Registry {
+        let mut notes = Vec::new();
+
+        // A leftover temp file means we died between `sync_all` and `rename`. The real file is
+        // intact, so this is noise — but noise that would make the next `create_new` fail.
+        let tmp = path.with_extension("json.tmp");
+        if tmp.exists() {
+            match std::fs::remove_file(&tmp) {
+                Ok(()) => notes.push(format!("removed stale {}", tmp.display())),
+                Err(e) => notes.push(format!("cannot remove stale {}: {e}", tmp.display())),
+            }
+        }
+        #[cfg(unix)]
+        tighten_mode(path, &mut notes);
+
+        let raw = match std::fs::read_to_string(path) {
+            Ok(t) => t,
+            // The normal first-run state, not a problem.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                return Registry::assembled(path, repos_dir, defaults, empty_file(), None, notes)
+            }
+            Err(e) => {
+                let error = RegistryError {
+                    code: "registry_corrupt",
+                    message: format!("repos.json cannot be read ({e})"),
+                    quarantined_to: None,
+                    rejected: Vec::new(),
+                };
+                return Registry::assembled(
+                    path,
+                    repos_dir,
+                    defaults,
+                    empty_file(),
+                    Some(error),
+                    notes,
+                );
+            }
+        };
+
+        let value: Value = match serde_json::from_str(&raw) {
+            Ok(v) => v,
+            Err(e) => {
+                return quarantine(
+                    path,
+                    repos_dir,
+                    defaults,
+                    notes,
+                    format!("repos.json is not valid JSON ({e}); quarantined"),
+                )
+            }
+        };
+        let Some(obj) = value.as_object() else {
+            return quarantine(
+                path,
+                repos_dir,
+                defaults,
+                notes,
+                "repos.json top level must be a JSON object; quarantined".to_string(),
+            );
+        };
+        if let Some(key) = obj
+            .keys()
+            .find(|k| k.as_str() != "version" && k.as_str() != "repos")
+        {
+            return quarantine(
+                path,
+                repos_dir,
+                defaults,
+                notes,
+                format!("repos.json has an unknown top-level key {key:?}; quarantined"),
+            );
+        }
+        match obj.get("version").and_then(Value::as_u64) {
+            Some(v) if v == u64::from(REGISTRY_VERSION) => {}
+            Some(v) => {
+                return quarantine(
+                    path,
+                    repos_dir,
+                    defaults,
+                    notes,
+                    format!("repos.json has version {v}, expected {REGISTRY_VERSION}; quarantined"),
+                )
+            }
+            None => {
+                return quarantine(
+                    path,
+                    repos_dir,
+                    defaults,
+                    notes,
+                    "repos.json is missing its \"version\" number; quarantined".to_string(),
+                )
+            }
+        }
+        let Some(entries) = obj.get("repos").and_then(Value::as_array).cloned() else {
+            return quarantine(
+                path,
+                repos_dir,
+                defaults,
+                notes,
+                "repos.json must have a \"repos\" array; quarantined".to_string(),
+            );
+        };
+
+        let now = now_ms();
+        let total = entries.len();
+        let mut repos: Vec<RepoDef> = Vec::new();
+        let mut rejected_raw: Vec<Value> = Vec::new();
+        let mut rejected: Vec<RejectedEntry> = Vec::new();
+
+        for (index, entry) in entries.into_iter().enumerate() {
+            let id_hint = entry.get("id").and_then(Value::as_str).map(str::to_string);
+
+            // Every rejection does the same three things: report it, keep the raw entry so a
+            // later save can write it back, and move on. Spelled out rather than hidden in a
+            // closure, because a closure would have to capture two of the three vectors.
+            let mut def: RepoDef = match serde_json::from_value(entry.clone()) {
+                Ok(d) => d,
+                Err(e) => {
+                    notes.push(format!("repos[{index}] rejected: {e}"));
+                    rejected.push(RejectedEntry {
+                        index,
+                        id: id_hint,
+                        reason: "invalid_request",
+                    });
+                    rejected_raw.push(entry);
+                    continue;
+                }
+            };
+            if repos.iter().any(|r| r.id == def.id) {
+                notes.push(format!(
+                    "repos[{index}] rejected: duplicate id {:?}",
+                    def.id
+                ));
+                rejected.push(RejectedEntry {
+                    index,
+                    id: id_hint,
+                    reason: "duplicate_id",
+                });
+                rejected_raw.push(entry);
+                continue;
+            }
+            if let Err(e) = validate_def(&def, &defaults) {
+                notes.push(format!("repos[{index}] rejected: {e}"));
+                rejected.push(RejectedEntry {
+                    index,
+                    id: id_hint,
+                    reason: reject_reason(&e),
+                });
+                rejected_raw.push(entry);
+                continue;
+            }
+            // Warnings have nowhere to go at load; the clamped value itself is the report, and
+            // `notes` carries the detail into git.log.
+            for w in normalise_def(&mut def, &defaults, now) {
+                notes.push(format!("repos[{index}]: {}", w.message));
+            }
+            repos.push(def);
+        }
+
+        let error = if rejected.is_empty() {
+            None
+        } else {
+            Some(RegistryError {
+                code: "registry_entries_rejected",
+                message: format!(
+                    "{} of {total} repo definitions were rejected",
+                    rejected.len()
+                ),
+                quarantined_to: None,
+                rejected,
+            })
+        };
+        let file = RegistryFile {
+            version: REGISTRY_VERSION,
+            repos,
+            rejected_raw,
+        };
+        Registry::assembled(path, repos_dir, defaults, file, error, notes)
+    }
+
+    fn assembled(
+        path: &Path,
+        repos_dir: &Path,
+        defaults: RegistryDefaults,
+        file: RegistryFile,
+        error: Option<RegistryError>,
+        notes: Vec<String>,
+    ) -> Registry {
+        Registry {
+            path: path.to_path_buf(),
+            repos_dir: repos_dir.to_path_buf(),
+            defaults,
+            file: RwLock::new(file),
+            error,
+            notes,
+        }
+    }
+
+    /// A poisoned lock means another thread panicked while holding it. The registry is only ever
+    /// replaced wholesale (`*guard = next`), so no half-updated state can be observed and
+    /// recovering beats making every subsequent read fail forever.
+    fn read(&self) -> std::sync::RwLockReadGuard<'_, RegistryFile> {
+        self.file.read().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn write(&self) -> std::sync::RwLockWriteGuard<'_, RegistryFile> {
+        self.file.write().unwrap_or_else(|e| e.into_inner())
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    pub fn repos_dir(&self) -> &Path {
+        &self.repos_dir
+    }
+
+    pub fn writable(&self) -> bool {
+        self.defaults.registry_writes
+    }
+
+    pub fn error(&self) -> Option<RegistryError> {
+        self.error.clone()
+    }
+
+    /// Non-fatal observations from `load`, for `git.log`. `registry.rs` has no logger.
+    pub fn notes(&self) -> &[String] {
+        &self.notes
+    }
+
+    pub fn count(&self) -> usize {
+        self.read().repos.len()
+    }
+
+    pub fn ids(&self) -> Vec<String> {
+        self.read().repos.iter().map(|r| r.id.clone()).collect()
+    }
+
+    pub fn list(&self) -> Vec<RepoDef> {
+        self.read().repos.clone()
+    }
+
+    pub fn snapshot(&self, id: &str) -> Result<RepoDef, GitError> {
+        self.read()
+            .repos
+            .iter()
+            .find(|r| r.id == id)
+            .cloned()
+            .ok_or_else(|| GitError::repo_not_found(id))
+    }
+
+    pub fn contains(&self, id: &str) -> bool {
+        self.read().repos.iter().any(|r| r.id == id)
+    }
+
+    pub fn auto_sync_secs(&self, id: &str) -> Option<u64> {
+        self.read()
+            .repos
+            .iter()
+            .find(|r| r.id == id)
+            .and_then(|r| r.auto_sync_secs)
+    }
+
+    /// Create or replace one entry, then persist. A `PUT` is a whole-definition write: fields
+    /// absent from `def` take their serde defaults, they are not merged with what was stored.
+    pub fn put(&self, def: RepoDef) -> Result<PutOutcome, GitError> {
+        if !self.defaults.registry_writes {
+            return Err(GitError::registry_read_only());
+        }
+        validate_id(&def.id)?;
+
+        let mut def = def;
+        let mut warnings = Vec::new();
+        let mut guard = self.write();
+        let existing = guard.repos.iter().position(|r| r.id == def.id);
+
+        if def.credential.is_none() {
+            if let Some(stored) = existing.and_then(|i| guard.repos[i].credential.clone()) {
+                let remote_host_now = def.remote.as_deref().and_then(remote_host);
+                let bound = stored.bound_host().map(str::to_string);
+                // Carrying the stored credential forward keeps the token off the loopback socket
+                // on every unrelated edit — but only while it is still bound to the host the
+                // remote points at. Repointing a repo at an attacker's host and re-PUTting is the
+                // cheapest way to steal a PAT out of this service; dropping the credential here
+                // is what makes that attack yield nothing.
+                let keep = stored.is_none()
+                    || match (&bound, &remote_host_now) {
+                        (Some(b), Some(h)) => b == h,
+                        // Never bound (hand-written); `normalise_def` binds it below.
+                        (None, _) => true,
+                        // The remote was removed, so there is no host to stay bound to.
+                        (Some(_), None) => false,
+                    };
+                if keep {
+                    def.credential = Some(stored);
+                } else {
+                    warnings.push(Warning {
+                        code: "auth_unbound",
+                        message: format!(
+                            "the stored credential was bound to {} but this remote is {}; it was \
+                             dropped — send a replacement credential with this PUT",
+                            bound.as_deref().unwrap_or("(nothing)"),
+                            remote_host_now.as_deref().unwrap_or("(no remote)")
+                        ),
+                    });
+                }
+            }
+        }
+
+        let now = now_ms();
+        def.created_at_ms = match existing.map(|i| guard.repos[i].created_at_ms) {
+            Some(prior) if prior != 0 => prior,
+            _ if def.created_at_ms != 0 => def.created_at_ms,
+            _ => now,
+        };
+        def.updated_at_ms = now;
+
+        validate_def(&def, &self.defaults)?;
+        warnings.extend(normalise_def(&mut def, &self.defaults, now));
+
+        // Build the whole next file, persist it, and only then swap it in. An in-memory
+        // registry that disagrees with repos.json would silently un-persist itself at the next
+        // restart, so the disk write is what commits the change.
+        let mut next = guard.clone();
+        match existing {
+            Some(i) => next.repos[i] = def.clone(),
+            None => next.repos.push(def.clone()),
+        }
+        save(&self.path, &next)?;
+        *guard = next;
+
+        Ok(PutOutcome {
+            created: existing.is_none(),
+            repo: def,
+            warnings,
+        })
+    }
+
+    /// Removes one entry and persists. The worktree under `<data-dir>/repos/<id>` is **not**
+    /// touched here — deleting a user's files is `GitService::delete_repo`'s explicit
+    /// `?purge=true` decision, not a side effect of editing the registry.
+    pub fn remove(&self, id: &str) -> Result<RepoDef, GitError> {
+        if !self.defaults.registry_writes {
+            return Err(GitError::registry_read_only());
+        }
+        let mut guard = self.write();
+        let index = guard
+            .repos
+            .iter()
+            .position(|r| r.id == id)
+            .ok_or_else(|| GitError::repo_not_found(id))?;
+
+        let mut next = guard.clone();
+        let removed = next.repos.remove(index);
+        save(&self.path, &next)?;
+        *guard = next;
+        Ok(removed)
+    }
+}
+
+fn empty_file() -> RegistryFile {
+    RegistryFile {
+        version: REGISTRY_VERSION,
+        repos: Vec::new(),
+        rejected_raw: Vec::new(),
+    }
+}
+
+/// Rename, never delete and never truncate: a hand-written file deserves better than "we
+/// deleted it", and the author needs the bytes back to find their typo.
+fn quarantine(
+    path: &Path,
+    repos_dir: &Path,
+    defaults: RegistryDefaults,
+    mut notes: Vec<String>,
+    message: String,
+) -> Registry {
+    let stamp = now_ms();
+    let mut target = path.with_extension(format!("json.corrupt-{stamp}"));
+    // Two corruptions inside one millisecond would otherwise overwrite the first quarantine.
+    let mut n = 1u32;
+    while target.exists() {
+        target = path.with_extension(format!("json.corrupt-{stamp}-{n}"));
+        n += 1;
+    }
+    let quarantined_to = match std::fs::rename(path, &target) {
+        Ok(()) => Some(target.display().to_string()),
+        Err(e) => {
+            notes.push(format!("cannot quarantine {}: {e}", path.display()));
+            None
+        }
+    };
+    let error = RegistryError {
+        code: "registry_corrupt",
+        message,
+        quarantined_to,
+        rejected: Vec::new(),
+    };
+    Registry::assembled(path, repos_dir, defaults, empty_file(), Some(error), notes)
+}
+
+/// `repos.json` can hold a personal access token, so group and other bits on it are a finding.
+/// Tightening in place is silent-but-logged rather than fatal: refusing to start over a mode
+/// bit would be worse than fixing it.
+#[cfg(unix)]
+fn tighten_mode(path: &Path, notes: &mut Vec<String>) {
+    use std::os::unix::fs::PermissionsExt;
+    let Ok(meta) = std::fs::metadata(path) else {
+        return;
+    };
+    let mode = meta.permissions().mode() & 0o777;
+    if mode & 0o077 == 0 {
+        return;
+    }
+    match std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)) {
+        Ok(()) => notes.push(format!("tightened {} from {mode:o} to 600", path.display())),
+        Err(e) => notes.push(format!("cannot tighten {}: {e}", path.display())),
+    }
+}
+
+/// Maps a validation failure onto the stable `rejected[].reason` vocabulary. `invalid_branch_name`
+/// has no `GitErrorCode` of its own — it is an `invalid_request` on the `branch` field.
+fn reject_reason(err: &GitError) -> &'static str {
+    match err.code() {
+        GitErrorCode::InvalidRepoId => "invalid_repo_id",
+        GitErrorCode::InsecureRemote => "insecure_remote",
+        GitErrorCode::SettingsSyncUnavailable => "settings_sync_unavailable",
+        GitErrorCode::InvalidRequest if err.field.as_deref() == Some("branch") => {
+            "invalid_branch_name"
+        }
+        _ => "invalid_request",
+    }
+}
+
+/// Completes a definition in place. Shared by `load` and `put` so the two can never disagree
+/// about what a normalised entry looks like.
+fn normalise_def(def: &mut RepoDef, d: &RegistryDefaults, now: u64) -> Vec<Warning> {
+    let mut warnings = Vec::new();
+
+    if def.branch.is_empty() {
+        def.branch = d.default_branch.clone();
+    }
+    if def.created_at_ms == 0 {
+        def.created_at_ms = now;
+    }
+    if def.updated_at_ms == 0 {
+        def.updated_at_ms = now;
+    }
+
+    // A hand-written credential may omit `bound_host`. Binding it to the remote it was written
+    // next to is the only reading that is not a downgrade: an absent bound_host would otherwise
+    // have to mean "send this token to whatever host the remote points at today".
+    if let Some(cred) = def.credential.take() {
+        let cred = if cred.is_none() || cred.bound_host().is_some() {
+            cred
+        } else {
+            cred.with_bound_host(def.remote.as_deref().and_then(remote_host))
+        };
+        def.credential = Some(cred);
+    }
+
+    match def.auto_sync_secs {
+        // 0 means off, and off is not a value to clamp.
+        None | Some(0) => def.auto_sync_secs = None,
+        Some(v) if v < AUTO_SYNC_MIN_SECS => {
+            def.auto_sync_secs = Some(AUTO_SYNC_MIN_SECS);
+            warnings.push(Warning {
+                code: "auto_sync_clamped",
+                message: format!(
+                    "auto_sync_secs {v} is below the {AUTO_SYNC_MIN_SECS}s minimum and was raised \
+                     to {AUTO_SYNC_MIN_SECS}"
+                ),
+            });
+        }
+        Some(v) if v > AUTO_SYNC_MAX_SECS => {
+            def.auto_sync_secs = Some(AUTO_SYNC_MAX_SECS);
+            warnings.push(Warning {
+                code: "auto_sync_clamped",
+                message: format!(
+                    "auto_sync_secs {v} is above the {AUTO_SYNC_MAX_SECS}s maximum and was lowered \
+                     to {AUTO_SYNC_MAX_SECS}"
+                ),
+            });
+        }
+        Some(_) => {}
+    }
+
+    warnings
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -776,6 +1542,726 @@ mod tests {
                 .field
                 .as_deref(),
             Some("branch")
+        );
+    }
+
+    #[test]
+    fn redaction_never_emits_a_secret() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        for cred in [
+            r#"{"kind":"none"}"#,
+            r#"{"kind":"token","token":"ghp_SUPERSECRET","bound_host":"github.com"}"#,
+            r#"{"kind":"ssh_key","private_key":"ghp_SUPERSECRET","passphrase":"ghp_SUPERSECRET",
+                 "public_key":"ssh-ed25519 AAAA","bound_host":"github.com"}"#,
+        ] {
+            let d = def(&format!(r#"{{"id":"notes","credential":{cred}}}"#));
+            let view = RepoView::new(&d, dir.path());
+            let json = serde_json::to_string(&view).expect("view serializes");
+            assert!(
+                !json.contains("ghp_SUPERSECRET"),
+                "leaked through RepoView: {json}"
+            );
+            assert!(
+                !format!("{d:?}").contains("ghp_SUPERSECRET"),
+                "leaked through Debug"
+            );
+        }
+    }
+
+    #[test]
+    fn repo_view_reports_stored_credentials_without_values() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repos_dir = dir.path().join("repos");
+        std::fs::create_dir_all(repos_dir.join("notes")).expect("tree");
+
+        let d = def(
+            r#"{"id":"notes","remote":"https://github.com/acme/notes.git","branch":"main",
+                "credential":{"kind":"token","token":"ghp_SUPERSECRET","bound_host":"github.com"},
+                "auto_sync_secs":300,"created_at_ms":7,"updated_at_ms":8}"#,
+        );
+        let v = RepoView::new(&d, &repos_dir);
+        assert_eq!(v.id, "notes");
+        assert_eq!(v.path, repos_dir.join("notes").display().to_string());
+        assert!(v.exists);
+        assert!(v.has_credentials);
+        assert_eq!(v.auto_sync_secs, Some(300));
+        assert_eq!(v.created_at_ms, 7);
+        assert_eq!(v.updated_at_ms, 8);
+        match v.credential {
+            Some(CredentialView::Token {
+                ref username,
+                token_stored,
+                ref bound_host,
+            }) => {
+                assert_eq!(username, "x-access-token");
+                assert!(token_stored);
+                assert_eq!(bound_host.as_deref(), Some("github.com"));
+            }
+            ref other => panic!("expected a token view, got {other:?}"),
+        }
+
+        // A missing tree is reported, not hidden: `exists: false` is how a UI knows to clone.
+        let absent = RepoView::new(&def(r#"{"id":"other"}"#), &repos_dir);
+        assert!(!absent.exists);
+        assert!(!absent.has_credentials);
+        assert!(absent.credential.is_none());
+
+        // `kind: "none"` is a credential in the file but not a credential in effect.
+        let explicit_none = RepoView::new(
+            &def(r#"{"id":"n","credential":{"kind":"none"}}"#),
+            &repos_dir,
+        );
+        assert!(!explicit_none.has_credentials);
+        assert!(matches!(
+            explicit_none.credential,
+            Some(CredentialView::None)
+        ));
+    }
+
+    #[test]
+    fn ssh_credential_view_shows_paths_but_never_material() {
+        let d = def(
+            r#"{"id":"a","credential":{"kind":"ssh_key","username":"git",
+                 "private_key_path":"/home/u/.ssh/id_ed25519",
+                 "public_key_path":"/home/u/.ssh/id_ed25519.pub",
+                 "passphrase":"ghp_SUPERSECRET","bound_host":"github.com"}}"#,
+        );
+        match CredentialView::of(d.credential.as_ref().expect("credential")) {
+            CredentialView::SshKey {
+                username,
+                private_key_path,
+                private_key_stored,
+                public_key_path,
+                passphrase_stored,
+                bound_host,
+            } => {
+                assert_eq!(username, "git");
+                // Paths are not secrets, and hiding them makes misconfiguration undebuggable.
+                assert_eq!(private_key_path.as_deref(), Some("/home/u/.ssh/id_ed25519"));
+                assert_eq!(
+                    public_key_path.as_deref(),
+                    Some("/home/u/.ssh/id_ed25519.pub")
+                );
+                assert!(!private_key_stored);
+                assert!(passphrase_stored);
+                assert_eq!(bound_host.as_deref(), Some("github.com"));
+            }
+            other => panic!("expected an ssh_key view, got {other:?}"),
+        }
+    }
+
+    fn file_of(defs: &[&str]) -> RegistryFile {
+        RegistryFile {
+            version: REGISTRY_VERSION,
+            repos: defs.iter().copied().map(def).collect(),
+            rejected_raw: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn save_writes_the_token_and_leaves_no_temp_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("repos.json");
+        let file = file_of(&[
+            r#"{"id":"notes","remote":"https://github.com/acme/notes.git","branch":"main",
+                "credential":{"kind":"token","token":"ghp_SUPERSECRET","bound_host":"github.com"},
+                "created_at_ms":7,"updated_at_ms":8}"#,
+        ]);
+        save(&path, &file).expect("save");
+
+        let text = std::fs::read_to_string(&path).expect("read back");
+        // The registry is the credential store; the token belongs on disk, redaction is for
+        // the HTTP surface. If this ever fails, `to_wire` stopped persisting credentials.
+        assert!(text.contains("ghp_SUPERSECRET"), "{text}");
+        assert!(
+            !dir.path().join("repos.json.tmp").exists(),
+            "temp file survived"
+        );
+
+        let back: serde_json::Value = serde_json::from_str(&text).expect("valid json");
+        assert_eq!(back["version"], serde_json::json!(REGISTRY_VERSION));
+        assert_eq!(back["repos"][0]["id"], serde_json::json!("notes"));
+        assert_eq!(back["repos"][0]["remote_name"], serde_json::json!("origin"));
+        assert_eq!(
+            back["repos"][0]["credential"]["kind"],
+            serde_json::json!("token")
+        );
+        assert_eq!(back["repos"][0]["auto_sync_secs"], serde_json::Value::Null);
+
+        // Round-trips through the parser it will be read back with.
+        let reparsed: RepoDef =
+            serde_json::from_value(back["repos"][0].clone()).expect("round trip");
+        assert_eq!(reparsed.id, "notes");
+        assert_eq!(reparsed.created_at_ms, 7);
+    }
+
+    #[test]
+    fn save_replaces_a_stale_temp_file_and_overwrites_atomically() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("repos.json");
+        // A crash between sync_all and rename leaves this behind; create_new would fail on it.
+        std::fs::write(dir.path().join("repos.json.tmp"), "junk").expect("stale tmp");
+        save(&path, &file_of(&[r#"{"id":"a"}"#])).expect("first save");
+        save(&path, &file_of(&[r#"{"id":"b"}"#])).expect("second save over an existing file");
+        let text = std::fs::read_to_string(&path).expect("read back");
+        assert!(text.contains("\"b\""), "{text}");
+        assert!(!text.contains("\"a\""), "{text}");
+        assert!(!dir.path().join("repos.json.tmp").exists());
+    }
+
+    #[test]
+    fn save_reports_registry_write_failed() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("no-such-dir").join("repos.json");
+        let e = save(&path, &file_of(&[])).expect_err("parent directory does not exist");
+        assert_eq!(e.code(), GitErrorCode::RegistryWriteFailed);
+    }
+
+    #[test]
+    fn rejected_raw_entries_are_written_back_verbatim() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("repos.json");
+        let mut file = file_of(&[r#"{"id":"good"}"#]);
+        file.rejected_raw
+            .push(serde_json::json!({ "id": "typo", "whoops": true }));
+        save(&path, &file).expect("save");
+        let back: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).expect("read")).expect("json");
+        let repos = back["repos"].as_array().expect("array");
+        assert_eq!(repos.len(), 2);
+        assert_eq!(
+            repos[1],
+            serde_json::json!({ "id": "typo", "whoops": true })
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn saved_registry_is_not_readable_by_group_or_other() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("repos.json");
+        save(&path, &file_of(&[r#"{"id":"a"}"#])).expect("save");
+        let mode = std::fs::metadata(&path)
+            .expect("metadata")
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o077, 0, "mode was {:o}", mode & 0o777);
+    }
+
+    fn load_at(dir: &std::path::Path) -> Registry {
+        Registry::load(&dir.join("repos.json"), &dir.join("repos"), defaults())
+    }
+
+    #[test]
+    fn a_missing_file_loads_an_empty_writable_registry() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let reg = load_at(dir.path());
+        assert_eq!(reg.count(), 0);
+        assert!(reg.error().is_none());
+        assert!(reg.writable());
+        assert!(reg.ids().is_empty());
+        assert!(!reg.contains("notes"));
+        assert_eq!(reg.path(), dir.path().join("repos.json"));
+        assert_eq!(reg.repos_dir(), dir.path().join("repos"));
+        // A host with [git] present and no repos never creates the file.
+        assert!(!dir.path().join("repos.json").exists());
+    }
+
+    #[test]
+    fn a_well_formed_file_loads_and_is_normalised_in_memory_only() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("repos.json");
+        let original = r#"{"version":1,"repos":[
+            {"id":"notes","remote":"https://GitHub.com/acme/notes.git",
+             "credential":{"kind":"token","token":"ghp_SUPERSECRET"},
+             "auto_sync_secs":5}
+        ]}"#;
+        std::fs::write(&path, original).expect("write");
+
+        let reg = load_at(dir.path());
+        assert!(reg.error().is_none());
+        let d = reg.snapshot("notes").expect("present");
+        assert_eq!(
+            d.branch, "main",
+            "empty branch filled from [git].default_branch"
+        );
+        assert_ne!(d.created_at_ms, 0, "timestamps stamped on load");
+        assert_ne!(d.updated_at_ms, 0);
+        assert_eq!(d.auto_sync_secs, Some(AUTO_SYNC_MIN_SECS), "5s clamped up");
+        assert_eq!(
+            d.credential.as_ref().and_then(CredentialSpec::bound_host),
+            Some("github.com"),
+            "a hand-written credential is bound to the remote it sits next to"
+        );
+        assert_eq!(reg.auto_sync_secs("notes"), Some(AUTO_SYNC_MIN_SECS));
+        assert_eq!(reg.auto_sync_secs("absent"), None);
+        assert_eq!(reg.list().len(), 1);
+        assert_eq!(
+            reg.snapshot("absent").expect_err("absent").code(),
+            GitErrorCode::RepoNotFound
+        );
+
+        // Normalisation is in memory. Loading must never rewrite the author's file — an
+        // updated_at_ms bump on every launch would make repos.json unusable in version control.
+        assert_eq!(std::fs::read_to_string(&path).expect("read"), original);
+    }
+
+    #[test]
+    fn a_stale_temp_file_is_removed_at_load() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let tmp = dir.path().join("repos.json.tmp");
+        std::fs::write(dir.path().join("repos.json"), r#"{"version":1,"repos":[]}"#)
+            .expect("write");
+        std::fs::write(&tmp, "half-written").expect("write tmp");
+        let reg = load_at(dir.path());
+        assert!(!tmp.exists(), "the crash leftover must be cleaned up");
+        assert!(
+            reg.notes().iter().any(|n| n.contains("repos.json.tmp")),
+            "{:?}",
+            reg.notes()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_loose_mode_is_tightened_at_load() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("repos.json");
+        std::fs::write(&path, r#"{"version":1,"repos":[]}"#).expect("write");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).expect("chmod");
+        let reg = load_at(dir.path());
+        let mode = std::fs::metadata(&path)
+            .expect("metadata")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o600, "mode was {mode:o}");
+        assert!(
+            reg.notes().iter().any(|n| n.contains("tightened")),
+            "{:?}",
+            reg.notes()
+        );
+    }
+
+    #[test]
+    fn invalid_json_is_quarantined_with_the_original_bytes() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("repos.json");
+        let original = "{ this is not json";
+        std::fs::write(&path, original).expect("write");
+
+        let reg = load_at(dir.path());
+        assert_eq!(reg.count(), 0, "the host still starts");
+        assert!(
+            !path.exists(),
+            "repos.json must be renamed away, never left in place"
+        );
+        let err = reg.error().expect("registry_error");
+        assert_eq!(err.code, "registry_corrupt");
+        assert!(err.rejected.is_empty());
+        let quarantine = err.quarantined_to.expect("quarantined_to");
+        assert!(quarantine.contains("repos.json.corrupt-"), "{quarantine}");
+        // Never deleted, never truncated: the author gets their file back.
+        assert_eq!(
+            std::fs::read_to_string(&quarantine).expect("read"),
+            original
+        );
+    }
+
+    #[test]
+    fn file_level_failures_are_all_quarantined() {
+        for body in [
+            r#"{"version":2,"repos":[]}"#,              // wrong version
+            r#"[]"#,                                    // top level not an object
+            r#"{"version":1}"#,                         // no repos array
+            r#"{"version":1,"repos":{}}"#,              // repos not an array
+            r#"{"version":1,"repos":[],"extra":true}"#, // unknown top-level key
+        ] {
+            let dir = tempfile::tempdir().expect("tempdir");
+            std::fs::write(dir.path().join("repos.json"), body).expect("write");
+            let reg = load_at(dir.path());
+            let err = reg.error().unwrap_or_else(|| panic!("no error for {body}"));
+            assert_eq!(err.code, "registry_corrupt", "{body}");
+            assert!(err.quarantined_to.is_some(), "{body}");
+            assert_eq!(reg.count(), 0, "{body}");
+        }
+    }
+
+    #[test]
+    fn bad_entries_are_skipped_and_the_good_ones_load() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            dir.path().join("repos.json"),
+            r#"{"version":1,"repos":[
+                {"id":"good"},
+                {"id":"../evil"},
+                {"id":"typo","whoops":true},
+                {"id":"cfg","sync_settings":true},
+                {"id":"branchy","branch":"bad..branch"},
+                {"id":"leaky","remote":"http://intranet/x.git"},
+                {"id":"good"}
+            ]}"#,
+        )
+        .expect("write");
+
+        let reg = load_at(dir.path());
+        assert_eq!(reg.ids(), vec!["good".to_string()]);
+        let err = reg.error().expect("registry_error");
+        assert_eq!(err.code, "registry_entries_rejected");
+        assert!(
+            err.quarantined_to.is_none(),
+            "entry failures never quarantine the file"
+        );
+        assert_eq!(err.message, "6 of 7 repo definitions were rejected");
+        assert_eq!(
+            err.rejected,
+            vec![
+                RejectedEntry {
+                    index: 1,
+                    id: Some("../evil".to_string()),
+                    reason: "invalid_repo_id"
+                },
+                RejectedEntry {
+                    index: 2,
+                    id: Some("typo".to_string()),
+                    reason: "invalid_request"
+                },
+                RejectedEntry {
+                    index: 3,
+                    id: Some("cfg".to_string()),
+                    reason: "settings_sync_unavailable"
+                },
+                RejectedEntry {
+                    index: 4,
+                    id: Some("branchy".to_string()),
+                    reason: "invalid_branch_name"
+                },
+                RejectedEntry {
+                    index: 5,
+                    id: Some("leaky".to_string()),
+                    reason: "insecure_remote"
+                },
+                // The first entry with an id wins; the later one is the duplicate.
+                RejectedEntry {
+                    index: 6,
+                    id: Some("good".to_string()),
+                    reason: "duplicate_id"
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn an_unreadable_id_is_reported_as_null() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            dir.path().join("repos.json"),
+            r#"{"version":1,"repos":[{"id":42},"nonsense"]}"#,
+        )
+        .expect("write");
+        let reg = load_at(dir.path());
+        let err = reg.error().expect("registry_error");
+        assert_eq!(err.code, "registry_entries_rejected");
+        assert_eq!(err.rejected.len(), 2);
+        assert_eq!(err.rejected[0].id, None);
+        assert_eq!(err.rejected[0].reason, "invalid_request");
+        assert_eq!(err.rejected[1].id, None);
+    }
+
+    #[test]
+    fn a_missing_private_key_path_is_accepted() {
+        // An unplugged USB key must surface as a per-job auth failure, not brick the registry.
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            dir.path().join("repos.json"),
+            r#"{"version":1,"repos":[{"id":"notes","remote":"git@github.com:acme/notes.git",
+                 "credential":{"kind":"ssh_key","private_key_path":"/nope/does/not/exist"}}]}"#,
+        )
+        .expect("write");
+        let reg = load_at(dir.path());
+        assert!(reg.error().is_none(), "{:?}", reg.error());
+        assert!(reg.contains("notes"));
+    }
+
+    #[test]
+    fn a_read_only_registry_reports_itself_as_such() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut d = defaults();
+        d.registry_writes = false;
+        let reg = Registry::load(&dir.path().join("repos.json"), &dir.path().join("repos"), d);
+        assert!(!reg.writable());
+    }
+
+    #[test]
+    fn put_creates_then_updates_and_persists() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("repos.json");
+        let reg = load_at(dir.path());
+
+        let first = reg.put(def(r#"{"id":"notes"}"#)).expect("create");
+        assert!(first.created);
+        assert!(first.warnings.is_empty());
+        assert_eq!(first.repo.branch, "main");
+        assert_ne!(first.repo.created_at_ms, 0);
+        assert!(path.exists(), "the first PUT is what creates repos.json");
+
+        let second = reg
+            .put(def(r#"{"id":"notes","sync_on_start":true}"#))
+            .expect("update");
+        assert!(!second.created);
+        assert!(second.repo.sync_on_start);
+        assert_eq!(
+            second.repo.created_at_ms, first.repo.created_at_ms,
+            "created_at_ms is preserved across updates"
+        );
+        assert!(second.repo.updated_at_ms >= first.repo.updated_at_ms);
+        assert_eq!(reg.count(), 1);
+
+        // Survives a reload, which is the only thing that proves it reached the disk.
+        let reloaded = load_at(dir.path());
+        assert!(reloaded.snapshot("notes").expect("present").sync_on_start);
+        assert!(reloaded.error().is_none());
+    }
+
+    #[test]
+    fn put_refuses_an_invalid_definition_without_touching_disk() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let reg = load_at(dir.path());
+        let e = reg
+            .put(def(r#"{"id":"../evil"}"#))
+            .expect_err("bad id must not be stored");
+        assert_eq!(e.code(), GitErrorCode::InvalidRepoId);
+        let e = reg
+            .put(def(r#"{"id":"a","branch":"bad..branch"}"#))
+            .expect_err("bad branch");
+        assert_eq!(e.code(), GitErrorCode::InvalidRequest);
+        assert_eq!(reg.count(), 0);
+        assert!(!dir.path().join("repos.json").exists());
+    }
+
+    #[test]
+    fn put_is_refused_when_registry_writes_is_off() {
+        // registry_writes = false means repos.json is author-owned; the API must not edit it.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut d = defaults();
+        d.registry_writes = false;
+        let reg = Registry::load(&dir.path().join("repos.json"), &dir.path().join("repos"), d);
+        let e = reg.put(def(r#"{"id":"notes"}"#)).expect_err("read only");
+        assert_eq!(e.code(), GitErrorCode::RegistryReadOnly);
+        assert!(!dir.path().join("repos.json").exists());
+    }
+
+    #[test]
+    fn a_failed_write_leaves_memory_untouched() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        // The parent directory does not exist, so the temp file cannot be created.
+        let reg = Registry::load(
+            &dir.path().join("nope").join("repos.json"),
+            &dir.path().join("repos"),
+            defaults(),
+        );
+        let e = reg.put(def(r#"{"id":"notes"}"#)).expect_err("cannot write");
+        assert_eq!(e.code(), GitErrorCode::RegistryWriteFailed);
+        // An in-memory registry that disagrees with repos.json would silently un-persist
+        // itself at the next restart, which is worse than a visible 500.
+        assert_eq!(reg.count(), 0);
+        assert!(!reg.contains("notes"));
+    }
+
+    #[test]
+    fn rejected_entries_survive_a_later_put() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("repos.json");
+        std::fs::write(
+            &path,
+            r#"{"version":1,"repos":[{"id":"good"},{"id":"../evil"},{"id":"typo","whoops":true}]}"#,
+        )
+        .expect("write");
+        let reg = load_at(dir.path());
+        assert_eq!(reg.ids(), vec!["good".to_string()]);
+
+        reg.put(def(r#"{"id":"good","sync_on_quit":true}"#))
+            .expect("put");
+
+        let back: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).expect("read")).expect("json");
+        let repos = back["repos"].as_array().expect("array");
+        assert_eq!(
+            repos.len(),
+            3,
+            "the rejected entries were written back: {repos:?}"
+        );
+        assert!(repos
+            .iter()
+            .any(|r| r["id"] == serde_json::json!("../evil")));
+        assert!(repos.iter().any(|r| r["whoops"] == serde_json::json!(true)));
+    }
+
+    fn token_def(id: &str, remote: &str) -> RepoDef {
+        def(&format!(
+            r#"{{"id":"{id}","remote":"{remote}",
+                 "credential":{{"kind":"token","token":"ghp_SUPERSECRET"}}}}"#
+        ))
+    }
+
+    #[test]
+    fn put_binds_a_new_credential_to_its_remote() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let reg = load_at(dir.path());
+        let out = reg
+            .put(token_def("notes", "https://GitHub.com/acme/notes.git"))
+            .expect("put");
+        assert_eq!(
+            out.repo
+                .credential
+                .as_ref()
+                .and_then(CredentialSpec::bound_host),
+            Some("github.com")
+        );
+        assert!(out.warnings.is_empty());
+    }
+
+    #[test]
+    fn put_carries_a_stored_credential_forward() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let reg = load_at(dir.path());
+        reg.put(token_def("notes", "https://github.com/acme/notes.git"))
+            .expect("first put");
+
+        // No credential in the body: an edit to an unrelated field must not require the caller
+        // to re-send the token over the loopback socket.
+        let out = reg
+            .put(def(
+                r#"{"id":"notes","remote":"https://github.com/acme/notes.git","sync_on_start":true}"#,
+            ))
+            .expect("second put");
+        assert!(out.repo.credential.is_some());
+        assert!(out.warnings.is_empty());
+        assert_eq!(
+            out.repo
+                .credential
+                .as_ref()
+                .and_then(CredentialSpec::bound_host),
+            Some("github.com")
+        );
+    }
+
+    #[test]
+    fn put_drops_a_credential_whose_host_changed() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let reg = load_at(dir.path());
+        reg.put(token_def("notes", "https://github.com/acme/notes.git"))
+            .expect("first put");
+
+        let out = reg
+            .put(def(
+                r#"{"id":"notes","remote":"https://evil.example/acme/notes.git"}"#,
+            ))
+            .expect("repointed put");
+        assert!(
+            out.repo.credential.is_none(),
+            "a repointed remote must not inherit the old host's token"
+        );
+        assert_eq!(out.warnings.len(), 1);
+        assert_eq!(out.warnings[0].code, "auth_unbound");
+        assert!(
+            out.warnings[0].message.contains("github.com"),
+            "{:?}",
+            out.warnings[0]
+        );
+
+        // And the token is really gone from disk.
+        let text = std::fs::read_to_string(dir.path().join("repos.json")).expect("read");
+        assert!(!text.contains("ghp_SUPERSECRET"), "{text}");
+    }
+
+    #[test]
+    fn put_replaces_rather_than_merges_a_credential() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let reg = load_at(dir.path());
+        reg.put(token_def("notes", "https://github.com/acme/notes.git"))
+            .expect("first put");
+        // An explicit `kind: "none"` is how a caller turns a stored credential off.
+        let out = reg
+            .put(def(
+                r#"{"id":"notes","remote":"https://github.com/acme/notes.git",
+                     "credential":{"kind":"none"}}"#,
+            ))
+            .expect("put none");
+        assert!(matches!(out.repo.credential, Some(CredentialSpec::None)));
+        let text = std::fs::read_to_string(dir.path().join("repos.json")).expect("read");
+        assert!(!text.contains("ghp_SUPERSECRET"), "{text}");
+    }
+
+    #[test]
+    fn put_clamps_auto_sync_secs_and_says_so() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let reg = load_at(dir.path());
+
+        let low = reg
+            .put(def(r#"{"id":"a","auto_sync_secs":5}"#))
+            .expect("put");
+        assert_eq!(low.repo.auto_sync_secs, Some(AUTO_SYNC_MIN_SECS));
+        assert_eq!(low.warnings[0].code, "auto_sync_clamped");
+
+        let high = reg
+            .put(def(r#"{"id":"b","auto_sync_secs":999999}"#))
+            .expect("put");
+        assert_eq!(high.repo.auto_sync_secs, Some(AUTO_SYNC_MAX_SECS));
+        assert_eq!(high.warnings[0].code, "auto_sync_clamped");
+
+        // 0 is "off", not a value to clamp, and produces no warning.
+        let off = reg
+            .put(def(r#"{"id":"c","auto_sync_secs":0}"#))
+            .expect("put");
+        assert_eq!(off.repo.auto_sync_secs, None);
+        assert!(off.warnings.is_empty());
+
+        let fine = reg
+            .put(def(r#"{"id":"d","auto_sync_secs":300}"#))
+            .expect("put");
+        assert_eq!(fine.repo.auto_sync_secs, Some(300));
+        assert!(fine.warnings.is_empty());
+    }
+
+    #[test]
+    fn remove_deletes_the_entry_and_persists() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let reg = load_at(dir.path());
+        reg.put(def(r#"{"id":"notes","sync_on_start":true}"#))
+            .expect("put");
+        reg.put(def(r#"{"id":"other"}"#)).expect("put");
+
+        let removed = reg.remove("notes").expect("remove");
+        assert_eq!(removed.id, "notes");
+        assert!(
+            removed.sync_on_start,
+            "the removed definition is returned in full"
+        );
+        assert_eq!(reg.ids(), vec!["other".to_string()]);
+
+        let reloaded = load_at(dir.path());
+        assert_eq!(reloaded.ids(), vec!["other".to_string()]);
+    }
+
+    #[test]
+    fn remove_reports_repo_not_found_and_read_only() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let reg = load_at(dir.path());
+        assert_eq!(
+            reg.remove("nope").expect_err("absent").code(),
+            GitErrorCode::RepoNotFound
+        );
+
+        let mut d = defaults();
+        d.registry_writes = false;
+        let ro = Registry::load(&dir.path().join("repos.json"), &dir.path().join("repos"), d);
+        assert_eq!(
+            ro.remove("anything").expect_err("read only").code(),
+            GitErrorCode::RegistryReadOnly,
+            "read-only is checked before existence, so a probe cannot enumerate ids"
         );
     }
 }

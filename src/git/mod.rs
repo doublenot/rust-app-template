@@ -17,6 +17,7 @@
 pub mod error;
 pub mod registry;
 pub mod secret;
+pub mod state;
 pub mod util;
 
 #[cfg(test)]
