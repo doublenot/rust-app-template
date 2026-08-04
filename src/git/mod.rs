@@ -4,6 +4,18 @@
 //! tripwire below; each later module registers itself by adding its own
 //! `pub mod <name>;` line to this file as it lands.
 
+// The subsystem lands over a dozen commits and is not reachable from `main` until the
+// host is wired up in task 10; without this, rustc's dead-code pass flags every item a
+// module publishes for the *next* module to consume, and CI runs `clippy -D warnings`.
+#![allow(dead_code)]
+// `GitError` is 152 bytes: a code plus four optional context strings, all of which the
+// HTTP envelope and the job record are contractually required to carry. Boxing it to
+// satisfy clippy's 128-byte `Result` budget would put an allocation on every `?` in the
+// subsystem to save a move on paths that are already doing filesystem or network I/O.
+#![allow(clippy::result_large_err)]
+
+pub mod secret;
+
 #[cfg(test)]
 mod tests {
     /// Guards the `git2` feature list in `Cargo.toml`, not git2 itself.
