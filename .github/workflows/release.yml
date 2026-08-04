@@ -21,12 +21,22 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
+      # perl and pkg-config are for the vendored OpenSSL that libssh2-sys pulls
+      # in on every unix target (git2 = vendored-libgit2 + ssh). make already
+      # comes with build-essential on the GitHub runners. macos-latest and
+      # windows-latest need nothing extra: macOS gets perl and make from the
+      # Xcode CLT, and Windows MSVC builds no OpenSSL at all.
       - name: Install Linux system deps
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
-          sudo apt-get install -y libgtk-3-dev libayatana-appindicator3-dev libxdo-dev
+          sudo apt-get install -y libgtk-3-dev libayatana-appindicator3-dev libxdo-dev \
+                                  perl pkg-config
       - uses: dtolnay/rust-toolchain@stable
+      # Caches ~/.cargo *and* ./target, which is what matters here: the ~80 s
+      # this build costs is compiling libgit2/libssh2/OpenSSL into
+      # target/*/build/{libgit2-sys,libssh2-sys,openssl-sys}-*. A cache of
+      # ~/.cargo/registry alone would save none of it.
       - uses: Swatinem/rust-cache@v2
       - name: Install cargo-packager
         run: cargo install cargo-packager --locked
