@@ -1,6 +1,6 @@
 # Git service for `chrome-host-app` — design
 
-Status: approved, ready to plan. Every git2 signature below is checked against **git2 0.21.0 / libgit2 1.9.6**, and the ones this document originally flagged were then re-checked directly against the vendored crate source at `~/.cargo/registry/src/*/git2-0.21.0/` (`merge_commits`, `merge_trees`, `treebuilder`, `Reference::shorthand`, `Branch::name`, `Cert::as_hostkey`, `CertHostkey::hash_sha256`, `CertificateCheckStatus::CertificatePassthrough`, both `git2::opts` timeout setters, `IndexConflict`/`IndexEntry`). One **[VERIFY]** remains, in §12.1, and only a real macOS build can close it.
+Status: approved, ready to plan. Every git2 signature below is checked against **git2 0.21.0 / libgit2 1.9.6**, and the ones this document originally flagged were then re-checked directly against the vendored crate source at `~/.cargo/registry/src/*/git2-0.21.0/` (`merge_commits`, `merge_trees`, `treebuilder`, `Reference::shorthand`, `Branch::name`, `Cert::as_hostkey`, `CertHostkey::hash_sha256`, `CertificateCheckStatus::CertificatePassthrough`, both `git2::opts` timeout setters, `IndexConflict`/`IndexEntry`). One **[VERIFY]** remains, in §12.1: its dependency-resolution half is now closed (macOS does resolve `openssl-sys → openssl-src`), but only a real macOS build can confirm that the vendored OpenSSL compiles and links there.
 
 ---
 
@@ -1785,7 +1785,9 @@ gethostname = "1"
 openssl-sys = { version = "0.9", features = ["vendored"] }
 ```
 
-**[VERIFY] on the first macOS CI run:** that `cargo tree --target aarch64-apple-darwin` shows `openssl-sys → openssl-src` and the build succeeds with no Homebrew OpenSSL present.
+**[VERIFY] — resolution-half CLOSED (commit `fadba71`), build-half still open.** The dependency-graph claim is confirmed: with the deps as written above, `cargo tree -i openssl-src --target aarch64-apple-darwin` resolves `openssl-src v300.6.1+3.6.3 → openssl-sys v0.9.117`, reached by three edges — our direct `[target.'cfg(unix)']` declaration, `libgit2-sys`, and `libssh2-sys`. Note that `git2`'s *own* optional `openssl-sys` edge is **absent** on macOS (Linux shows four edges, macOS three), which is exactly why the direct declaration is load-bearing rather than redundant. `x86_64-pc-windows-msvc` resolves no OpenSSL at all (`nothing to print`).
+
+What a resolution check **cannot** establish, and what still needs a real macOS runner: that the vendored OpenSSL actually *compiles and links* there with no Homebrew OpenSSL present. Keep this item open until the first green macOS CI leg.
 
 `LIBGIT2_NO_VENDOR=1` (plus `LIBSSH2_SYS_USE_PKG_CONFIG=1`) remains available as a distro-packager escape hatch and is documented in README §7.
 
