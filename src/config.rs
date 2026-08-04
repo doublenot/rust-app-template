@@ -371,6 +371,17 @@ pub struct RuntimePaths {
     pub logs_dir: PathBuf,
     pub settings_file: PathBuf,
     pub lock_file: PathBuf,
+    // Computed unconditionally — they are only paths. Nothing here creates them:
+    // `ensure()` deliberately ignores all three so that a host with no `[git]`
+    // section leaves no git files on disk at all. The mkdir for `repos_dir`
+    // belongs to `GitService::start`, and that placement is the entire reason
+    // the "nothing on disk when git is off" guarantee holds.
+    #[allow(dead_code)]
+    pub repos_dir: PathBuf,
+    #[allow(dead_code)]
+    pub registry_file: PathBuf,
+    #[allow(dead_code)]
+    pub git_state_file: PathBuf,
 }
 
 impl RuntimePaths {
@@ -381,6 +392,9 @@ impl RuntimePaths {
             logs_dir: data_dir.join("logs"),
             settings_file: data_dir.join("settings.json"),
             lock_file: data_dir.join("app.lock"),
+            repos_dir: data_dir.join("repos"),
+            registry_file: data_dir.join("repos.json"),
+            git_state_file: data_dir.join("git-state.json"),
             data_dir,
         }
     }
@@ -520,6 +534,22 @@ mod tests {
         assert_eq!(p.logs_dir, p.data_dir.join("logs"));
         assert_eq!(p.settings_file, p.data_dir.join("settings.json"));
         assert_eq!(p.lock_file, p.data_dir.join("app.lock"));
+        assert_eq!(p.repos_dir, p.data_dir.join("repos"));
+        assert_eq!(p.registry_file, p.data_dir.join("repos.json"));
+        assert_eq!(p.git_state_file, p.data_dir.join("git-state.json"));
+    }
+
+    #[test]
+    fn ensure_does_not_create_git_paths() {
+        let tmp = tempfile::tempdir().unwrap();
+        let p = RuntimePaths::under(tmp.path(), "com.example.x");
+        p.ensure().unwrap();
+        assert!(p.data_dir.is_dir());
+        assert!(p.chrome_profile.is_dir());
+        assert!(p.logs_dir.is_dir());
+        assert!(!p.repos_dir.exists());
+        assert!(!p.registry_file.exists());
+        assert!(!p.git_state_file.exists());
     }
 
     #[test]
