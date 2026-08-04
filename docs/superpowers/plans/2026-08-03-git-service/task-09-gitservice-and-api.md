@@ -5157,31 +5157,45 @@ fails the suite."
 
 Run each of these and read the output; every one is a one-line claim this task makes.
 
+Every one of these invariants is *stated in a doc comment in the very file it constrains*
+— `api.rs:3` says "No `git2` type crosses this file", `ops.rs:10` and `jobs.rs:18` name
+`tokio` in order to forbid it, `creds.rs:436` explains the `.expose()` count. A bare
+`grep` therefore matches its own documentation and can never report the number the audit
+claims. Each command below filters out whole-line comments (`^path:NN: *//`) so it
+measures code rather than prose. Measured on the task-9 tree: item 1 → no code hit
+(`api.rs:3` is the doc comment), item 4 → no code hit (`ops.rs:10,281,1731` and
+`jobs.rs:5,7,18` are all comments), item 5 → 4.
+
 ```bash
+nc() { grep -v ':[0-9]*: *//'; }   # drop whole-line comments
+
 # 1. No git2 type crosses api.rs.
-! grep -n 'git2' src/git/api.rs && echo "OK: api.rs names no git2"
+! grep -Hn 'git2' src/git/api.rs | nc | grep . && echo "OK: api.rs names no git2"
 
 # 2. No rt.enter() was added anywhere. The only pre-existing hits are in host.rs,
-#    around tokio::process::Command::spawn.
-grep -rn 'rt.enter()\|\.enter()' src/ || echo "none"
+#    around tokio::process::Command::spawn. (`gate.enter()` in jobs.rs is a test
+#    barrier, not a runtime guard.)
+grep -rn 'rt.enter()\|\.enter()' src/ | nc || echo "none"
 
 # 3. Nothing under src/git/ touches the host's process or window machinery.
+#    `HostEvent::GitRestartChildren` is the one sanctioned channel and is expected.
 ! grep -rn 'tokio::process\|chrome_generation\|server_generation\|Children' src/git/ \
+  | nc | grep -v 'HostEvent::GitRestartChildren' | grep . \
   && echo "OK: src/git/ holds no host machinery"
 
 # 4. The leaf modules still name no axum and no tokio.
-! grep -ln 'axum\|tokio' src/git/ops.rs src/git/merge.rs src/git/creds.rs \
+! grep -rn 'axum\|tokio' src/git/ops.rs src/git/merge.rs src/git/creds.rs \
   src/git/jobs.rs src/git/registry.rs src/git/state.rs src/git/secret.rs src/git/util.rs \
-  && echo "OK: leaf modules are runtime-free"
+  | nc | grep . && echo "OK: leaf modules are runtime-free"
 # (src/git/error.rs is expected to name axum: it owns http_status() and IntoResponse.)
 
-# 5. Exactly four `.expose()` call sites, all in creds::callbacks.
-grep -rn '\.expose()' src/ | tee /dev/stderr | wc -l
+# 5. Exactly four `.expose()` call sites in production code, all in creds::callbacks.
+#    secret.rs's own unit test calls it too; that is the accessor testing itself.
+grep -rn '\.expose()' src/ | nc | grep -v '^src/git/secret.rs:' | tee /dev/stderr | wc -l
 ```
 
-Item 3 will report `Children` if the string appears in a comment; read the hit rather than
-trusting the exit code. Item 5 must print `4`; anything else means a secret escaped
-`creds.rs` and the audit in §8.5 is no longer true.
+Item 5 must print `4`; anything else means a secret escaped `creds.rs` and the audit in
+§8.5 is no longer true.
 
 - [ ] **Step 103: Run the whole gate and commit the audit fixes, if any**
 

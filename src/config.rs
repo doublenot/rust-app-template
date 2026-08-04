@@ -131,16 +131,10 @@ pub enum FieldType {
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
-// Consumed by the git service and the host wiring, neither of which exists yet.
-// The section is parsed and validated here regardless of whether anything reads
-// it, so that turning a git feature on later can never surface a *new* config
-// error at an awkward moment.
-//
-// `allow`, not `expect`: the tests below read every field, so under `cfg(test)`
-// dead_code never fires and an `expect` would be reported as unfulfilled. Placing it
-// on the struct also keeps `AppConfig.git` alive — rustc's dead-code pass treats the
-// item as live, so `git_enabled`'s read of `self.git` counts.
-#[allow(dead_code)]
+// Consumed by `crate::git::GitService` and the host wiring. The section is parsed and
+// validated here regardless of whether a given field is read on this run, so that
+// turning a git feature on later can never surface a *new* config error at an awkward
+// moment.
 pub struct GitSection {
     #[serde(default)]
     pub tray_sync: bool,
@@ -424,14 +418,8 @@ pub struct RuntimePaths {
     // section leaves no git files on disk at all. The mkdir for `repos_dir`
     // belongs to `GitService::start`, and that placement is the entire reason
     // the "nothing on disk when git is off" guarantee holds.
-    //
-    // `allow`, not `expect`: `runtime_paths_layout` reads all three, so dead_code does
-    // not fire under `cfg(test)`. Task 9 deletes the attributes when it adds readers.
-    #[allow(dead_code)]
     pub repos_dir: PathBuf,
-    #[allow(dead_code)]
     pub registry_file: PathBuf,
-    #[allow(dead_code)]
     pub git_state_file: PathBuf,
 }
 

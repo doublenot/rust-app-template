@@ -138,6 +138,7 @@ fn main() {
         },
         settings_file: paths.settings_file.clone(),
         events: host_tx,
+        git: None,
     };
     let port = rt
         .block_on(internal_server::start(state))
