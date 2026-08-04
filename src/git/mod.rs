@@ -2474,4 +2474,364 @@ mod tests {
         let events = settings_sync_events(false).await;
         assert!(events.is_empty(), "expected no host events, got {events:?}");
     }
+
+    // ── network integration tests ─────────────────────────────────────────
+    // The only tests in this crate that touch a real remote, and therefore the
+    // only #[ignore]d ones here. They live in mod.rs rather than in ops.rs or
+    // creds.rs because each exercises the whole GitService -> jobs -> ops ->
+    // creds path; none is a unit test of a single file. CI runs
+    // `cargo test --locked` with no secrets and no network.
+
+    use super::{GitService, StartOutcome};
+    use crate::config::{AppConfig, RuntimePaths};
+    use crate::git::jobs::{JobOp, JobState, JobView};
+    use crate::git::ops::OpRequest;
+    use crate::git::registry::{CredentialSpec, RepoDef};
+    use crate::git::secret::Secret;
+    use crate::git::state::StateStore;
+    use crate::internal_server::{AppStatus, HostEvent};
+    use std::path::Path;
+    use std::sync::Arc;
+
+    const TEST_TOML: &str = r#"
+[app]
+name = "GitNetTest"
+identifier = "com.example.gitnettest"
+
+[git]
+default_branch = "main"
+network_timeout_secs = 60
+"#;
+
+    /// Owns the tokio runtime and the event receiver for as long as the test
+    /// runs. Dropping the runtime would cancel the `spawn_blocking` the job is
+    /// executing on, and `run_job` below would then spin until its deadline on
+    /// a job that no longer has a worker.
+    struct Harness {
+        #[allow(dead_code)]
+        rt: tokio::runtime::Runtime,
+        #[allow(dead_code)]
+        events: tokio::sync::mpsc::UnboundedReceiver<HostEvent>,
+        paths: RuntimePaths,
+        svc: Arc<GitService>,
+    }
+
+    fn harness(base: &Path) -> Harness {
+        let cfg = AppConfig::from_str(TEST_TOML).expect("test config parses");
+        let paths = RuntimePaths::under(base, &cfg.app.identifier);
+        paths.ensure().expect("create data dirs");
+        let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
+        let (tx, events) = tokio::sync::mpsc::unbounded_channel();
+        // Ready, so `after_job` is not in its "defer the restart" branch.
+        let status = Arc::new(tokio::sync::RwLock::new(AppStatus::Ready {
+            target_url: "http://127.0.0.1:1/".to_string(),
+        }));
+        let svc = GitService::new(&cfg, &paths, rt.handle().clone(), tx, status)
+            .expect("[git] is present in TEST_TOML, so the service exists");
+        svc.start();
+        Harness {
+            rt,
+            events,
+            paths,
+            svc,
+        }
+    }
+
+    fn def(id: &str, remote: &str, credential: Option<CredentialSpec>) -> RepoDef {
+        RepoDef {
+            id: id.to_string(),
+            remote: Some(remote.to_string()),
+            remote_name: "origin".to_string(),
+            // "" and 0 are the sentinels Registry::put normalises: the branch
+            // is filled from [git].default_branch, the timestamps from now.
+            branch: String::new(),
+            credential,
+            author: None,
+            sync_settings: false,
+            settings_path: "settings.json".to_string(),
+            auto_sync_secs: None,
+            sync_on_start: false,
+            sync_on_quit: false,
+            restart_children_on_pull: false,
+            created_at_ms: 0,
+            updated_at_ms: 0,
+        }
+    }
+
+    /// Admit a job and block until it is terminal. Sleeping is legal here and
+    /// nowhere else in this crate: these tests wait on a real network, so the
+    /// zero-sleep rule the `jobs.rs` tests hold to does not apply.
+    fn run_job(h: &Harness, id: &str, op: JobOp) -> JobView {
+        let slot = match h
+            .svc
+            .start_job(id, op, OpRequest::manual())
+            .expect("job admitted")
+        {
+            StartOutcome::Started(s) | StartOutcome::Replay(s) | StartOutcome::Busy(s) => s,
+        };
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(300);
+        while !slot.is_terminal() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "job {} never reached a terminal state",
+                slot.id
+            );
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        slot.view(h.svc.host_instance())
+    }
+
+    fn code_of(view: &JobView) -> &'static str {
+        view.error.as_ref().map(|e| e.code.as_str()).unwrap_or("-")
+    }
+
+    fn message_of(view: &JobView) -> Option<String> {
+        view.error.as_ref().map(|e| e.message.clone())
+    }
+
+    /// The canary for the vendored-TLS story. A `vendored-libgit2` +
+    /// vendored-OpenSSL build has to find the machine's CA bundle by itself
+    /// (libgit2's initialiser probes for it). If this fails on a distro, every
+    /// `https://` remote fails on that distro — so run it manually on every
+    /// platform the app ships to.
+    #[test]
+    #[ignore = "requires network; run with cargo test -- --ignored"]
+    fn vendored_tls_trusts_public_ca() {
+        let tmp = tempfile::tempdir().unwrap();
+        let h = harness(tmp.path());
+        h.svc
+            .put_repo(
+                "libc",
+                def("libc", "https://github.com/rust-lang/libc.git", None),
+            )
+            .expect("define repo");
+
+        let view = run_job(&h, "libc", JobOp::Clone);
+        assert_eq!(
+            view.state,
+            JobState::Succeeded,
+            "clone failed [{}]: {:?}",
+            code_of(&view),
+            message_of(&view)
+        );
+        assert!(
+            h.svc.tree_path("libc").join(".git").is_dir(),
+            "clone reported success but left no .git directory"
+        );
+    }
+
+    /// The whole HTTPS + stored-credential path against a real server,
+    /// including a *server-side* rejection. That last part cannot be covered
+    /// offline: libgit2's local transport does not run server hooks, so the
+    /// bare-repo fixtures in `ops.rs` can produce a client-side non-fast-
+    /// forward but never a `push_update_reference` status line from a server.
+    ///
+    /// `GIT_TEST_HTTPS_URL` must be a scratch repository you own that already
+    /// has a `main` branch with at least one commit; this test pushes to it.
+    #[test]
+    #[ignore = "requires GIT_TEST_HTTPS_URL and GIT_TEST_TOKEN"]
+    fn real_https_clone_and_push_and_server_rejection() {
+        let (url, token) = match (
+            std::env::var("GIT_TEST_HTTPS_URL"),
+            std::env::var("GIT_TEST_TOKEN"),
+        ) {
+            (Ok(u), Ok(t)) => (u, t),
+            _ => panic!("set GIT_TEST_HTTPS_URL and GIT_TEST_TOKEN"),
+        };
+        let cred = CredentialSpec::Token {
+            username: "x-access-token".to_string(),
+            token: Secret::new(token.clone()),
+            bound_host: None,
+        };
+        let tmp = tempfile::tempdir().unwrap();
+        let h = harness(tmp.path());
+
+        // Two independent clones of the same remote, so one can get ahead of
+        // the other without a second process.
+        for id in ["alpha", "beta"] {
+            h.svc
+                .put_repo(id, def(id, &url, Some(cred.clone())))
+                .expect("define repo");
+            let view = run_job(&h, id, JobOp::Clone);
+            assert_eq!(
+                view.state,
+                JobState::Succeeded,
+                "{id} clone failed [{}]: {:?}",
+                code_of(&view),
+                message_of(&view)
+            );
+        }
+
+        // alpha advances the remote.
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis();
+        std::fs::write(
+            h.svc.tree_path("alpha").join("host-test.txt"),
+            format!("{stamp}\n"),
+        )
+        .unwrap();
+        let view = run_job(&h, "alpha", JobOp::Sync);
+        assert_eq!(
+            view.state,
+            JobState::Succeeded,
+            "alpha sync failed [{}]: {:?}",
+            code_of(&view),
+            message_of(&view)
+        );
+        let result = view.result.as_ref().expect("a succeeded job has a result");
+        assert_eq!(result["pushed"], serde_json::Value::Bool(true));
+
+        // Leak canary: a stored PAT must not appear anywhere on the wire type.
+        let body = serde_json::to_string(&view).unwrap();
+        assert!(!body.contains(&token), "the job view leaked the token");
+
+        // beta is now one commit behind, so its push must be refused.
+        std::fs::write(h.svc.tree_path("beta").join("host-test.txt"), "divergent\n").unwrap();
+        let view = run_job(&h, "beta", JobOp::Commit);
+        assert_eq!(
+            view.state,
+            JobState::Succeeded,
+            "beta commit failed [{}]: {:?}",
+            code_of(&view),
+            message_of(&view)
+        );
+        let view = run_job(&h, "beta", JobOp::Push);
+        assert_eq!(
+            view.state,
+            JobState::Failed,
+            "a diverged push was accepted — nothing rejected it"
+        );
+        // Either end may catch it first: libgit2 can refuse a non-fast-forward
+        // refspec locally, or the server can answer with a rejection status.
+        assert!(
+            matches!(code_of(&view), "push_rejected" | "not_fast_forward"),
+            "unexpected rejection code {}: {:?}",
+            code_of(&view),
+            message_of(&view)
+        );
+    }
+
+    /// TOFU host-key pinning, end to end: the first SSH clone learns the
+    /// remote's key into `git-state.json`, and a second host whose pin does
+    /// not match refuses to talk to that remote at all.
+    ///
+    /// `GIT_TEST_SSH_KEY` is the path to an *unencrypted* private key with
+    /// access to `GIT_TEST_SSH_URL`.
+    #[test]
+    #[ignore = "requires GIT_TEST_SSH_URL and GIT_TEST_SSH_KEY"]
+    fn real_ssh_clone_pins_the_host_key() {
+        let (url, key) = match (
+            std::env::var("GIT_TEST_SSH_URL"),
+            std::env::var("GIT_TEST_SSH_KEY"),
+        ) {
+            (Ok(u), Ok(k)) => (u, k),
+            _ => panic!("set GIT_TEST_SSH_URL and GIT_TEST_SSH_KEY"),
+        };
+        let cred = CredentialSpec::SshKey {
+            username: "git".to_string(),
+            private_key_path: Some(std::path::PathBuf::from(&key)),
+            private_key: None,
+            public_key_path: None,
+            public_key: None,
+            passphrase: None,
+            bound_host: None,
+        };
+        let tmp = tempfile::tempdir().unwrap();
+
+        // First host: clones, and learns the fingerprint on the way.
+        let state_file = {
+            let h = harness(tmp.path());
+            h.svc
+                .put_repo("sshrepo", def("sshrepo", &url, Some(cred)))
+                .expect("define repo");
+            let view = run_job(&h, "sshrepo", JobOp::Clone);
+            assert_eq!(
+                view.state,
+                JobState::Succeeded,
+                "ssh clone failed [{}]: {:?}",
+                code_of(&view),
+                message_of(&view)
+            );
+            // Clear the tree so the second host has to reach the network again.
+            std::fs::remove_dir_all(h.svc.tree_path("sshrepo")).unwrap();
+            h.paths.git_state_file.clone()
+        };
+
+        let learned = StateStore::load(&state_file)
+            .fingerprint("sshrepo")
+            .expect("TOFU recorded a fingerprint");
+        assert!(
+            learned.starts_with("SHA256:"),
+            "unexpected fingerprint format: {learned}"
+        );
+
+        // Poison the pin. A fresh host must now refuse the same remote, which
+        // is the whole point of pinning: repos.json survives, only the pin
+        // changed.
+        StateStore::load(&state_file)
+            .record_fingerprint("sshrepo", &format!("SHA256:{}", "A".repeat(43)));
+
+        let h = harness(tmp.path());
+        let view = run_job(&h, "sshrepo", JobOp::Clone);
+        assert_eq!(
+            view.state,
+            JobState::Failed,
+            "a mismatched host-key pin was accepted"
+        );
+        assert_eq!(
+            code_of(&view),
+            "host_key_mismatch",
+            "{:?}",
+            message_of(&view)
+        );
+    }
+
+    /// libgit2 re-invokes the credentials callback up to fifteen times before
+    /// giving up ("too many redirects or authentication replays"), retrying the
+    /// same rejected identity each time. `creds::callbacks` self-limits at
+    /// MAX_CRED_ATTEMPTS, and this is the only honest test of that cap: it
+    /// needs a server that actually rejects. No env vars — the URL is a
+    /// repository that does not exist, which GitHub answers with a credential
+    /// challenge rather than a 404.
+    #[test]
+    #[ignore = "requires network; asserts a wrong token fails fast instead of looping 15×"]
+    fn wrong_token_fails_once() {
+        let bogus = "this-is-not-a-valid-token";
+        let tmp = tempfile::tempdir().unwrap();
+        let h = harness(tmp.path());
+        let cred = CredentialSpec::Token {
+            username: "x-access-token".to_string(),
+            token: Secret::new(bogus.to_string()),
+            bound_host: None,
+        };
+        h.svc
+            .put_repo(
+                "nope",
+                def(
+                    "nope",
+                    "https://github.com/rust-lang/does-not-exist-9f3a2b41.git",
+                    Some(cred),
+                ),
+            )
+            .expect("define repo");
+
+        let started = std::time::Instant::now();
+        let view = run_job(&h, "nope", JobOp::Clone);
+        let elapsed = started.elapsed();
+
+        assert_eq!(
+            view.state,
+            JobState::Failed,
+            "a bogus token was accepted for a nonexistent repository"
+        );
+        assert_eq!(code_of(&view), "auth_failed", "{:?}", message_of(&view));
+        assert!(
+            elapsed < std::time::Duration::from_secs(30),
+            "took {elapsed:?} — the credential retry cap is not holding"
+        );
+        let body = serde_json::to_string(&view).unwrap();
+        assert!(!body.contains(bogus), "the error leaked the token");
+    }
 }
