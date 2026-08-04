@@ -471,14 +471,19 @@ Run:
 grep -n '^### 9\.[0-9]' README.md
 grep -c 'auth_failed` is HTTP 502, never 401' README.md
 grep -c 'error_dialogs' README.md
-grep -n 'TODO\|TBD\|FIXME' README.md
+sed -n '/^## 9\. Git service/,$p' README.md | grep -n 'TODO\|TBD\|FIXME'
 ```
 
 Expected: seven `### 9.x` headings (`9.1 Quickstart`, `9.2 The merge policy…`,
 `9.3 Endpoints`, `9.4 Defining a repo`, `9.5 Jobs, retries, and errors`,
 `9.6 Automatic syncs, the tray, and dialogs`, `9.7 Operational notes`); `1` for
-the 502 rule; `3` or more for `error_dialogs`; and **no output at all** from the
-last grep (grep exits 1 — that is the pass condition).
+the 502 rule; `3` for `error_dialogs` (§3 table, §9.2, §9.6); and **no output at
+all** from the last grep (grep exits 1 — that is the pass condition).
+
+The last grep is scoped to §9 onward on purpose: §7 already contains the
+sentence "Code signing and notarization … are a per-app TODO", which is
+deliberate prose telling the template user what they still owe. Grepping the
+whole file could therefore never pass.
 
 - [ ] **Step 9: Commit §9**
 
@@ -748,23 +753,30 @@ at runtime; this only reclaims build cost.
 Run:
 
 ```bash
-grep -n 'perl make pkg-config' README.md
-grep -n 'LIBGIT2_NO_VENDOR=1' README.md
-grep -n 'target/\*/build/{libgit2-sys,libssh2-sys,openssl-sys}-\*' README.md
-grep -n 'APP_GIT_ENABLED' README.md
-grep -n 'git-state.json' README.md
-grep -n 'registry_writes' README.md
+for p in 'perl make pkg-config' 'LIBGIT2_NO_VENDOR=1' 'APP_GIT_ENABLED' \
+         'git-state.json' 'registry_writes' 'error_dialogs'; do
+  printf '%-24s %s\n' "$p" "$(grep -c "$p" README.md)"
+done
+grep -c 'target/\*/build/{libgit2-sys,libssh2-sys,openssl-sys}-\*' README.md
 grep -c '^### `\[git\]`' README.md
 ```
 
-Expected: `perl make pkg-config` appears **three** times (§2 install block, §7
-table, §7 "Why perl and make" table row spells them separately — accept two or
-three hits, one of which must be in the §2 block and one in the §7 table);
-`LIBGIT2_NO_VENDOR=1` once; the cache path once; `APP_GIT_ENABLED` at least twice
-(the §4 table and its explanation, plus §9 if you mentioned it); `git-state.json`
-at least three times (§6 row, §9.5, §9.7 or §3's `ssh_host_key_policy` row);
-`registry_writes` at least three times (§3 table, §5 delta, §9.3/§9.4); and the
-`[git]` subheading exactly `1`.
+Expected — **exact** counts, measured against the landed README. A range cannot
+fail usefully, so any deviation is a real drift to go and look at:
+
+```
+perl make pkg-config     2      # §2 install block, §7 table
+LIBGIT2_NO_VENDOR=1      1      # §7 "Removing the git service"
+APP_GIT_ENABLED          2      # §4 table row, §4 explanation
+git-state.json           3      # §6 row, §9.5, §9.7
+registry_writes          3      # §3 table, §5 delta, §9.4
+error_dialogs            3      # §3 table, §9.2, §9.6
+1                               # the build-cache path
+1                               # the [git] subheading
+```
+
+("Why perl and make" names the two tools in prose rather than as the literal
+`perl make pkg-config` string, which is why that count is 2 and not 3.)
 
 - [ ] **Step 17: Commit the §2–§7 updates**
 
