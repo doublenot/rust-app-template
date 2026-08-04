@@ -719,6 +719,11 @@ it. Append to `mod tests`.
             out.starts_with("[git]\n"),
             "app.toml has no commented-out [git] block"
         );
+        // `[git]` plus one line per GitSection field. Every shipped value is its own
+        // serde default, so the assertions below would still pass if the block lost
+        // keys — a field added to GitSection but never documented would slip through.
+        // Pinning the count is what makes this test bidirectional.
+        assert_eq!(out.lines().count(), 12, "expected [git] + 11 keys:\n{out}");
         let s = format!("{}{out}", minimal());
         let c = AppConfig::from_str(&s).unwrap_or_else(|e| panic!("{e}\n--- built from ---\n{s}"));
         let g = c.git.unwrap();
@@ -735,6 +740,15 @@ comment (the blank line after the block). Prose lines above `# [git]` are outsid
 continuation line whose body is itself a `#` comment (the wrapped `error_dialogs` note) is skipped
 by the `!body.starts_with('#')` guard; trailing `# …` comments on a key line are handled by TOML
 itself.
+
+The `out.lines().count()` assertion is load-bearing and was added during execution, after the
+original test was found to be one-directional. It catches a key *renamed* in `GitSection` (the
+stale comment name reaches `deny_unknown_fields`) but not a key *missing* from the comment,
+because every shipped value equals its own serde default — a truncated extraction produces a
+`GitSection` indistinguishable from a complete one. Mutation-checked by deleting the `allow_http`
+line: the assertion fails with `left: 11 / right: 12`. **Step 23 must therefore leave a blank
+line between the block and `# [[settings.fields]]`**, or the extractor runs on into the settings
+block and the count is wrong for that reason instead.
 
 - [ ] **Step 22: Run the test and watch it fail**
 
@@ -775,6 +789,9 @@ separated from `[menu]` above by the blank line that is already there:
 # ssh_host_key_policy = "tofu"          # "tofu" | "accept"
 ```
 
+Leave a blank line after `ssh_host_key_policy` and before `# [[settings.fields]]` — it is what
+terminates step 21's extractor, and the file already separates every other block that way.
+
 Every value shown is the actual default, which is what step 21's test enforces. `README §9` does
 not exist yet — task 12 writes it. The `#` column is aligned at 41 to match `[window]` and `[menu]`
 above.
@@ -807,9 +824,14 @@ cargo test
 ```
 
 Expected: `cargo fmt --check` silent; clippy `Finished` with no warnings; `cargo test` reports
-`test result: ok. 42 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out` for the
+`test result: ok. 43 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out` for the
 `chrome-host-app` binary (up from 33 passed at the start of the task) plus `0 passed` for
 `gen_icons`.
+
+The task adds **ten** tests — four in step 1, two in step 6, two in step 11, one in step 16
+(`runtime_paths_layout` is *extended*, not added, so it does not count), and one in step 21.
+33 + 10 = 43. The per-step `config::` counts above (13 → 15 → 17 → 18 → 19) were re-derived
+against a measured baseline of nine `config::tests` and are correct as written.
 
 If `cargo fmt` rewrote anything, fold it into the last commit:
 

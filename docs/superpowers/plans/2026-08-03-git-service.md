@@ -80,6 +80,8 @@ listed here rather than dropped because the fix pass was cut short by an account
 
 | task | finding |
 |---|---|
+| 2 | Step 26's expected test count corrected 42 → 43. The auditor's second claim — that the intermediate `config::` counts drift — is **wrong**: 13/15/17/18/19 were re-derived against a measured baseline of nine `config::tests` and every one is right. Verified green end-to-end |
+| 2 | *(found during execution, not by the auditors)* Step 21's `shipped_git_block_is_commented_out_but_valid` was one-directional — every shipped value equals its serde default, so a `[git]` block that **lost** keys still deserialized into an indistinguishable `GitSection` and the test passed. Step 21 now pins `out.lines().count()` to 12; mutation-checked by deleting `allow_http` (`left: 11 / right: 12`). Step 23 gained an explicit instruction to leave the terminating blank line |
 | 3 | `GitErrorCode::SettingsInvalid` / `settings_invalid` deleted — invalid pulled settings are deliberately a warning on a *successful* job (§9.7), so nothing could ever emit the code |
 | 3 | `GitError::auth_missing`, `auth_unbound`, `canceled`, `timeout` deleted — zero call sites; the four *codes* remain and are reached via `record_cred_failure` and `error::classify` |
 | 6 | `percent` now computed from `indexed_objects`, per §6.4 — indexing lags receipt, so a received-based percent sits at 100% while indexing is still running |
@@ -92,7 +94,6 @@ listed here rather than dropped because the fix pass was cut short by an account
 
 | task | finding | fix |
 |---|---|---|
-| 2 | Step 26's expected test count is wrong (says 42, should be 43); intermediate counts also drift | Recount against the steps; the task adds ten tests, `runtime_paths_layout` is extended not added |
 | 4 | `#![allow(dead_code)]` in `registry.rs`/`state.rs` is redundant — task 3's attribute in `mod.rs` already propagates to child modules | Delete both, and the claim that task 9 removes them |
 | 5 | `JobStore::lookup` never evicts, so `/jobs/{id}` can return a record `/jobs` reports as gone (§6.5) | Add `inner.evict(now)` to `lookup`, with a failing test using the injected clock (keep zero `sleep`s) |
 | 5 | Test names diverge from the ones spec §10.2 names | Add a mapping table; do not rename the tests |
