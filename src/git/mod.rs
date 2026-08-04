@@ -14,8 +14,10 @@
 // subsystem to save a move on paths that are already doing filesystem or network I/O.
 #![allow(clippy::result_large_err)]
 
+pub mod creds;
 pub mod error;
 pub mod jobs;
+pub mod ops;
 pub mod registry;
 pub mod secret;
 pub mod state;
