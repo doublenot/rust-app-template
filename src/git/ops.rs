@@ -674,6 +674,11 @@ pub fn sync(ctx: &OpCtx) -> Result<OpOutcome, GitError> {
         .and_then(|h| h.target())
         .map(|o| o.to_string());
 
+    // Before staging, so this host's settings ride out on the same commit as
+    // everything else in the tree. `sync` is the only verb that does this: a
+    // `pull` refuses a dirty tree, and copying in is what would make it dirty.
+    let settings_before = settings_copy_in(ctx)?;
+
     // Committing everything BEFORE the fetch is load-bearing, not convenient.
     // Afterwards every tracked file is at a committed state, which is what makes
     // the merge's forced checkout provably unable to destroy work, and it
@@ -703,6 +708,11 @@ pub fn sync(ctx: &OpCtx) -> Result<OpOutcome, GitError> {
     out.fetched_head = fetched.map(|o| o.to_string());
 
     apply_merge(&repo, ctx, &mut out)?;
+
+    // After the merge and before the push, so settings that arrived with the
+    // merge are validated before this host acts on them, and so a rejected file
+    // is healed in the tree the next sync will commit.
+    settings_apply_back(ctx, settings_before, &mut out)?;
 
     record_ahead_behind(&repo, ctx, &mut out);
     // Measured before the push, because afterwards it is 0 by construction and
@@ -3689,5 +3699,138 @@ mod tests {
         assert!(!out.settings_synced);
         assert!(out.settings_rejected.is_none());
         assert!(!fx.host_settings.exists());
+    }
+
+    /// An origin whose `main` already carries this host's exact settings bytes,
+    /// plus the `seed` clone that stands in for a teammate.
+    ///
+    /// Seeding through `settings::save` is what makes the bytes identical, so a
+    /// later `settings_copy_in` produces no diff and the only change in the job
+    /// under test is the one the teammate pushed.
+    fn origin_with_settings() -> (testkit::Origin, PathBuf) {
+        let o = testkit::origin_with_main();
+        // `origin_with_main` already owns the "seed" tree and pushed `main` from
+        // it; cloning a second one over that path is what libgit2 refuses with
+        // "exists and is not an empty directory".
+        let seed = o.root.path().join("seed");
+        crate::settings::save(
+            &seed.join("settings.json"),
+            &crate::settings::defaults(&settings_schema()),
+        )
+        .expect("seed settings.json");
+        testkit::commit_all(&seed, "seed settings.json");
+        testkit::push_main(&seed);
+        (o, seed)
+    }
+
+    fn mirror_job(
+        o: &testkit::Origin,
+        tree: &std::path::Path,
+        host_settings: &std::path::Path,
+    ) -> testkit::Job {
+        let mut fx = testkit::job(o, tree, JobOp::Sync);
+        fx.ctx.def.sync_settings = true;
+        fx.ctx.settings = Some(SettingsCtx {
+            schema: settings_schema(),
+            settings_file: host_settings.to_path_buf(),
+        });
+        fx
+    }
+
+    #[test]
+    fn sync_adopts_settings_that_arrived_with_the_merge() {
+        let (o, seed) = origin_with_settings();
+        let a = testkit::clone_at(&o, "a");
+
+        let mut wanted = crate::settings::defaults(&settings_schema());
+        wanted.insert("theme".to_string(), serde_json::json!("dark"));
+        crate::settings::save(&seed.join("settings.json"), &wanted).expect("teammate edit");
+        testkit::commit_all(&seed, "switch the theme to dark");
+        testkit::push_main(&seed);
+
+        let host_settings = o.root.path().join("data/settings.json");
+        let fx = mirror_job(&o, &a, &host_settings);
+
+        let out = sync(&fx.ctx).expect("sync");
+
+        assert!(
+            !out.committed,
+            "the copy-in wrote byte-identical bytes, so there was nothing to commit"
+        );
+        assert!(out.settings_synced);
+        assert!(
+            out.settings_changed,
+            "a pulled value change must earn a restart"
+        );
+        assert!(out.settings_rejected.is_none());
+        assert_eq!(
+            crate::settings::load(&settings_schema(), &host_settings)["theme"],
+            serde_json::json!("dark")
+        );
+    }
+
+    #[test]
+    fn sync_survives_settings_a_teammate_broke() {
+        let (o, seed) = origin_with_settings();
+        let a = testkit::clone_at(&o, "a");
+
+        std::fs::write(seed.join("settings.json"), "{\"theme\": \"purple\"}\n")
+            .expect("teammate typo");
+        testkit::commit_all(&seed, "typo the theme");
+        testkit::push_main(&seed);
+
+        let host_settings = o.root.path().join("data/settings.json");
+        let fx = mirror_job(&o, &a, &host_settings);
+
+        let out = sync(&fx.ctx).expect("a teammate's typo must not fail the whole sync");
+
+        assert!(out.settings_rejected.is_some());
+        assert!(!out.settings_synced);
+        assert!(!out.settings_changed);
+        assert!(out.warnings.iter().any(|w| w.code == "settings_rejected"));
+        assert_eq!(
+            crate::settings::load(&settings_schema(), &host_settings)["theme"],
+            serde_json::json!("light"),
+            "the local settings must survive the pull untouched"
+        );
+        assert_eq!(
+            std::fs::read(a.join("settings.json")).expect("read the tree copy"),
+            std::fs::read(&host_settings).expect("read the host copy"),
+            "the tree copy must be healed so the next push fixes the remote"
+        );
+    }
+
+    #[test]
+    fn first_sync_publishes_the_host_settings_without_a_restart() {
+        let o = testkit::origin_with_main();
+        let a = testkit::clone_at(&o, "a");
+        let host_settings = o.root.path().join("data/settings.json");
+        let fx = mirror_job(&o, &a, &host_settings);
+
+        let out = sync(&fx.ctx).expect("sync");
+
+        assert!(
+            out.committed,
+            "the materialized settings.json must be staged with everything else"
+        );
+        assert!(!out.settings_synced);
+        assert!(
+            !out.settings_changed,
+            "publishing our own settings must never restart our own children"
+        );
+
+        let bare = git2::Repository::open_bare(&o.bare).expect("open the bare origin");
+        let head = bare
+            .find_reference("refs/heads/main")
+            .expect("origin has main")
+            .peel_to_commit()
+            .expect("main has a commit");
+        assert!(
+            head.tree()
+                .expect("commit tree")
+                .get_path(std::path::Path::new("settings.json"))
+                .is_ok(),
+            "the first sync must publish settings.json to the remote"
+        );
     }
 }
