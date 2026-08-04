@@ -7,6 +7,9 @@
 //! exactly one file — this one.
 
 use axum::http::StatusCode;
+use serde::ser::SerializeStruct;
+use serde::{Serialize, Serializer};
+use std::path::Path;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GitErrorCode {
@@ -292,6 +295,341 @@ fn strip_userinfo(message: &str) -> String {
     out
 }
 
+/// git2's own class/code, carried through for debugging. Explicitly **not** part of
+/// the contract: clients match on `code`, never on this.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct Git2Hint {
+    pub class: String,
+    pub code: String,
+}
+
+impl Git2Hint {
+    pub fn of(e: &git2::Error) -> Git2Hint {
+        Git2Hint {
+            class: format!("{:?}", e.class()),
+            code: format!("{:?}", e.code()),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct GitError {
+    pub code: GitErrorCode,
+    pub message: String,
+    pub repo_id: Option<String>,
+    /// Absolute, display form. Set on `path_refused` only.
+    pub path: Option<String>,
+    /// Set on `invalid_request` only.
+    pub field: Option<String>,
+    pub git2: Option<Git2Hint>,
+}
+
+impl GitError {
+    pub fn new(code: GitErrorCode, message: impl Into<String>) -> GitError {
+        GitError {
+            code,
+            message: message.into(),
+            repo_id: None,
+            path: None,
+            field: None,
+            git2: None,
+        }
+    }
+
+    pub fn with_repo(mut self, repo_id: &str) -> GitError {
+        self.repo_id = Some(repo_id.to_string());
+        self
+    }
+
+    pub fn with_path(mut self, path: &Path) -> GitError {
+        self.path = Some(path.display().to_string());
+        self
+    }
+
+    pub fn with_field(mut self, field: &str) -> GitError {
+        self.field = Some(field.to_string());
+        self
+    }
+
+    pub fn with_git2(mut self, e: &git2::Error) -> GitError {
+        self.git2 = Some(Git2Hint::of(e));
+        self
+    }
+
+    pub fn code(&self) -> GitErrorCode {
+        self.code
+    }
+
+    pub fn http_status(&self) -> StatusCode {
+        self.code.http_status()
+    }
+
+    pub fn retryable(&self) -> bool {
+        self.code.retryable()
+    }
+
+    /// Run `scrub` over the message. Every error crossing into a job record,
+    /// `git-state.json`, `git.log`, or a dialog goes through here first.
+    pub fn scrubbed(mut self, secrets: &[&str]) -> GitError {
+        self.message = scrub(&self.message, secrets);
+        self
+    }
+
+    /// Reinterpret a merge conflict as a dirty tree.
+    ///
+    /// libgit2 refuses a checkout that would overwrite local edits with
+    /// `ErrorCode::Conflict`, which `classify` maps to `merge_unresolvable` — correct
+    /// for a merge, wrong for a checkout, where nothing was merged and the fix the
+    /// caller needs to hear is "commit or discard your changes first". Only call sites
+    /// that know they were checking out may apply this.
+    // Consuming `self` is the point: the error is re-labelled once, on its way out of
+    // the checkout call. `wrong_self_convention` wants `as_*` to borrow.
+    #[allow(clippy::wrong_self_convention)]
+    pub fn as_dirty_tree_if_conflict(mut self) -> GitError {
+        if self.code == GitErrorCode::MergeUnresolvable {
+            self.code = GitErrorCode::DirtyTree;
+        }
+        self
+    }
+
+    pub fn internal(message: impl Into<String>) -> GitError {
+        GitError::new(GitErrorCode::Internal, message)
+    }
+
+    pub fn invalid_request(field: &str, message: impl Into<String>) -> GitError {
+        GitError::new(GitErrorCode::InvalidRequest, message).with_field(field)
+    }
+
+    pub fn invalid_repo_id(id: &str) -> GitError {
+        GitError::new(
+            GitErrorCode::InvalidRepoId,
+            format!(
+                "repo id {id:?} is not valid: 1-64 characters of [a-z0-9._-] starting with a \
+                 letter or digit, no \"..\", no trailing dot or space, and not a Windows \
+                 reserved name"
+            ),
+        )
+    }
+
+    pub fn insecure_remote(remote: &str, why: &str) -> GitError {
+        GitError::new(
+            GitErrorCode::InsecureRemote,
+            format!("remote {remote:?} was refused: {why}"),
+        )
+    }
+
+    pub fn repo_not_found(id: &str) -> GitError {
+        GitError::new(
+            GitErrorCode::RepoNotFound,
+            format!("repo {id:?} is not in the registry"),
+        )
+        .with_repo(id)
+    }
+
+    pub fn repo_busy(id: &str, op: &str) -> GitError {
+        GitError::new(
+            GitErrorCode::RepoBusy,
+            format!("repo {id:?} is busy running {op}"),
+        )
+        .with_repo(id)
+    }
+
+    pub fn job_not_found(raw: &str) -> GitError {
+        GitError::new(
+            GitErrorCode::JobNotFound,
+            format!("job {raw:?} is unknown, has been evicted, or belongs to an earlier run"),
+        )
+    }
+
+    pub fn registry_read_only() -> GitError {
+        GitError::new(
+            GitErrorCode::RegistryReadOnly,
+            "repos.json is author-owned: [git].registry_writes is false",
+        )
+    }
+
+    pub fn registry_write_failed(e: impl std::fmt::Display) -> GitError {
+        GitError::new(
+            GitErrorCode::RegistryWriteFailed,
+            format!("repos.json could not be written: {e}"),
+        )
+    }
+
+    pub fn path_refused(path: &Path, why: &str) -> GitError {
+        GitError::new(
+            GitErrorCode::PathRefused,
+            format!("refusing to touch {}: {why}", path.display()),
+        )
+        .with_path(path)
+    }
+
+    pub fn purge_failed(e: impl std::fmt::Display) -> GitError {
+        GitError::new(
+            GitErrorCode::PurgeFailed,
+            format!("the working tree could not be removed: {e}"),
+        )
+    }
+
+    pub fn status_timeout() -> GitError {
+        GitError::new(
+            GitErrorCode::StatusTimeout,
+            "the bounded status read did not finish in time",
+        )
+    }
+
+    pub fn shutting_down() -> GitError {
+        GitError::new(
+            GitErrorCode::ShuttingDown,
+            "the host is shutting down and is not accepting new git jobs",
+        )
+    }
+
+    pub fn remote_missing() -> GitError {
+        GitError::new(
+            GitErrorCode::RemoteMissing,
+            "this repo has no remote configured",
+        )
+    }
+
+    pub fn confirm_required() -> GitError {
+        GitError::new(
+            GitErrorCode::ConfirmRequired,
+            "this operation discards work: retry with \"confirm\": true",
+        )
+    }
+
+    pub fn settings_sync_unavailable() -> GitError {
+        GitError::new(
+            GitErrorCode::SettingsSyncUnavailable,
+            "sync_settings needs a [settings] section in app.toml",
+        )
+    }
+
+    pub fn no_worktree(id: &str) -> GitError {
+        GitError::new(
+            GitErrorCode::NoWorktree,
+            format!("repo {id:?} has no working tree yet: run clone or init first"),
+        )
+        .with_repo(id)
+    }
+
+    pub fn not_a_repository(path: &Path) -> GitError {
+        GitError::new(
+            GitErrorCode::NotARepository,
+            format!(
+                "{} exists and is not empty but is not a git repository",
+                path.display()
+            ),
+        )
+    }
+
+    pub fn detached_head() -> GitError {
+        GitError::new(
+            GitErrorCode::DetachedHead,
+            "HEAD is detached: check out the configured branch first",
+        )
+    }
+
+    pub fn branch_mismatch(actual: &str, expected: &str) -> GitError {
+        GitError::new(
+            GitErrorCode::BranchMismatch,
+            format!("HEAD is on {actual:?} but this repo is configured for {expected:?}"),
+        )
+    }
+
+    pub fn unborn_branch(what: &str) -> GitError {
+        GitError::new(
+            GitErrorCode::UnbornBranch,
+            format!("{what} needs at least one commit and this branch has none"),
+        )
+    }
+
+    pub fn dirty_tree(what: &str) -> GitError {
+        GitError::new(
+            GitErrorCode::DirtyTree,
+            format!("{what} would discard uncommitted changes"),
+        )
+    }
+
+    pub fn merge_path_type_conflict(path: &Path) -> GitError {
+        GitError::new(
+            GitErrorCode::MergePathTypeConflict,
+            format!(
+                "{} is a file on one side of the merge and a directory on the other",
+                path.display()
+            ),
+        )
+    }
+
+    pub fn merge_unresolvable() -> GitError {
+        GitError::new(
+            GitErrorCode::MergeUnresolvable,
+            "the merge left conflicts that prefer-local resolution could not settle",
+        )
+    }
+
+    pub fn push_rejected(refname: &str, status: &str) -> GitError {
+        GitError::new(
+            GitErrorCode::PushRejected,
+            format!("the remote rejected {refname}: {status}"),
+        )
+    }
+
+    pub fn io(message: impl Into<String>) -> GitError {
+        GitError::new(GitErrorCode::IoFailed, message)
+    }
+}
+
+/// The **job-error** shape: `{"code","message","retryable","git2"?}`.
+///
+/// Hand-written, and deliberately narrower than the HTTP envelope: `repo_id`, `path`
+/// and `field` are not emitted here because a job record already names its repo, and
+/// `api::ApiError` puts them into the envelope instead. Keeping the two shapes in two
+/// types is what lets both of spec §5's worked examples be true at once.
+impl Serialize for GitError {
+    fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        let len = 3 + usize::from(self.git2.is_some());
+        let mut st = s.serialize_struct("GitError", len)?;
+        st.serialize_field("code", self.code.as_str())?;
+        st.serialize_field("message", &self.message)?;
+        st.serialize_field("retryable", &self.code.retryable())?;
+        if let Some(hint) = &self.git2 {
+            st.serialize_field("git2", hint)?;
+        }
+        st.end()
+    }
+}
+
+impl std::fmt::Display for GitError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}: {}", self.code.as_str(), self.message)
+    }
+}
+
+impl std::error::Error for GitError {}
+
+/// The `?` path for call sites with no abort flag and no credential in scope.
+///
+/// Inside a job, `OpCtx::classify_err` is used instead: it knows the abort reason and
+/// the secrets to scrub, both of which this conversion has to assume away.
+impl From<git2::Error> for GitError {
+    fn from(e: git2::Error) -> GitError {
+        GitError::new(classify(&e, AbortReason::None), e.message()).with_git2(&e)
+    }
+}
+
+impl From<std::io::Error> for GitError {
+    fn from(e: std::io::Error) -> GitError {
+        GitError::io(e.to_string())
+    }
+}
+
+impl From<serde_json::Error> for GitError {
+    fn from(e: serde_json::Error) -> GitError {
+        GitError::internal(format!("json: {e}"))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -512,6 +850,76 @@ mod tests {
         assert_eq!(
             scrub("cloning into abcdefg/repo", &["abcdefg"]),
             "cloning into ***/repo"
+        );
+    }
+
+    #[test]
+    fn scrubbed_rewrites_the_message_and_keeps_everything_else() {
+        let e = GitError::new(
+            GitErrorCode::AuthFailed,
+            "https://u:secretpass@h/x rejected",
+        )
+        .with_repo("notes")
+        .scrubbed(&["secretpass"]);
+        assert_eq!(e.message, "https://h/x rejected");
+        assert_eq!(e.code, GitErrorCode::AuthFailed);
+        assert_eq!(e.repo_id.as_deref(), Some("notes"));
+    }
+
+    #[test]
+    fn job_error_shape_is_code_message_retryable_and_an_optional_hint() {
+        let e = GitError::new(GitErrorCode::NetworkFailed, "boom").with_repo("notes");
+        assert_eq!(
+            serde_json::to_string(&e).expect("GitError serialises"),
+            r#"{"code":"network_failed","message":"boom","retryable":true}"#
+        );
+
+        let e = e.with_git2(&err(C::NotFastForward, K::Reference));
+        assert_eq!(
+            serde_json::to_string(&e).expect("GitError serialises"),
+            r#"{"code":"network_failed","message":"boom","retryable":true,"git2":{"class":"Reference","code":"NotFastForward"}}"#
+        );
+    }
+
+    #[test]
+    fn from_git2_classifies_and_attaches_the_hint() {
+        let e: GitError = git2::Error::new(C::Locked, K::Index, "index.lock exists").into();
+        assert_eq!(e.code, GitErrorCode::RepoLocked);
+        assert_eq!(e.message, "index.lock exists");
+        assert_eq!(
+            e.git2,
+            Some(Git2Hint {
+                class: "Index".to_string(),
+                code: "Locked".to_string()
+            })
+        );
+    }
+
+    #[test]
+    fn from_io_and_json_errors() {
+        let io: GitError = std::io::Error::new(std::io::ErrorKind::PermissionDenied, "nope").into();
+        assert_eq!(io.code, GitErrorCode::IoFailed);
+        assert_eq!(io.message, "nope");
+
+        let json: GitError = serde_json::from_str::<u32>("{").unwrap_err().into();
+        assert_eq!(json.code, GitErrorCode::Internal);
+        assert!(json.message.starts_with("json: "));
+    }
+
+    #[test]
+    fn a_checkout_conflict_can_be_reinterpreted_as_a_dirty_tree() {
+        let e = GitError::new(GitErrorCode::MergeUnresolvable, "x").as_dirty_tree_if_conflict();
+        assert_eq!(e.code, GitErrorCode::DirtyTree);
+        // Anything else passes through untouched.
+        let e = GitError::new(GitErrorCode::NetworkFailed, "x").as_dirty_tree_if_conflict();
+        assert_eq!(e.code, GitErrorCode::NetworkFailed);
+    }
+
+    #[test]
+    fn display_leads_with_the_code() {
+        assert_eq!(
+            GitError::repo_not_found("notes").to_string(),
+            "repo_not_found: repo \"notes\" is not in the registry"
         );
     }
 }
