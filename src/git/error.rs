@@ -247,6 +247,51 @@ pub fn classify(e: &git2::Error, abort: AbortReason) -> GitErrorCode {
     }
 }
 
+/// Remove credentials from a message before it reaches a job record, `git.log`,
+/// `git-state.json`, or a dialog.
+///
+/// Two passes, because there are two ways a secret gets into a libgit2 message:
+/// quoted back as part of a URL, and echoed as part of a transport error.
+pub fn scrub(message: &str, secrets: &[&str]) -> String {
+    let mut out = strip_userinfo(message);
+    for secret in secrets {
+        // A short "secret" is far likelier to be a substring of a path, a host, or a
+        // hex prefix than an actual credential, and replacing it would mangle every
+        // message it appears in. Real tokens and passphrases are much longer than 6.
+        if secret.len() > 6 {
+            out = out.replace(secret, "***");
+        }
+    }
+    out
+}
+
+/// `scheme://user:pw@host/path` -> `scheme://host/path`, everywhere in the string.
+///
+/// A PAT is routinely carried in the *username* position (`https://ghp_x@host/…`), so
+/// a bare `user@` is stripped too. `scp`-style remotes (`git@github.com:acme/x.git`)
+/// have no `://` and are left alone — they carry no secret and the user needs to see
+/// them. Nothing but the userinfo is touched: host and path are what make the message
+/// worth logging at all.
+fn strip_userinfo(message: &str) -> String {
+    let mut out = String::with_capacity(message.len());
+    let mut rest = message;
+    while let Some(sep) = rest.find("://") {
+        let after = sep + 3;
+        out.push_str(&rest[..after]);
+        let end = rest[after..]
+            .find(|c: char| c == '/' || c == '?' || c == '#' || c.is_whitespace())
+            .map_or(rest.len(), |i| after + i);
+        let authority = &rest[after..end];
+        match authority.rfind('@') {
+            Some(at) => out.push_str(&authority[at + 1..]),
+            None => out.push_str(authority),
+        }
+        rest = &rest[end..];
+    }
+    out.push_str(rest);
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -427,5 +472,46 @@ mod tests {
         // the operation did not fail *because* we aborted it.
         let e = err(C::Auth, K::Http);
         assert_eq!(classify(&e, AbortReason::Shutdown), G::AuthFailed);
+    }
+
+    #[test]
+    fn scrub_strips_url_userinfo() {
+        assert_eq!(scrub("https://u:p@h/x", &[]), "https://h/x");
+        assert_eq!(
+            scrub(
+                "failed to connect to https://ghp_realtoken@github.com/acme/x.git: 403",
+                &[]
+            ),
+            "failed to connect to https://github.com/acme/x.git: 403"
+        );
+        // scp-form has no scheme and carries no secret: leave it readable.
+        assert_eq!(
+            scrub("remote 'git@github.com:acme/x.git' not found", &[]),
+            "remote 'git@github.com:acme/x.git' not found"
+        );
+        // No userinfo, nothing to do.
+        assert_eq!(scrub("cloning https://h/x", &[]), "cloning https://h/x");
+    }
+
+    #[test]
+    fn scrub_replaces_a_stored_secret_anywhere_in_the_message() {
+        let token = "github_pat_11ABCDEF";
+        let msg = format!("unexpected http status 401 (sent {token}) while listing refs");
+        assert_eq!(
+            scrub(&msg, &[token]),
+            "unexpected http status 401 (sent ***) while listing refs"
+        );
+    }
+
+    #[test]
+    fn scrub_leaves_short_secrets_alone() {
+        assert_eq!(
+            scrub("cloning into abcdef/repo", &["abcdef"]),
+            "cloning into abcdef/repo"
+        );
+        assert_eq!(
+            scrub("cloning into abcdefg/repo", &["abcdefg"]),
+            "cloning into ***/repo"
+        );
     }
 }
