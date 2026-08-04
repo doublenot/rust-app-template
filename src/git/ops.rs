@@ -18,9 +18,10 @@ use std::time::Instant;
 use serde::Serialize;
 
 use crate::config::SettingsSection;
-use crate::git::creds::{HostKeyChecker, ResolvedCred};
+use crate::git::creds::{self, HostKeyChecker, ResolvedCred};
 use crate::git::error::{self, AbortReason, GitError, GitErrorCode};
 use crate::git::jobs::{AbortFlag, JobOp, JobSlot, Phase, Progress};
+use crate::git::merge::{self, MergeOutcome};
 use crate::git::registry::{AuthorSpec, CredentialSpec, RepoDef, Warning};
 
 /// Who the host says it is when it writes a commit nobody typed.
@@ -572,16 +573,156 @@ pub fn clone(ctx: &OpCtx) -> Result<OpOutcome, GitError> {
     Ok(out)
 }
 
-pub fn pull(_ctx: &OpCtx) -> Result<OpOutcome, GitError> {
-    Err(GitError::internal("pull is not implemented yet"))
+pub fn pull(ctx: &OpCtx) -> Result<OpOutcome, GitError> {
+    let repo = open_tree(ctx)?;
+    require_branch(&repo, &ctx.def.branch)?;
+    if ctx.def.remote.is_none() {
+        return Err(GitError::remote_missing().with_repo(&ctx.def.id));
+    }
+
+    let mut out = OpOutcome::new("up_to_date", &ctx.def.branch);
+    out.head_before = repo
+        .head()
+        .ok()
+        .and_then(|h| h.target())
+        .map(|o| o.to_string());
+
+    if ctx.request.commit_local {
+        let (commit, files) = stage_and_commit(&repo, ctx)?;
+        out.committed = commit.is_some();
+        out.commit = commit.map(|o| o.to_string());
+        out.files_committed = files;
+        if commit.is_some() {
+            out.outcome = "committed";
+        }
+    } else {
+        // The merge force-checks-out its result, which is provably
+        // non-destructive only when every tracked file is already at a
+        // committed state. Untracked files are deliberately not counted:
+        // nothing in a pull touches them, and refusing on a stray scratch file
+        // would make auto-sync useless.
+        let mut so = git2::StatusOptions::new();
+        so.include_untracked(false)
+            .include_ignored(false)
+            .include_unmodified(false);
+        let dirty = !repo
+            .statuses(Some(&mut so))
+            .map_err(|e| ctx.classify_err(&e))?
+            .is_empty();
+        if dirty {
+            let mut e = GitError::dirty_tree("pull").with_repo(&ctx.def.id);
+            // The code alone does not tell the caller which of the two ways out
+            // exists, and this is the error an integrator hits first.
+            e.message
+                .push_str("; commit them first, or retry with commit_local=true");
+            return Err(e);
+        }
+    }
+
+    let fetched = fetch(&repo, ctx)?;
+    out.fetched = true;
+    out.fetched_head = fetched.map(|o| o.to_string());
+
+    apply_merge(&repo, ctx, &mut out)?;
+
+    out.head_after = repo
+        .head()
+        .ok()
+        .and_then(|h| h.target())
+        .map(|o| o.to_string());
+    record_ahead_behind(&repo, ctx, &mut out);
+    ctx.phase(Phase::Finalizing);
+    Ok(out)
 }
 
-pub fn push(_ctx: &OpCtx) -> Result<OpOutcome, GitError> {
-    Err(GitError::internal("push is not implemented yet"))
+pub fn push(ctx: &OpCtx) -> Result<OpOutcome, GitError> {
+    let repo = open_tree(ctx)?;
+    require_branch(&repo, &ctx.def.branch)?;
+
+    let mut out = OpOutcome::new("pushed", &ctx.def.branch);
+    // A push moves the remote, never HEAD, so before and after are the same.
+    let head = repo
+        .head()
+        .ok()
+        .and_then(|h| h.target())
+        .map(|o| o.to_string());
+    out.head_before = head.clone();
+    out.head_after = head;
+
+    push_branch(&repo, ctx, &mut out)?;
+    record_ahead_behind(&repo, ctx, &mut out);
+    ctx.phase(Phase::Finalizing);
+    Ok(out)
 }
 
-pub fn sync(_ctx: &OpCtx) -> Result<OpOutcome, GitError> {
-    Err(GitError::internal("sync is not implemented yet"))
+pub fn sync(ctx: &OpCtx) -> Result<OpOutcome, GitError> {
+    // A sync of a repo that was never materialised is a clone: the caller asked
+    // for "make this tree match the remote", and there is no earlier step they
+    // should have had to run first.
+    if !ctx.tree.exists() && ctx.def.remote.is_some() {
+        return clone(ctx);
+    }
+
+    let repo = open_tree(ctx)?;
+    require_branch(&repo, &ctx.def.branch)?;
+
+    let mut out = OpOutcome::new("no_changes", &ctx.def.branch);
+    out.head_before = repo
+        .head()
+        .ok()
+        .and_then(|h| h.target())
+        .map(|o| o.to_string());
+
+    // Committing everything BEFORE the fetch is load-bearing, not convenient.
+    // Afterwards every tracked file is at a committed state, which is what makes
+    // the merge's forced checkout provably unable to destroy work, and it
+    // collapses "HEAD is unborn" to "the tree really was empty".
+    let (commit, files) = stage_and_commit(&repo, ctx)?;
+    out.committed = commit.is_some();
+    out.commit = commit.map(|o| o.to_string());
+    out.files_committed = files;
+    if commit.is_some() {
+        out.outcome = "committed";
+    }
+
+    if ctx.def.remote.is_none() {
+        // Local version history for the child process, with nothing to publish
+        // it to, is a legitimate configuration.
+        out.head_after = repo
+            .head()
+            .ok()
+            .and_then(|h| h.target())
+            .map(|o| o.to_string());
+        ctx.phase(Phase::Finalizing);
+        return Ok(out);
+    }
+
+    let fetched = fetch(&repo, ctx)?;
+    out.fetched = true;
+    out.fetched_head = fetched.map(|o| o.to_string());
+
+    apply_merge(&repo, ctx, &mut out)?;
+
+    record_ahead_behind(&repo, ctx, &mut out);
+    // Measured before the push, because afterwards it is 0 by construction and
+    // every no-op sync would claim it had published something.
+    let had_local_commits = out.ahead > 0;
+
+    if ctx.request.push {
+        push_branch(&repo, ctx, &mut out)?;
+        if out.outcome == "no_changes" && had_local_commits {
+            out.outcome = "pushed";
+        }
+    }
+
+    out.head_after = repo
+        .head()
+        .ok()
+        .and_then(|h| h.target())
+        .map(|o| o.to_string());
+    record_ahead_behind(&repo, ctx, &mut out);
+    ctx.phase(Phase::Finalizing);
+    Ok(out)
 }
 
 pub fn commit(ctx: &OpCtx) -> Result<OpOutcome, GitError> {
@@ -1221,6 +1362,194 @@ pub fn purge_tree(
     std::fs::remove_dir_all(&real).map_err(|e| GitError::io(format!("{}: {e}", real.display())))
 }
 
+/// Fetch `def.branch` from `def.remote_name` and report the remote's tip.
+///
+/// `Ok(None)` means the remote has no such branch yet — not an error: `push`
+/// creates it.
+pub fn fetch(repo: &git2::Repository, ctx: &OpCtx) -> Result<Option<git2::Oid>, GitError> {
+    if ctx.def.remote.is_none() {
+        return Err(GitError::remote_missing().with_repo(&ctx.def.id));
+    }
+    ctx.phase(Phase::Fetching);
+    let mut remote = repo
+        .find_remote(&ctx.def.remote_name)
+        .map_err(|e| ctx.classify_err(&e))?;
+
+    // An explicit single-branch refspec rather than the remote's configured
+    // `+refs/heads/*:refs/remotes/<r>/*`: a sync that only ever touches one
+    // branch must not download every branch the remote has grown.
+    let branch = ctx.def.branch.as_str();
+    let remote_name = ctx.def.remote_name.as_str();
+    let refspec = format!("+refs/heads/{branch}:refs/remotes/{remote_name}/{branch}");
+
+    let mut fo = git2::FetchOptions::new();
+    fo.remote_callbacks(creds::callbacks(ctx));
+    // Tags are out of scope. The default (`AutotagOption::Auto`) downloads every
+    // tag that points into the fetched history, and the host never pushes one
+    // back, so they would only ever accumulate in one direction.
+    fo.download_tags(git2::AutotagOption::None);
+    remote
+        .fetch(&[refspec.as_str()], Some(&mut fo), Some("host sync"))
+        .map_err(|e| ctx.classify_err(&e))?;
+
+    // A refspec whose source does not exist on the remote matches nothing and
+    // is not an error, so the tracking ref — not the fetch's return value — is
+    // what says whether the remote has this branch at all.
+    let tracking = format!("refs/remotes/{remote_name}/{branch}");
+    match repo.find_reference(&tracking) {
+        Ok(r) => Ok(r.target()),
+        Err(e) if e.code() == git2::ErrorCode::NotFound => Ok(None),
+        Err(e) => Err(ctx.classify_err(&e)),
+    }
+}
+
+/// Publish `def.branch` to the remote and make sure it has an upstream.
+pub fn push_branch(
+    repo: &git2::Repository,
+    ctx: &OpCtx,
+    out: &mut OpOutcome,
+) -> Result<(), GitError> {
+    if ctx.def.remote.is_none() {
+        return Err(GitError::remote_missing().with_repo(&ctx.def.id));
+    }
+    // Pushing a branch with no commits fails deep inside libgit2's refspec
+    // matcher with "src refspec '...' does not match any existing object".
+    //
+    // `head_is_unborn`, not `Repository::is_empty()`: libgit2 defines empty as
+    // "HEAD points at `init.defaultBranch` and there are no refs", which is
+    // false for every repo this service pins to `[git].default_branch` on a
+    // machine whose git default differs.
+    if head_is_unborn(repo) {
+        return Err(GitError::unborn_branch("push").with_repo(&ctx.def.id));
+    }
+
+    ctx.phase(Phase::Pushing);
+    let branch = ctx.def.branch.as_str();
+    let mut remote = repo
+        .find_remote(&ctx.def.remote_name)
+        .map_err(|e| ctx.classify_err(&e))?;
+    // The leading `+` is a force push and comes SOLELY from an explicit
+    // `force: true` in the request — never from config, and never as a fallback
+    // after a rejection. git2 0.21's PushOptions has no expected-old-oid
+    // parameter, so there is no force-with-lease to fall back to either; a
+    // fetch-compare-then-force approximation is a TOCTOU window, not a lease.
+    let spec = if ctx.request.force {
+        format!("+refs/heads/{branch}:refs/heads/{branch}")
+    } else {
+        format!("refs/heads/{branch}:refs/heads/{branch}")
+    };
+
+    let mut po = git2::PushOptions::new();
+    po.remote_callbacks(creds::callbacks(ctx));
+    remote.push(&[spec.as_str()], Some(&mut po)).map_err(|e| {
+        let mut err = ctx.classify_err(&e);
+        if err.code() == GitErrorCode::NotFastForward {
+            // libgit2's own text describes the situation but not the fix,
+            // and this error is the one a user hits most often.
+            err.message
+                .push_str("; pull first, or retry with force=true");
+        }
+        err
+    })?;
+
+    // A server-side refusal — a protected branch, a pre-receive hook — is
+    // invisible to libgit2 locally: `push` returns Ok(()) and the refusal
+    // arrives only through push_update_reference, which our callbacks record.
+    // Without this drain the job reports a success that pushed nothing.
+    ctx.take_push_rejections()?;
+
+    out.pushed = true;
+    out.force_pushed = ctx.request.force;
+
+    // Clone sets the upstream; a manual push does not. Without it a repo the
+    // host created with init + push has no `branch.<b>.merge`, and every later
+    // graph_ahead_behind through Branch::upstream() fails with NotFound forever.
+    let mut b = repo
+        .find_branch(branch, git2::BranchType::Local)
+        .map_err(|e| ctx.classify_err(&e))?;
+    if b.upstream().is_err() {
+        b.set_upstream(Some(&format!("{}/{branch}", ctx.def.remote_name)))
+            .map_err(|e| ctx.classify_err(&e))?;
+        out.upstream_set = true;
+    }
+    Ok(())
+}
+
+/// Fill in how far the local branch is from its upstream.
+///
+/// Best-effort by design: a repo whose upstream has never been set is the
+/// normal state before the first push, and reporting (0, 0) for it beats
+/// failing an operation that otherwise succeeded.
+fn record_ahead_behind(repo: &git2::Repository, ctx: &OpCtx, out: &mut OpOutcome) {
+    let local = repo.head().ok().and_then(|h| h.target());
+    let upstream = repo
+        .find_branch(&ctx.def.branch, git2::BranchType::Local)
+        .ok()
+        .and_then(|b| b.upstream().ok())
+        .and_then(|u| u.get().target());
+    let (ahead, behind) = local
+        .zip(upstream)
+        .and_then(|(l, u)| repo.graph_ahead_behind(l, u).ok())
+        .unwrap_or_default();
+    out.ahead = ahead;
+    out.behind = behind;
+}
+
+/// A merge report for the four outcomes that write no merge commit.
+fn merge_report(kind: &'static str) -> MergeReport {
+    MergeReport {
+        kind,
+        merge_commit: None,
+        conflicts_resolved: Vec::new(),
+        recover_hint: None,
+    }
+}
+
+/// Run the merge and fold its result into the outcome.
+///
+/// The merge outranks the commit that preceded it when both happened: a merge
+/// is what a sync is *for*, and a caller reading `outcome == "merged"` still
+/// learns about the commit from `committed` / `commit`.
+fn apply_merge(repo: &git2::Repository, ctx: &OpCtx, out: &mut OpOutcome) -> Result<(), GitError> {
+    let report = match merge::analyse(repo, ctx)? {
+        MergeOutcome::UpToDate => merge_report("up_to_date"),
+        MergeOutcome::NoRemoteBranch => merge_report("no_remote_branch"),
+        MergeOutcome::AdoptedRemote { .. } => {
+            out.outcome = "fast_forward";
+            merge_report("adopted_remote")
+        }
+        MergeOutcome::FastForward { .. } => {
+            out.outcome = "fast_forward";
+            merge_report("fast_forward")
+        }
+        MergeOutcome::Merged(result) => {
+            out.outcome = if result.unrelated {
+                "merged_unrelated"
+            } else {
+                "merged"
+            };
+            // One path, because a hint has to be runnable as written. The merge
+            // commit's own message enumerates every path it overwrote.
+            let recover_hint = result
+                .conflicts_resolved
+                .first()
+                .map(|p| format!("git show {}^2:{p}", result.merge_commit));
+            MergeReport {
+                kind: if result.unrelated {
+                    "merge_commit_unrelated"
+                } else {
+                    "merge_commit"
+                },
+                merge_commit: Some(result.merge_commit.to_string()),
+                conflicts_resolved: result.conflicts_resolved,
+                recover_hint,
+            }
+        }
+    };
+    out.merge = Some(report);
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1630,23 +1959,6 @@ mod tests {
         // Draining clears the list, so a retry inside the same job does not
         // rediscover a rejection the previous attempt already reported.
         assert!(fx.ctx.take_push_rejections().is_ok());
-    }
-
-    /// Scaffolding. It proves `run`'s dispatch table is total and that each arm
-    /// reaches a verb of the same name; tasks 7 and 8 drop a line from the list
-    /// below as each verb lands, and the whole test with the last stub.
-    #[test]
-    fn run_dispatches_to_a_verb_of_the_same_name() {
-        let fx = plain();
-        for op in [JobOp::Pull, JobOp::Push, JobOp::Sync] {
-            let e = run(op, &fx.ctx).expect_err("no verb is implemented in this slice");
-            assert_eq!(e.code(), GitErrorCode::Internal);
-            assert!(
-                e.message.starts_with(op.as_str()),
-                "{op:?} reached the wrong verb: {}",
-                e.message
-            );
-        }
     }
 
     use std::path::Path;
@@ -2988,8 +3300,12 @@ mod tests {
         .expect("run reset");
         assert_eq!(out.outcome, "reset");
 
+        // Task 8 made `sync` real, so this arm no longer answers `internal`.
+        // The tree is checked out on `side` while this definition says `main`,
+        // and only `sync`'s own `require_branch` can produce that code — which
+        // is what proves the arm reaches the real verb rather than a stub.
         let err = run(JobOp::Sync, &fx.op(def, JobOp::Sync, OpRequest::default()))
-            .expect_err("sync arrives in the next task");
-        assert_eq!(err.code(), GitErrorCode::Internal);
+            .expect_err("HEAD is on side and the definition says main");
+        assert_eq!(err.code(), GitErrorCode::BranchMismatch);
     }
 }

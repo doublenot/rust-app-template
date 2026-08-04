@@ -17,6 +17,7 @@
 pub mod creds;
 pub mod error;
 pub mod jobs;
+pub mod merge;
 pub mod ops;
 pub mod registry;
 pub mod secret;
