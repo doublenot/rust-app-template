@@ -644,7 +644,7 @@ Two surfaces, **one vocabulary**: a synchronously-detectable problem becomes an 
 | `auth_unbound` | false | stored credential's `bound_host` ≠ the remote's host (§8.2) |
 | `host_key_mismatch` | false | `ErrorCode::Certificate` + `ErrorClass::Ssh` (TOFU pin) |
 | `certificate_invalid` | false | `ErrorCode::Certificate` + `ErrorClass::Ssl` |
-| `network_failed` | **true** | classes `Net`, `Http`, `Ssl`, `Zlib`, `Indexer` |
+| `network_failed` | **true** | classes `Net`, `Http`, `Ssl`, `Zlib`, `Indexer` — **and** class `Os` when the message begins `failed to connect to` (see the note under `io_failed`) |
 | `timeout` | **true** | our watchdog aborted a transfer, or libgit2's own connect/idle timeout |
 | `canceled` | — | abort flag observed (shutdown) |
 | `not_fast_forward` | **true** | `ErrorCode::NotFastForward` (client-side) **or** `push_update_reference` reporting non-ff |
@@ -661,7 +661,13 @@ Two surfaces, **one vocabulary**: a synchronously-detectable problem becomes an 
 | `merge_unresolvable` | false | conflicts survived resolution; `ErrorCode::{Unmerged,Conflict,MergeConflict}` |
 | `repo_locked` | **true** | `ErrorCode::Locked`; message names the lock file's absolute path |
 | `settings_invalid` | false | (never fatal today — surfaces as `result.settings_rejected`) |
-| `io_failed` | maybe | classes `Os`, `Filesystem`, `std::io::Error` |
+| `io_failed` | no | classes `Os`, `Filesystem`, `std::io::Error`, **except** a failed TCP connect |
+
+> **Amended during task 3 execution.** This partition assumed class `Os` means local errno. It does not: libgit2 reuses `GIT_ERROR_OS` for *socket* errors, so a refused or unreachable connect — the archetypal transient failure — landed in `io_failed`, the one code deliberately marked non-retryable. The inversion is what made it a bug rather than a preference: a DNS miss carries class `Net` and *is* retryable, so "I typo'd the hostname" was retryable while "the host is down" was not.
+>
+> Measured against the vendored libgit2 1.9.6 with real `RepoBuilder::clone` calls: `Connection refused` and `Network is unreachable` both give `code=GenericError class=Os`, while a DNS failure gives class `Net` and a connect *timeout* gives class `Net`. Grepping libgit2 for `"failed to connect` returns exactly three literals — the timeout (already class `Net`), `streams/socket.c` (every transport, unix) and `transports/winhttp.c` (Windows) — so the message prefix is a precise discriminator rather than a heuristic. `classify` gained one guarded arm, and `git::error::tests::libgit2_still_reports_a_refused_connect_the_way_the_os_arm_expects` pins the libgit2 behaviour the arm depends on, hermetically, over loopback.
+>
+> `io_failed` is now flatly **not** retryable rather than "maybe": with the connect case moved out, every remaining member is a local errno where retrying spins.
 | `internal` | false | fallback |
 
 ```rust

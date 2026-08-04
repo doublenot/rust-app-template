@@ -246,6 +246,21 @@ pub fn classify(e: &git2::Error, abort: AbortReason) -> GitErrorCode {
         (C::NotFound, K::Net) | (C::NotFound, K::Reference) => G::RemoteNotFound,
         (C::NotFound, K::Repository) => G::NoWorktree,
         (_, K::Net | K::Http | K::Ssl | K::Zlib | K::Indexer) => G::NetworkFailed,
+        // libgit2 reuses GIT_ERROR_OS for *socket* errors, so the class alone cannot
+        // separate "the server is down" from "EACCES on the working tree". Measured
+        // against the vendored libgit2 1.9.6: a failed TCP connect is the only
+        // network-origin GIT_ERROR_OS anywhere in the library — `streams/socket.c`
+        // (every transport, unix) and `transports/winhttp.c` (Windows) — and both
+        // spell it with this prefix; grepping the tree for `"failed to connect`
+        // returns exactly those two plus the timeout, which is already class Net.
+        //
+        // Without this arm the archetypal transient failure — server restarting,
+        // laptop offline, VPN down — reports `io_failed`, which is deliberately NOT
+        // retryable because that code was reasoned about as local errno. The
+        // inversion is what makes it a bug rather than a preference: a DNS miss
+        // carries class Net and *is* retryable, so "I typo'd the hostname" would be
+        // retryable while "the host is down" would not.
+        (_, K::Os) if e.message().starts_with("failed to connect to") => G::NetworkFailed,
         (_, K::Os | K::Filesystem) => G::IoFailed,
         _ => G::Internal,
     }
@@ -861,6 +876,67 @@ mod tests {
         // the operation did not fail *because* we aborted it.
         let e = err(C::Auth, K::Http);
         assert_eq!(classify(&e, AbortReason::Shutdown), G::AuthFailed);
+    }
+
+    #[test]
+    fn a_refused_connect_is_a_network_failure_not_a_disk_failure() {
+        let refused = git2::Error::new(
+            C::GenericError,
+            K::Os,
+            "failed to connect to 127.0.0.1: Connection refused",
+        );
+        assert_eq!(classify(&refused, AbortReason::None), G::NetworkFailed);
+        assert!(
+            G::NetworkFailed.retryable(),
+            "a server that is down may be up on the next attempt"
+        );
+        // A genuine local errno still lands on io_failed, which is deliberately not
+        // retryable — retrying EACCES or ENOSPC spins forever.
+        let eacces = git2::Error::new(
+            C::GenericError,
+            K::Os,
+            "failed to stat '/x/y': Permission denied",
+        );
+        assert_eq!(classify(&eacces, AbortReason::None), G::IoFailed);
+        assert!(!G::IoFailed.retryable());
+    }
+
+    /// The test above only proves the arm fires for a message *I* typed. This one
+    /// proves libgit2 1.9.6 really does produce that class and that prefix, which is
+    /// the assumption the arm rests on — if a future libgit2 reworded it or moved the
+    /// connect failure to `GIT_ERROR_NET`, the arm would quietly stop matching and
+    /// every outage would go back to reporting a non-retryable `io_failed`.
+    ///
+    /// Hermetic: binds a port, drops the listener, then connects to the now-closed
+    /// port over loopback. No external network and no DNS, so it is safe offline and
+    /// in a sandbox. `git://` is used deliberately — it goes through `streams/socket.c`
+    /// on every platform, avoiding WinHTTP and any configured HTTP proxy.
+    #[test]
+    fn libgit2_still_reports_a_refused_connect_the_way_the_os_arm_expects() {
+        let port = {
+            let l = std::net::TcpListener::bind("127.0.0.1:0").expect("bind loopback");
+            l.local_addr().expect("local addr").port()
+        };
+        let tmp = tempfile::tempdir().expect("tempdir");
+        // `Repository` has no `Debug`, so `expect_err` is unavailable here.
+        let e = match git2::build::RepoBuilder::new().clone(
+            &format!("git://127.0.0.1:{port}/x.git"),
+            &tmp.path().join("clone"),
+        ) {
+            Err(e) => e,
+            Ok(_) => panic!("a closed loopback port cannot be cloned from"),
+        };
+        assert_eq!(
+            (e.code(), e.class()),
+            (C::GenericError, K::Os),
+            "libgit2 changed how it reports a refused connect: {e:?}"
+        );
+        assert!(
+            e.message().starts_with("failed to connect to"),
+            "the `K::Os` guard in classify keys on this prefix: {:?}",
+            e.message()
+        );
+        assert_eq!(classify(&e, AbortReason::None), G::NetworkFailed);
     }
 
     #[test]

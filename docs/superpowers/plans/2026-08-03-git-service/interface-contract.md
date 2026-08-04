@@ -311,7 +311,7 @@ pub enum GitErrorCode {
 | `MergePathTypeConflict` | `merge_path_type_conflict` | 409 | false |
 | `MergeUnresolvable` | `merge_unresolvable` | 409 | false |
 | `RepoLocked` | `repo_locked` | 409 | **true** |
-| `IoFailed` | `io_failed` | 500 | false |
+| `IoFailed` | `io_failed` | 500 | false | *(a failed TCP connect is class `Os` but maps to `NetworkFailed` — see the amendment in spec §5.6)* |
 | `Internal` | `internal` | 500 | false |
 
 **[CONTRACT DECISION]** `IoFailed.retryable() == false` (§5.6 says "maybe"; a caller that blindly
