@@ -23,6 +23,35 @@ pub mod secret;
 pub mod state;
 pub mod util;
 
+/// How long libgit2 may spend establishing a connection before giving up.
+///
+/// Deliberately not a config key: it is a liveness floor, not a policy, and a caller who
+/// wants to wait longer for a slow server wants `[git].network_timeout_secs`.
+pub const CONNECT_TIMEOUT_MS: i32 = 10_000;
+
+/// Install the process-global libgit2 network timeouts. Call once, from
+/// `GitService::start`, before any repository is opened.
+///
+/// Without these, a black-holed remote pins a `spawn_blocking` thread indefinitely: the
+/// job watchdog lives inside the transfer callbacks, which never fire before the
+/// transport has data. Both libgit2 options default to 0, meaning "the OS default".
+pub fn init_libgit2_timeouts(network_timeout_secs: u64) -> Result<(), crate::git::error::GitError> {
+    let total = i32::try_from(network_timeout_secs.saturating_mul(1000)).unwrap_or(i32::MAX);
+    // SAFETY: both setters mutate libgit2 process-global state and are documented as
+    // needing external synchronisation. The single caller runs once, on the main thread,
+    // during startup and before any repository has been opened, so no other thread can
+    // be inside libgit2 at this point.
+    unsafe {
+        git2::opts::set_server_connect_timeout_in_milliseconds(CONNECT_TIMEOUT_MS).map_err(
+            |e| crate::git::error::GitError::internal(format!("libgit2 connect timeout: {e}")),
+        )?;
+        git2::opts::set_server_timeout_in_milliseconds(total).map_err(|e| {
+            crate::git::error::GitError::internal(format!("libgit2 server timeout: {e}"))
+        })?;
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     /// Guards the `git2` feature list in `Cargo.toml`, not git2 itself.
@@ -135,5 +164,26 @@ mod tests {
             v.threads(),
             "libgit2 must be thread-aware; git work runs on tokio's blocking pool: {v:?}"
         );
+    }
+
+    /// Without these, a black-holed remote pins a `spawn_blocking` thread indefinitely:
+    /// our own watchdog lives inside the transfer callbacks, and those never fire before
+    /// the transport has produced data. Both libgit2 options default to 0, meaning
+    /// "whatever the OS decides", which on Linux is around two hours.
+    #[test]
+    fn network_timeouts_are_installed_from_the_configured_value() {
+        super::init_libgit2_timeouts(45).expect("libgit2 accepts both timeouts");
+        // SAFETY: reads libgit2 process-global state. Nothing else in this test binary
+        // writes it, and `init_libgit2_timeouts` has already returned.
+        unsafe {
+            assert_eq!(
+                git2::opts::get_server_connect_timeout_in_milliseconds().expect("connect"),
+                super::CONNECT_TIMEOUT_MS
+            );
+            assert_eq!(
+                git2::opts::get_server_timeout_in_milliseconds().expect("server"),
+                45_000
+            );
+        }
     }
 }
