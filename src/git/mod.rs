@@ -17,6 +17,86 @@ mod tests {
     /// the shipped .deb/.dmg/.msi depends on a system library the user does not have.
     /// libgit2 reports all four capabilities at runtime, so one assertion converts both
     /// silent regressions into a red test.
+    /// Ties `config::validate_branch_name` to the library that actually enforces the
+    /// rule, in the one direction that matters: **everything we accept, libgit2 must
+    /// accept.** The reverse is deliberately false — we reject a leading `-`, `@`, `~`
+    /// and friends that libgit2 is happy with, because they are argv and shell hazards.
+    ///
+    /// This exists because the validator is the single admission gate for
+    /// `[git].default_branch`, `repos[].branch` and `POST /api/git/repos/<id>/branch`.
+    /// A name that slips through is not caught anywhere else: it reaches libgit2 deep
+    /// inside a job, where it surfaces as a generic ref error instead of the
+    /// admission-time rejection the API contract promises. An earlier revision checked
+    /// `.lock` against the whole name rather than each path component, so `a.lock/b`,
+    /// `a/.b` and `x/.` all passed — this test is what would have caught it.
+    ///
+    /// `is_valid_name` wants a full refname; branches live under `refs/heads/`.
+    #[test]
+    fn validate_branch_name_never_admits_a_name_libgit2_refuses() {
+        // Shapes chosen to probe each rule and its boundary, not to be exhaustive:
+        // component dots, `.lock` in every position, separators, and the length limit.
+        let corpus = [
+            "main",
+            "a",
+            "feature/x",
+            "v1.2.3",
+            "a-b_c",
+            "release/2026.08",
+            "a.b.c",
+            "refs/heads/x",
+            "x.locked",
+            "lock",
+            ".",
+            "..",
+            "...",
+            ".x",
+            "a.",
+            "x.lock",
+            "x.lock.",
+            "a/.b",
+            "x/.",
+            "a.lock/b",
+            "a/b.lock/c",
+            "a..b",
+            "a//b",
+            "-x",
+            "/x",
+            "x/",
+            "@",
+            "a b",
+            "a~b",
+            "héllo",
+            "a\tb",
+            "",
+        ];
+        for name in corpus {
+            if crate::config::validate_branch_name(name) {
+                assert!(
+                    git2::Reference::is_valid_name(&format!("refs/heads/{name}")),
+                    "validate_branch_name accepted {name:?}, which libgit2 refuses as a refname"
+                );
+            }
+        }
+        // Guard the guard: a corpus that no longer reaches the interesting branch
+        // would make the loop above vacuously true.
+        assert!(
+            corpus.iter().filter(|n| validate(n)).count() >= 8,
+            "corpus no longer exercises the accept path"
+        );
+        assert!(
+            corpus.iter().filter(|n| !validate(n)).count() >= 8,
+            "corpus no longer exercises the reject path"
+        );
+        assert!(
+            validate(&"a".repeat(200)) && !validate(&"a".repeat(201)),
+            "MAX_BRANCH_NAME_LEN boundary moved"
+        );
+    }
+
+    fn validate(name: &str) -> bool {
+        crate::config::validate_branch_name(name)
+    }
+
     #[test]
     fn libgit2_is_vendored_with_network_transports() {
         let v = git2::Version::get();

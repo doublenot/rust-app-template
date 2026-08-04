@@ -1107,17 +1107,37 @@ pub fn validate_branch_name(name: &str) -> bool;
 ```
 `validate_branch_name` rules (single source of truth for `[git].default_branch`,
 `repos[].branch`, and `POST /branch`): non-empty; `<= MAX_BRANCH_NAME_LEN` bytes; every char in
-`[A-Za-z0-9._/-]`; no `..`; no leading `-` or `/`; no trailing `/`; does not end in `.lock`; no `//`;
-not exactly `@`; no ASCII control chars.
+`[A-Za-z0-9._/-]`; no `..`; no leading `-` or `/`; no trailing `/`; no `//`; not exactly `@`; no
+ASCII control chars; and **per path component** — no component may begin with `.`, end with `.`,
+or end with `.lock`.
+
+> **Amended during task 2 execution.** The rule list previously said only "does not end in
+> `.lock`", i.e. it tested the *whole name*. Measured against this repo's own libgit2 1.9.6:
+> `git2::Reference::is_valid_name` refuses `.`, `.x`, `a.`, `x.lock.`, `a/.b`, `x/.`, `a.lock/b`
+> and `a/b.lock/c`, every one of which the old list admitted. Because this function is the only
+> admission gate for all three entry points, an admitted name failed *later*, inside a job, as a
+> generic libgit2 ref error rather than the admission-time `invalid_request` the API promises.
+> The one-directional invariant — everything we accept, libgit2 accepts — is now machine-checked
+> by `git::tests::validate_branch_name_never_admits_a_name_libgit2_refuses`. The reverse stays
+> deliberately false: we reject a leading `-`, `@` and `~` that libgit2 allows.
 
 `AppConfig::validate` gains a `[git]` arm producing these exact strings:
 | rule | string |
 |---|---|
 | bad `default_branch` | `git.default_branch "{v}" is not a valid branch name` |
 | `author_name` has `<`, `>`, `\n` | `git.author_name must not contain '<', '>' or newlines (git signatures cannot represent them)` |
+| `author_name` non-empty but blank, or bearing an ASCII control char | `git.author_name must not be blank or contain control characters (git signatures cannot represent them)` |
 | bad `author_email` | `git.author_email "{v}" must look like a plain address, e.g. app@example.com` |
 | `network_timeout_secs` ∉ `5..=3600` | `git.network_timeout_secs must be between 5 and 3600 (got {v})` |
 | `quit_sync_timeout_secs > 120` | `git.quit_sync_timeout_secs must be 120 or less (0 disables sync_on_quit)` |
+
+The `author_email` rule is: non-empty ⇒ exactly the shape `<non-empty>@<non-empty>`, no `<`/`>`,
+no whitespace, no ASCII control characters. **Amended during task 2 execution** — the old rule was
+a bare `contains('@')`, which admitted `@`, `@e.com`, `a@` and `a\0@e.com`. Measured:
+`Signature::now("App", "@")` returns `Ok("App <@>")`, a commit ident attributable to nobody, and an
+embedded NUL fails with `data contained a nul byte`. `author_name = " "` was likewise admitted and
+fails `Signature::now` with `Signature cannot have an empty name or email` — note `""` is *not*
+affected, it remains the documented sentinel meaning "fall back to `[app].name`".
 
 ### 5.2 `git/secret.rs` — task 3
 See §4.2. No free functions.

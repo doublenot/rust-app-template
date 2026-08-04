@@ -195,11 +195,14 @@ pub enum SshHostKeyPolicy { #[default] Tofu, Accept }
 |---|---|
 | `default_branch` is a valid branch name (see below) | `git.default_branch "…" is not a valid branch name` |
 | `author_name` has no `<`, `>`, `\n` | `git.author_name must not contain '<', '>' or newlines (git signatures cannot represent them)` |
-| `author_email`, if non-empty, contains `@` and none of `<`, `>`, whitespace | `git.author_email "…" must look like a plain address, e.g. app@example.com` |
+| `author_name`, if non-empty, is not blank and has no ASCII control chars | `git.author_name must not be blank or contain control characters (git signatures cannot represent them)` |
+| `author_email`, if non-empty, matches `<non-empty>@<non-empty>` with none of `<`, `>`, whitespace, ASCII control | `git.author_email "…" must look like a plain address, e.g. app@example.com` |
 | `network_timeout_secs` ∈ `5..=3600` | `git.network_timeout_secs must be between 5 and 3600 (got 0)` |
 | `quit_sync_timeout_secs` ≤ `120` | `git.quit_sync_timeout_secs must be 120 or less (0 disables sync_on_quit)` |
 
-`validate_branch_name(s)` — shared with `repos.json` and `POST /branch`: non-empty, ≤ 200 bytes, every char in `[A-Za-z0-9._/-]`, no `..`, no leading `-` or `/`, no trailing `/` or `.lock`, no `//`, not `@`, no ASCII control.
+`validate_branch_name(s)` — shared with `repos.json` and `POST /branch`: non-empty, ≤ 200 bytes, every char in `[A-Za-z0-9._/-]`, no `..`, no leading `-` or `/`, no trailing `/`, no `//`, not `@`, no ASCII control, and **per path component** no component beginning with `.`, ending with `.`, or ending with `.lock`.
+
+> Amended during task 2 execution. The per-component dot rules replace a whole-name `.lock` check that admitted eight shapes libgit2 refuses (`.`, `.x`, `a.`, `x.lock.`, `a/.b`, `x/.`, `a.lock/b`, `a/b.lock/c`) — measured against the vendored libgit2 1.9.6 via `git2::Reference::is_valid_name`. Since this is the sole admission gate, each one turned an admission-time rejection into a generic ref error deep inside a job. Now machine-checked by `git::tests::validate_branch_name_never_admits_a_name_libgit2_refuses`.
 
 Validation runs whether or not the section is later used, so enabling a repo never surfaces a new config error at an awkward moment.
 

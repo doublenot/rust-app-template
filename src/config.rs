@@ -135,6 +135,11 @@ pub enum FieldType {
 // The section is parsed and validated here regardless of whether anything reads
 // it, so that turning a git feature on later can never surface a *new* config
 // error at an awkward moment.
+//
+// `allow`, not `expect`: the tests below read every field, so under `cfg(test)`
+// dead_code never fires and an `expect` would be reported as unfulfilled. Placing it
+// on the struct also keeps `AppConfig.git` alive — rustc's dead-code pass treats the
+// item as live, so `git_enabled`'s read of `self.git` counts.
 #[allow(dead_code)]
 pub struct GitSection {
     #[serde(default)]
@@ -191,10 +196,20 @@ pub const MAX_BRANCH_NAME_LEN: usize = 200;
 /// `[git].default_branch`, `repos[].branch` in `repos.json`, and the body of
 /// `POST /api/git/repos/<id>/branch`.
 ///
-/// Deliberately stricter than git's own `check_ref_format`, and a whitelist rather
-/// than a blacklist: `[A-Za-z0-9._/-]` already excludes ASCII control characters,
-/// whitespace, `@`, `~`, `^`, `:`, `?`, `*`, `[`, `\` and every shell metacharacter,
-/// so a future git relaxing its own rules cannot widen ours by accident.
+/// A whitelist rather than a blacklist: `[A-Za-z0-9._/-]` already excludes ASCII
+/// control characters, whitespace, `@`, `~`, `^`, `:`, `?`, `*`, `[`, `\` and every
+/// shell metacharacter, so a future git relaxing its own rules cannot widen ours by
+/// accident. It is additionally stricter than libgit2 on a leading `-` (an argv
+/// hazard), which libgit2 itself allows.
+///
+/// The invariant that matters is one-directional and machine-checked by
+/// `git::tests::validate_branch_name_never_admits_a_name_libgit2_refuses`: every name
+/// this accepts must be a name libgit2 accepts. The reverse is deliberately false.
+///
+/// The dot rules are **per path component**, not per name. libgit2 refuses a component
+/// that begins with `.`, ends with `.`, or ends with `.lock`, so `a/.b`, `x/.` and
+/// `a.lock/b` are all invalid refs even though the name as a whole neither begins with
+/// a dot nor ends in `.lock`. Checking only the whole string let all three through.
 pub fn validate_branch_name(name: &str) -> bool {
     if name.is_empty() || name.len() > MAX_BRANCH_NAME_LEN {
         return false;
@@ -211,7 +226,8 @@ pub fn validate_branch_name(name: &str) -> bool {
     if name.starts_with('-') || name.starts_with('/') || name.ends_with('/') {
         return false;
     }
-    !name.ends_with(".lock")
+    name.split('/')
+        .all(|part| !part.starts_with('.') && !part.ends_with('.') && !part.ends_with(".lock"))
 }
 
 impl AppConfig {
@@ -229,8 +245,13 @@ impl AppConfig {
         self.menu.settings && self.settings.is_some()
     }
 
-    // Called by the git service constructor and by `supervisor::build_env`, neither
-    // of which exists yet.
+    // Read by `host::App::start_children`, which does not exist yet. (Not by
+    // `GitService::new`, which destructures `cfg.git` directly, and not by
+    // `supervisor::build_env`, which receives a pre-computed bool.)
+    //
+    // `allow`, not the `expect` used for `main::notice`: the tests below call this,
+    // so dead_code does not fire under `cfg(test)` and `expect` would be unfulfilled.
+    // Task 10 deletes the attribute when it adds the real caller.
     #[allow(dead_code)]
     pub fn git_enabled(&self) -> bool {
         self.git.is_some()
@@ -337,10 +358,37 @@ impl AppConfig {
                         .into(),
                 );
             }
+            // `""` is the documented sentinel for "fall back to [app].name". A name
+            // that is merely *blank* is not the sentinel, so task 9 hands it straight
+            // to `git2::Signature::now`, which refuses it — measured: `" "` yields
+            // "Signature cannot have an empty name or email", and an embedded NUL
+            // yields "data contained a nul byte". Catching both here turns a one-space
+            // typo in app.toml into a startup config error instead of a libgit2 error
+            // on every commit, sync and merge for the life of the install.
+            if !git.author_name.is_empty()
+                && (git.author_name.trim().is_empty()
+                    || git.author_name.chars().any(char::is_control))
+            {
+                return Err(
+                    "git.author_name must not be blank or contain control characters (git \
+                     signatures cannot represent them)"
+                        .into(),
+                );
+            }
+            // Same reasoning, plus: a bare "@" passes a naive `contains('@')` and
+            // produces the signature `App <@>` — syntactically valid, attributable to
+            // nobody. Require a non-empty local part and domain.
+            let email_shaped = match git.author_email.split_once('@') {
+                Some((local, domain)) => !local.is_empty() && !domain.is_empty(),
+                None => false,
+            };
             if !git.author_email.is_empty()
-                && (!git.author_email.contains('@')
+                && (!email_shaped
                     || git.author_email.contains(['<', '>'])
-                    || git.author_email.chars().any(char::is_whitespace))
+                    || git
+                        .author_email
+                        .chars()
+                        .any(|c| c.is_whitespace() || c.is_control()))
             {
                 return Err(format!(
                     "git.author_email {:?} must look like a plain address, e.g. app@example.com",
@@ -376,6 +424,9 @@ pub struct RuntimePaths {
     // section leaves no git files on disk at all. The mkdir for `repos_dir`
     // belongs to `GitService::start`, and that placement is the entire reason
     // the "nothing on disk when git is off" guarantee holds.
+    //
+    // `allow`, not `expect`: `runtime_paths_layout` reads all three, so dead_code does
+    // not fire under `cfg(test)`. Task 9 deletes the attributes when it adds readers.
     #[allow(dead_code)]
     pub repos_dir: PathBuf,
     #[allow(dead_code)]
@@ -606,7 +657,29 @@ mod tests {
             assert!(validate_branch_name(good), "rejected {good:?}");
         }
         for bad in [
-            "", "-x", "/x", "x/", "a..b", "a//b", "@", "x.lock", "a b", "a~b", "héllo", "a\tb",
+            "",
+            "-x",
+            "/x",
+            "x/",
+            "a..b",
+            "a//b",
+            "@",
+            "x.lock",
+            "a b",
+            "a~b",
+            "héllo",
+            "a\tb",
+            // Per-component dot rules. Every one of these is refused by libgit2
+            // 1.9.6 (measured); the whole-name `.lock` check alone let the last
+            // four through.
+            ".",
+            ".x",
+            "a.",
+            "x.lock.",
+            "a/.b",
+            "x/.",
+            "a.lock/b",
+            "a/b.lock/c",
         ] {
             assert!(!validate_branch_name(bad), "accepted {bad:?}");
         }
@@ -631,7 +704,33 @@ mod tests {
             "git.author_name must not contain '<', '>' or newlines (git signatures cannot \
              represent them)"
         );
-        for bad in ["nobody", "a b@c.d", "<a@b.c>"] {
+        // Blank and control-bearing names are NOT the "" sentinel: measured against
+        // libgit2 1.9.6, each one makes `Signature::now` fail outright. These are
+        // TOML escapes (`\u0000`, four hex digits) — not Rust's `\u{0}`.
+        for bad in [" ", "  ", r"\t", r"App\u0000"] {
+            let s = format!("{}[git]\nauthor_name = \"{bad}\"\n", minimal());
+            assert_eq!(
+                AppConfig::from_str(&s).unwrap_err(),
+                "git.author_name must not be blank or contain control characters (git \
+                 signatures cannot represent them)",
+                "accepted author_name {bad:?}"
+            );
+        }
+        // A NUL in the address fails `Signature::now` with "data contained a nul
+        // byte". Asserted separately because the message quotes the *parsed* value,
+        // whose Debug form is `"a\u{0}@e.com"`, not the TOML source spelling.
+        let nul_email = "a\u{0}@e.com";
+        let s = format!("{}[git]\nauthor_email = \"a\\u0000@e.com\"\n", minimal());
+        assert_eq!(
+            AppConfig::from_str(&s).unwrap_err(),
+            // Built with the same `{:?}` the validator uses. Spelling it out by hand
+            // would pin a rustc detail: Debug for NUL renders `\0` today and `\u{0}`
+            // in older toolchains.
+            format!("git.author_email {nul_email:?} must look like a plain address, e.g. app@example.com")
+        );
+        // "@" alone yields the signature `App <@>` — valid to libgit2, attributable
+        // to nobody; a missing local part or domain is the same defect.
+        for bad in ["nobody", "a b@c.d", "<a@b.c>", "@", "@e.com", "a@"] {
             let s = format!("{}[git]\nauthor_email = \"{bad}\"\n", minimal());
             assert_eq!(
                 AppConfig::from_str(&s).unwrap_err(),
@@ -694,17 +793,42 @@ mod tests {
             "app.toml has no commented-out [git] block"
         );
         // `[git]` plus one line per GitSection field. Every shipped value is its own
-        // serde default, so the assertions below would still pass if the block lost
-        // keys — a field added to GitSection but never documented would slip through.
-        // Pinning the count is what makes this test bidirectional.
+        // serde default, so a block that *lost* keys would deserialize into a
+        // GitSection indistinguishable from a complete one and every assertion below
+        // would still pass. The count is what catches that direction.
         assert_eq!(out.lines().count(), 12, "expected [git] + 11 keys:\n{out}");
         let s = format!("{}{out}", minimal());
         let c = AppConfig::from_str(&s).unwrap_or_else(|e| panic!("{e}\n--- built from ---\n{s}"));
-        let g = c.git.unwrap();
-        assert!(g.registry_writes);
-        assert_eq!(g.default_branch, "main");
-        assert_eq!(g.network_timeout_secs, 120);
-        assert_eq!(g.quit_sync_timeout_secs, 10);
-        assert_eq!(g.ssh_host_key_policy, SshHostKeyPolicy::Tofu);
+        // Exhaustive destructuring is the other direction, and it is a *compile*
+        // error: add a field to GitSection and this stops building (E0027) until
+        // someone names it here and documents it in app.toml. A hardcoded count
+        // alone cannot do that — 11 documented keys still equal 11 when the struct
+        // grows a twelfth field.
+        let GitSection {
+            tray_sync,
+            error_dialogs,
+            status_api,
+            registry_writes,
+            default_branch,
+            author_name,
+            author_email,
+            network_timeout_secs,
+            quit_sync_timeout_secs,
+            allow_http,
+            ssh_host_key_policy,
+        } = c.git.unwrap();
+        // Every shipped value must equal the real default. `allow_http` matters most:
+        // its comment is the operator's only statement of the secure default.
+        assert!(!tray_sync);
+        assert!(!error_dialogs);
+        assert!(!status_api);
+        assert!(registry_writes);
+        assert_eq!(default_branch, "main");
+        assert_eq!(author_name, "");
+        assert_eq!(author_email, "");
+        assert_eq!(network_timeout_secs, 120);
+        assert_eq!(quit_sync_timeout_secs, 10);
+        assert!(!allow_http);
+        assert_eq!(ssh_host_key_policy, SshHostKeyPolicy::Tofu);
     }
 }
