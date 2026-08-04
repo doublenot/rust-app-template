@@ -23,6 +23,7 @@ use crate::git::error::{self, AbortReason, GitError, GitErrorCode};
 use crate::git::jobs::{AbortFlag, JobOp, JobSlot, Phase, Progress};
 use crate::git::merge::{self, MergeOutcome};
 use crate::git::registry::{AuthorSpec, CredentialSpec, RepoDef, Warning};
+use crate::settings;
 
 /// Who the host says it is when it writes a commit nobody typed.
 #[derive(Debug, Clone)]
@@ -1550,11 +1551,158 @@ fn apply_merge(repo: &git2::Repository, ctx: &OpCtx, out: &mut OpOutcome) -> Res
     Ok(())
 }
 
+/// The work-tree copy of `settings.json` for a repo that mirrors settings.
+///
+/// `settings_path` is registry-validated as relative, `/`-separated and free of
+/// `..`, and `Path::join` treats `/` as a separator on Windows too, so no
+/// per-platform splitting is needed here.
+fn settings_tree_path(ctx: &OpCtx) -> PathBuf {
+    ctx.tree.join(&ctx.def.settings_path)
+}
+
+/// A change detector, not a checksum.
+///
+/// Both hashes are produced by the same process inside one job and neither is
+/// ever persisted or transmitted, so a fast non-cryptographic 64-bit hash is
+/// exactly the right tool: the question is only "did these bytes move while we
+/// were fetching and merging".
+fn hash_bytes(bytes: &[u8]) -> u64 {
+    use std::hash::{DefaultHasher, Hasher};
+    let mut hasher = DefaultHasher::new();
+    hasher.write(bytes);
+    hasher.finish()
+}
+
+/// The single delegation point to the one writer of any `settings.json`.
+///
+/// Routing the tree copy through `settings::save` too — rather than copying the
+/// host file byte-for-byte — is what normalizes key order and whitespace, so two
+/// hosts that agree on the values produce identical bytes and never fight over
+/// formatting.
+fn write_settings(
+    path: &std::path::Path,
+    values: &serde_json::Map<String, serde_json::Value>,
+) -> Result<(), GitError> {
+    settings::save(path, values).map_err(|e| GitError::io(format!("write {}: {e}", path.display())))
+}
+
+/// Materialize the host's `settings.json` and copy it into the work tree.
+///
+/// Returns the hash of the bytes now in the tree, or `None` when this repo does
+/// not mirror settings. Prefer-local applies to settings exactly as it does to
+/// every other file: this machine's `settings.json` is what gets published, and
+/// the merge decides the rest.
+pub fn settings_copy_in(ctx: &OpCtx) -> Result<Option<u64>, GitError> {
+    if !ctx.def.sync_settings {
+        return Ok(None);
+    }
+    // `sync_settings` with no schema is a registry-validation error, so this is
+    // reachable only if `[settings]` was removed from app.toml under a live
+    // repos.json. Failing loudly beats a data-sync feature that quietly stops.
+    let Some(sc) = ctx.settings.as_ref() else {
+        return Err(GitError::settings_sync_unavailable().with_repo(&ctx.def.id));
+    };
+
+    // `load` is total: an absent file, junk, an unknown key or a wrong-typed
+    // value all collapse to the schema's defaults, which is precisely what
+    // "materialize it from the defaults first" means.
+    let values = settings::load(&sc.schema, &sc.settings_file);
+    if !sc.settings_file.exists() {
+        write_settings(&sc.settings_file, &values)?;
+    }
+
+    let target = settings_tree_path(ctx);
+    write_settings(&target, &values)?;
+    let bytes = std::fs::read(&target)
+        .map_err(|e| GitError::io(format!("read {}: {e}", target.display())))?;
+    Ok(Some(hash_bytes(&bytes)))
+}
+
+/// Validate the work tree's `settings.json` after the merge and adopt it.
+///
+/// Never fails the job over bad *content*: a teammate's typo must not wedge an
+/// entire repo's sync forever. A rejected file is reported as a warning on an
+/// otherwise successful job and the host's own valid copy is written back into
+/// the tree, so the next sync commits it and the next push heals the remote.
+pub fn settings_apply_back(
+    ctx: &OpCtx,
+    before_hash: Option<u64>,
+    out: &mut OpOutcome,
+) -> Result<(), GitError> {
+    // `None` means `settings_copy_in` did nothing: this repo does not mirror
+    // settings and there is no copy of ours to compare against.
+    let (Some(before), Some(sc)) = (before_hash, ctx.settings.as_ref()) else {
+        return Ok(());
+    };
+
+    let target = settings_tree_path(ctx);
+    let Ok(after) = std::fs::read(&target) else {
+        // The copy above was committed before the fetch and the merge prefers
+        // local, so the file cannot normally vanish. If it somehow did, heal it
+        // rather than fail: the tree copy is the disposable one.
+        return heal_tree_copy(ctx, sc);
+    };
+    if hash_bytes(&after) == before {
+        return Ok(());
+    }
+
+    let validated = serde_json::from_slice::<serde_json::Value>(&after)
+        .map_err(|e| e.to_string())
+        .and_then(|incoming| settings::validate_incoming(&sc.schema, &incoming));
+
+    let rejected = match validated {
+        Ok(values) => {
+            // Read before the write, because this comparison is the only thing
+            // standing between an auto-sync and a Chrome restart every five
+            // minutes: the file changing is not enough, the values must differ.
+            let current = settings::load(&sc.schema, &sc.settings_file);
+            // §14 risk 11, accepted rather than fixed: the settings page can
+            // POST /api/settings while this write is in flight, and whichever
+            // `settings::save` lands second wins the whole file. It is a
+            // last-writer-wins race over one small document, not a corruption
+            // risk — `save` writes the complete map in one call, so no reader
+            // can ever observe a half-written file. Locking it would mean a
+            // cross-process lock between the host and its own HTTP handler for
+            // a collision that needs a settings edit inside the same second as
+            // a sync; the worst case is one lost update, which the next save or
+            // sync republishes. Do NOT "fix" this by skipping the write when
+            // the file changed underneath: that would silently drop the
+            // remote's values instead, which is the strictly worse loss.
+            write_settings(&sc.settings_file, &values)?;
+            out.settings_synced = true;
+            out.settings_changed = values != current;
+            return Ok(());
+        }
+        Err(e) => e,
+    };
+
+    let message = format!(
+        "{} was rejected and the local settings were left unchanged: {rejected}",
+        ctx.def.settings_path
+    );
+    out.settings_rejected = Some(SettingsRejected { error: rejected });
+    out.warnings.push(Warning {
+        code: "settings_rejected",
+        message,
+    });
+    heal_tree_copy(ctx, sc)
+}
+
+/// Write the host's own valid settings back over the tree copy.
+///
+/// The next sync stages and commits it, and that push is what heals the remote
+/// for everyone else.
+fn heal_tree_copy(ctx: &OpCtx, sc: &SettingsCtx) -> Result<(), GitError> {
+    let values = settings::load(&sc.schema, &sc.settings_file);
+    write_settings(&settings_tree_path(ctx), &values)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::config::SshHostKeyPolicy;
     use crate::git::jobs::{Admission, JobStore, RepoLease};
+    use crate::git::merge::testkit;
     use std::time::Duration;
 
     fn def(json: &str) -> RepoDef {
@@ -3307,5 +3455,239 @@ mod tests {
         let err = run(JobOp::Sync, &fx.op(def, JobOp::Sync, OpRequest::default()))
             .expect_err("HEAD is on side and the definition says main");
         assert_eq!(err.code(), GitErrorCode::BranchMismatch);
+    }
+
+    /// Two fields is the smallest schema that can prove both "an omitted key
+    /// falls back to its default" and "a bad value is rejected".
+    fn settings_schema() -> crate::config::SettingsSection {
+        crate::config::AppConfig::from_str(
+            "[app]\nname = \"X\"\nidentifier = \"com.example.x\"\n\
+             [menu]\nsettings = true\n\
+             [[settings.fields]]\n\
+             key = \"theme\"\nlabel = \"Theme\"\ntype = \"select\"\n\
+             default = \"light\"\noptions = [\"light\", \"dark\"]\n\
+             [[settings.fields]]\n\
+             key = \"notify\"\nlabel = \"Notifications\"\ntype = \"boolean\"\n\
+             default = true\n",
+        )
+        .expect("the fixture config must parse")
+        .settings
+        .expect("the fixture config declares a settings section")
+    }
+
+    /// A `sync_settings` repo whose work tree is not a git repository at all.
+    ///
+    /// Neither settings helper ever opens one: they move bytes between the
+    /// host's `settings.json` and the tree copy, and driving them directly is
+    /// what keeps these assertions about the *files* and nothing else. The
+    /// host's settings file lives outside the tree, as it does in production
+    /// (`<data-dir>/settings.json`).
+    struct SettingsFx {
+        _dir: tempfile::TempDir,
+        tree: PathBuf,
+        host_settings: PathBuf,
+        job: testkit::Job,
+    }
+
+    fn settings_fx() -> SettingsFx {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let tree = dir.path().join("tree");
+        std::fs::create_dir_all(&tree).expect("create the work tree dir");
+        let host_settings = dir.path().join("data/settings.json");
+        let mut job = testkit::job_local(&tree, JobOp::Sync);
+        job.ctx.def.sync_settings = true;
+        job.ctx.settings = Some(SettingsCtx {
+            schema: settings_schema(),
+            settings_file: host_settings.clone(),
+        });
+        SettingsFx {
+            _dir: dir,
+            tree,
+            host_settings,
+            job,
+        }
+    }
+
+    #[test]
+    fn settings_copy_in_materializes_the_host_file_and_copies_it_in() {
+        let fx = settings_fx();
+        assert!(
+            !fx.host_settings.exists(),
+            "the fixture must start with no host settings.json"
+        );
+
+        let hash = settings_copy_in(&fx.job.ctx).expect("copy in");
+
+        assert!(hash.is_some(), "a sync_settings repo must report a hash");
+        assert!(
+            fx.host_settings.exists(),
+            "a first sync must materialize the host's settings.json from the schema"
+        );
+        assert_eq!(
+            std::fs::read(fx.tree.join("settings.json")).expect("read the tree copy"),
+            std::fs::read(&fx.host_settings).expect("read the host copy"),
+            "the tree copy must be byte-identical to the host copy"
+        );
+        let values = crate::settings::load(&settings_schema(), &fx.host_settings);
+        assert_eq!(values["theme"], serde_json::json!("light"));
+        assert_eq!(values["notify"], serde_json::json!(true));
+    }
+
+    #[test]
+    fn settings_copy_in_is_a_no_op_without_sync_settings() {
+        let mut fx = settings_fx();
+        fx.job.ctx.def.sync_settings = false;
+
+        assert_eq!(settings_copy_in(&fx.job.ctx).expect("copy in"), None);
+        assert!(
+            !fx.tree.join("settings.json").exists(),
+            "a repo that did not opt in must never gain a settings.json"
+        );
+        assert!(!fx.host_settings.exists());
+    }
+
+    #[test]
+    fn sync_settings_without_a_schema_is_settings_sync_unavailable() {
+        // The registry rejects this combination, so it is reachable only when
+        // [settings] was deleted from app.toml under a live repos.json. A
+        // silently no-op data-sync feature is how people lose data.
+        let mut fx = settings_fx();
+        fx.job.ctx.settings = None;
+
+        let e = settings_copy_in(&fx.job.ctx).expect_err("a schemaless mirror must not be silent");
+        assert_eq!(e.code(), GitErrorCode::SettingsSyncUnavailable);
+    }
+
+    #[test]
+    fn unchanged_tree_settings_are_not_reapplied() {
+        let fx = settings_fx();
+        let before = settings_copy_in(&fx.job.ctx).expect("copy in");
+        let host_bytes = std::fs::read(&fx.host_settings).expect("read the host copy");
+
+        let mut out = OpOutcome::new("up_to_date", "main");
+        settings_apply_back(&fx.job.ctx, before, &mut out).expect("apply back");
+
+        assert!(!out.settings_synced);
+        assert!(
+            !out.settings_changed,
+            "an untouched file must never restart children"
+        );
+        assert!(out.settings_rejected.is_none());
+        assert!(out.warnings.is_empty());
+        assert_eq!(
+            std::fs::read(&fx.host_settings).expect("read the host copy"),
+            host_bytes
+        );
+    }
+
+    #[test]
+    fn valid_pulled_settings_are_saved_and_flag_a_restart() {
+        let fx = settings_fx();
+        let before = settings_copy_in(&fx.job.ctx).expect("copy in");
+        std::fs::write(fx.tree.join("settings.json"), r#"{"theme":"dark"}"#)
+            .expect("write the tree copy");
+
+        let mut out = OpOutcome::new("merged", "main");
+        settings_apply_back(&fx.job.ctx, before, &mut out).expect("apply back");
+
+        assert!(out.settings_synced);
+        assert!(
+            out.settings_changed,
+            "a changed value is what earns a restart"
+        );
+        assert!(out.settings_rejected.is_none());
+        let values = crate::settings::load(&settings_schema(), &fx.host_settings);
+        assert_eq!(values["theme"], serde_json::json!("dark"));
+        // The key the remote omitted came back as the schema's default rather
+        // than disappearing from the host's file.
+        assert_eq!(values["notify"], serde_json::json!(true));
+    }
+
+    #[test]
+    fn valid_but_identical_settings_do_not_flag_a_restart() {
+        // Same values, different formatting. A restart tears down the user's
+        // window and discards in-page state, so whitespace must never buy one.
+        let fx = settings_fx();
+        let before = settings_copy_in(&fx.job.ctx).expect("copy in");
+        std::fs::write(
+            fx.tree.join("settings.json"),
+            r#"{"notify":true,"theme":"light"}"#,
+        )
+        .expect("write the tree copy");
+
+        let mut out = OpOutcome::new("merged", "main");
+        settings_apply_back(&fx.job.ctx, before, &mut out).expect("apply back");
+
+        assert!(out.settings_synced, "the file was still adopted");
+        assert!(
+            !out.settings_changed,
+            "identical values reformatted must not restart children"
+        );
+    }
+
+    #[test]
+    fn rejected_settings_leave_the_local_file_untouched_and_heal_the_tree() {
+        let fx = settings_fx();
+        let before = settings_copy_in(&fx.job.ctx).expect("copy in");
+        let host_bytes = std::fs::read(&fx.host_settings).expect("read the host copy");
+        std::fs::write(fx.tree.join("settings.json"), r#"{"theme":"purple"}"#)
+            .expect("write the tree copy");
+
+        let mut out = OpOutcome::new("merged", "main");
+        settings_apply_back(&fx.job.ctx, before, &mut out)
+            .expect("a teammate's typo must not fail the job");
+
+        assert!(!out.settings_synced);
+        assert!(!out.settings_changed);
+        let rejected = out
+            .settings_rejected
+            .expect("settings_rejected must carry the reason");
+        assert!(
+            rejected.error.contains("purple"),
+            "the message must name the offending value: {}",
+            rejected.error
+        );
+        assert_eq!(out.warnings.len(), 1);
+        assert_eq!(out.warnings[0].code, "settings_rejected");
+        assert_eq!(
+            std::fs::read(&fx.host_settings).expect("read the host copy"),
+            host_bytes,
+            "a rejected pull must not touch the local settings.json at all"
+        );
+        assert_eq!(
+            std::fs::read(fx.tree.join("settings.json")).expect("read the tree copy"),
+            host_bytes,
+            "the tree copy must be healed so the next push fixes the remote"
+        );
+    }
+
+    #[test]
+    fn unparseable_tree_settings_are_rejected_rather_than_fatal() {
+        // Broken JSON and a schema violation are the same event from the user's
+        // side - someone committed a file this host cannot use - and both must
+        // leave the repo syncing.
+        let fx = settings_fx();
+        let before = settings_copy_in(&fx.job.ctx).expect("copy in");
+        std::fs::write(fx.tree.join("settings.json"), "{not json").expect("write the tree copy");
+
+        let mut out = OpOutcome::new("merged", "main");
+        settings_apply_back(&fx.job.ctx, before, &mut out).expect("broken JSON must not fail");
+
+        assert!(out.settings_rejected.is_some());
+        assert!(!out.settings_synced);
+        assert_eq!(out.warnings[0].code, "settings_rejected");
+    }
+
+    #[test]
+    fn apply_back_without_a_copy_in_does_nothing() {
+        let mut fx = settings_fx();
+        fx.job.ctx.def.sync_settings = false;
+
+        let mut out = OpOutcome::new("up_to_date", "main");
+        settings_apply_back(&fx.job.ctx, None, &mut out).expect("apply back");
+
+        assert!(!out.settings_synced);
+        assert!(out.settings_rejected.is_none());
+        assert!(!fx.host_settings.exists());
     }
 }
