@@ -539,6 +539,9 @@ impl GitService {
     /// Deliberately **no** `reset --hard` and **no** `cleanup_state()`: our merge never
     /// enters `RepositoryState::Merge`, so a merge state in one of these trees was
     /// created by a human and discarding their staged resolution would be unrecoverable.
+    /// `ops::require_clean_state` is the other half of that decision: startup leaves such
+    /// a tree alone, and every mutating verb then refuses it rather than committing over
+    /// it.
     fn recover_index_locks(&self) {
         // Captured at construction, not here: see `started_at`. The guard only has to
         // distinguish a lock left by a previous run of ours from one a `git` process
