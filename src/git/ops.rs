@@ -2178,49 +2178,7 @@ mod tests {
     }
 
     use std::path::Path;
-    use std::sync::OnceLock;
     use tempfile::TempDir;
-
-    /// Points libgit2's global config search path at a scratch `.gitconfig` that sets
-    /// `init.defaultBranch = master`, and its system/XDG/ProgramData search paths at the
-    /// same (otherwise empty) directory.
-    ///
-    /// Two jobs, both load-bearing. It makes every test in this file run on a machine
-    /// whose git default *disagrees* with `[git].default_branch`, which is the only way
-    /// to prove `RepositoryInitOptions::initial_head` is doing the work rather than the
-    /// ambient default happening to agree. And it stops the developer's real
-    /// `~/.gitconfig` — `init.defaultBranch`, `core.autocrlf`, `commit.gpgsign`, a global
-    /// `core.excludesFile` — from deciding whether these tests pass.
-    fn hostile_global_config() {
-        // The search path is process-global and must outlive every test, so the directory
-        // is deliberately never dropped: a static is not dropped at process exit. It is
-        // one 30-byte file in the OS temp dir.
-        static CONFIG_HOME: OnceLock<TempDir> = OnceLock::new();
-        CONFIG_HOME.get_or_init(|| {
-            let dir = tempfile::tempdir().expect("config tempdir");
-            std::fs::write(
-                dir.path().join(".gitconfig"),
-                "[init]\n\tdefaultBranch = master\n",
-            )
-            .expect("write .gitconfig");
-            // SAFETY: `set_search_path` mutates libgit2 process-global state and is
-            // documented as needing external synchronisation. `OnceLock::get_or_init` is
-            // that synchronisation: every test enters through `Fixture::*` before it
-            // touches git2, and `get_or_init` blocks every other thread until this
-            // closure returns.
-            unsafe {
-                for level in [
-                    git2::ConfigLevel::Global,
-                    git2::ConfigLevel::XDG,
-                    git2::ConfigLevel::System,
-                    git2::ConfigLevel::ProgramData,
-                ] {
-                    git2::opts::set_search_path(level, dir.path()).expect("set search path");
-                }
-            }
-            dir
-        });
-    }
 
     /// A `RepoDef` with the shape `Registry::put` guarantees: non-empty branch, non-zero
     /// timestamps, `origin` as the remote name.
@@ -2266,8 +2224,16 @@ mod tests {
             Fixture::with_origin_head("master")
         }
 
+        /// Both constructors funnel through here, so this is where every `Fixture`-based
+        /// test in this file enters the crate's one libgit2 gate — before the `init_opts`
+        /// below, and so before its first git2 call. The settings tests further down
+        /// build no `Fixture` and enter through `testkit`, which gates itself.
+        ///
+        /// The helper is `testkit`'s and deliberately not a copy: a second `OnceLock`
+        /// would be a second, unordered mutation of the same process-global search path,
+        /// which is exactly the hazard it exists to close.
         fn with_origin_head(head: &str) -> Fixture {
-            hostile_global_config();
+            testkit::hostile_global_config();
             let root = tempfile::tempdir().expect("tempdir");
             let repos_root = root.path().join("repos");
             std::fs::create_dir_all(&repos_root).expect("repos root");

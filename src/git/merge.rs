@@ -416,9 +416,17 @@ pub fn analyse(repo: &git2::Repository, ctx: &OpCtx) -> Result<MergeOutcome, Git
 /// It lives here rather than in `ops.rs` because both test modules need it and a
 /// second copy would drift. It is `pub(crate)` and `#[cfg(test)]`, so it exists
 /// in no shipped build.
+///
+/// It is also **the crate's single gate onto libgit2 in tests**: every entry point
+/// below that names `git2` — plus `job_with`, whose `OpCtx` is handed straight to
+/// production code that does — opens with `hostile_global_config()`. The three that
+/// do neither (`origin_with_main`, `job`, `job_local`) delegate to one that does
+/// before touching anything, so the gate is already shut by the time they arrive.
+/// Read that function's SAFETY note before adding an entry point that skips it.
 #[cfg(test)]
 pub(crate) mod testkit {
     use std::path::{Path, PathBuf};
+    use std::sync::OnceLock;
     use std::time::{Duration, Instant};
 
     use tempfile::TempDir;
@@ -432,6 +440,66 @@ pub(crate) mod testkit {
     /// The file every seeded fixture starts from. Nine lines, so a test can edit
     /// the top and the bottom without the two hunks ever touching.
     pub(crate) const SEEDED: &str = "one\ntwo\nthree\nfour\nfive\nsix\nseven\neight\nnine\n";
+
+    /// Points libgit2's Global, XDG, System and ProgramData config search paths at one
+    /// scratch directory holding a `.gitconfig` that sets `init.defaultBranch = master`.
+    ///
+    /// Two jobs, both load-bearing. It makes every test in the crate run on a machine
+    /// whose git default *disagrees* with the `main` these fixtures pin and with
+    /// `[git].default_branch`, which is the only way to prove `initial_head` and
+    /// `ops::init`'s branch pin are doing the work rather than the ambient default
+    /// happening to agree — see `testkit_pins_a_default_branch_that_disagrees_with_main`.
+    /// And it stops the developer's real `~/.gitconfig` — `init.defaultBranch`,
+    /// `core.autocrlf`, `commit.gpgsign`, a global `core.excludesFile` — from deciding
+    /// whether these tests pass.
+    pub(crate) fn hostile_global_config() {
+        // The search path is process-global and must outlive every test, so the directory
+        // is deliberately never dropped: a static is not dropped at process exit. It is
+        // one 30-byte file in the OS temp dir.
+        static CONFIG_HOME: OnceLock<TempDir> = OnceLock::new();
+        CONFIG_HOME.get_or_init(|| {
+            let dir = tempfile::tempdir().expect("config tempdir");
+            std::fs::write(
+                dir.path().join(".gitconfig"),
+                "[init]\n\tdefaultBranch = master\n",
+            )
+            .expect("write .gitconfig");
+            // SAFETY: `set_search_path` mutates libgit2 process-global state behind no
+            // lock of its own, so it is sound only if it happens-before every libgit2 call
+            // in the process — including calls on the other threads cargo is running tests
+            // on right now.
+            //
+            // `get_or_init` supplies exactly that edge, and nothing more. The thread that
+            // runs this closure finishes all four writes before any other thread returns
+            // from `get_or_init`, and the writes never happen again. So the ordering holds
+            // for a thread if and only if that thread calls `hostile_global_config` BEFORE
+            // its own first libgit2 call. It buys nothing for a thread already inside
+            // libgit2 — which is why the gate lives here, in the one module every test
+            // reaches git2 through, rather than in one module's private fixture.
+            //
+            // The cost of missing it is silent rather than loud: `git_repository_is_empty`
+            // compares HEAD's symbolic target against `git_repository_initialbranch`,
+            // which reads `init.defaultBranch` back through this very search path. Flip
+            // the path between a clone's `git_repository_init` and its emptiness check and
+            // the fresh repository stops looking empty — the clone dies with "the
+            // repository is not empty" in a test that never mentioned config at all.
+            //
+            // ANY FUTURE TEST MODULE THAT TOUCHES git2 MUST ENTER THROUGH THIS GATE, from
+            // its own fixture, before its first git2 call. `git::ops`, `git::mod` and
+            // `git::error` each do so for that reason.
+            unsafe {
+                for level in [
+                    git2::ConfigLevel::Global,
+                    git2::ConfigLevel::XDG,
+                    git2::ConfigLevel::System,
+                    git2::ConfigLevel::ProgramData,
+                ] {
+                    git2::opts::set_search_path(level, dir.path()).expect("set search path");
+                }
+            }
+            dir
+        });
+    }
 
     pub(crate) struct Origin {
         /// Every tree in one test lives under here, so one `TempDir` drop cleans
@@ -448,11 +516,12 @@ pub(crate) mod testkit {
 
     /// An empty bare remote.
     ///
-    /// `initial_head` is pinned because `Repository::init` honours the
-    /// developer's global `init.defaultBranch`: on a machine that defaults to
-    /// `master`, every `refs/heads/main` refspec in this file would match
-    /// nothing and the whole suite would pass for the wrong reason.
+    /// `initial_head` is pinned because `Repository::init` honours the global
+    /// `init.defaultBranch` — which `hostile_global_config` has just set to
+    /// `master` precisely so it disagrees. Without the pin every
+    /// `refs/heads/main` refspec in this file would match nothing.
     pub(crate) fn origin() -> Origin {
+        hostile_global_config();
         let root = tempfile::tempdir().expect("tempdir");
         let bare = root.path().join("origin.git");
         let mut opts = git2::RepositoryInitOptions::new();
@@ -474,6 +543,7 @@ pub(crate) mod testkit {
     /// A working tree that was never cloned: `git init` with `main` pinned, plus
     /// the origin remote. This is "the host created this repo itself".
     pub(crate) fn init_tree(o: &Origin, name: &str) -> PathBuf {
+        hostile_global_config();
         let tree = o.root.path().join(name);
         std::fs::create_dir_all(&tree).expect("create tree dir");
         let mut opts = git2::RepositoryInitOptions::new();
@@ -484,6 +554,7 @@ pub(crate) mod testkit {
     }
 
     pub(crate) fn clone_at(o: &Origin, name: &str) -> PathBuf {
+        hostile_global_config();
         let tree = o.root.path().join(name);
         git2::build::RepoBuilder::new()
             .clone(url_of(o), &tree)
@@ -506,6 +577,7 @@ pub(crate) mod testkit {
     /// `git add -A && git commit`, with an explicit signature: these tests must
     /// not depend on the developer's global `user.name`.
     pub(crate) fn commit_all(tree: &Path, message: &str) -> git2::Oid {
+        hostile_global_config();
         let repo = git2::Repository::open(tree).expect("open tree");
         let mut index = repo.index().expect("index");
         index
@@ -522,6 +594,7 @@ pub(crate) mod testkit {
     }
 
     pub(crate) fn push_main(tree: &Path) {
+        hostile_global_config();
         let repo = git2::Repository::open(tree).expect("open tree");
         let mut remote = repo.find_remote("origin").expect("find origin");
         remote
@@ -531,6 +604,7 @@ pub(crate) mod testkit {
 
     /// A raw fetch, so the merge tests do not depend on `ops::fetch`.
     pub(crate) fn fetch_main(tree: &Path) -> git2::Oid {
+        hostile_global_config();
         let repo = git2::Repository::open(tree).expect("open tree");
         let mut remote = repo.find_remote("origin").expect("find origin");
         remote
@@ -547,12 +621,14 @@ pub(crate) mod testkit {
     }
 
     pub(crate) fn head_of(tree: &Path) -> git2::Oid {
+        hostile_global_config();
         let repo = git2::Repository::open(tree).expect("open tree");
         let head = repo.head().expect("head");
         head.target().expect("head has a target")
     }
 
     pub(crate) fn origin_main(o: &Origin) -> git2::Oid {
+        hostile_global_config();
         let repo = git2::Repository::open_bare(&o.bare).expect("open bare origin");
         let main = repo
             .find_reference("refs/heads/main")
@@ -577,7 +653,11 @@ pub(crate) mod testkit {
         job_with(None, tree, op, OpRequest::default())
     }
 
+    /// The gate is here and not only in the `git2`-naming helpers because this builds an
+    /// `OpCtx` whose whole purpose is to be handed to `ops::sync` and friends — a caller
+    /// can reach libgit2 through the production code without ever naming it itself.
     pub(crate) fn job_with(o: Option<&Origin>, tree: &Path, op: JobOp, request: OpRequest) -> Job {
+        hostile_global_config();
         let store = JobStore::new("0000dead".to_string());
         let admitted = store
             .admit("notes", op, None)
@@ -624,6 +704,7 @@ pub(crate) mod testkit {
     /// on disk — so none of these can be violated unless someone reaches for
     /// `Repository::merge` or lets libgit2 synthesise marker content.
     pub(crate) fn assert_no_merge_state(tree: &Path) {
+        hostile_global_config();
         assert!(
             !tree.join(".git/MERGE_HEAD").exists(),
             "MERGE_HEAD was left behind"
@@ -728,6 +809,33 @@ mod tests {
         let blob = repo.find_blob(entry.id()).expect("blob");
         let content = blob.content().to_vec();
         Some(content)
+    }
+
+    /// A mechanism lock, not a regression test for the search-path race — a race cannot
+    /// be pinned by an assertion, and the evidence that one is closed is a green suite
+    /// run many times, not a `#[test]`.
+    ///
+    /// What it does pin is the premise the rest of this file rests on: after entering
+    /// through `testkit`, the ambient `init.defaultBranch` disagrees with `main`, so
+    /// every `refs/heads/main` here is doing real work rather than agreeing with the
+    /// machine. `origin()` is called first for its side effect — the gate — and the
+    /// control repository is then initialised with **no** `initial_head`, which is the
+    /// only way to observe what libgit2 would have chosen on its own. Read `main` here
+    /// and the fixtures have gone vacuous: the suite stays green and proves nothing.
+    /// (On a developer whose own default is already `master` this can only fail if
+    /// `hostile_global_config` stopped writing; the property it guards holds either way.)
+    #[test]
+    fn testkit_pins_a_default_branch_that_disagrees_with_main() {
+        let o = origin();
+        let repo = git2::Repository::init(o.root.path().join("ambient")).expect("ambient init");
+        let head = repo
+            .find_reference("HEAD")
+            .expect("a fresh repo has a HEAD");
+        assert_eq!(
+            head.symbolic_target().expect("HEAD is valid utf-8"),
+            Some("refs/heads/master"),
+            "the fixtures must run against a git default that disagrees with `main`"
+        );
     }
 
     #[test]

@@ -980,6 +980,12 @@ mod tests {
     /// on every platform, avoiding WinHTTP and any configured HTTP proxy.
     #[test]
     fn libgit2_still_reports_a_refused_connect_the_way_the_os_arm_expects() {
+        // The only git2 call in this file that reaches a repository, so it enters the
+        // crate's one libgit2 gate first. `clone_into` runs its `git_repository_is_empty`
+        // check *before* it connects, so an unsynchronised search-path flip would fail
+        // this clone with GIT_ERROR_INVALID and the assertion below would blame libgit2
+        // for a reword it never made.
+        crate::git::merge::testkit::hostile_global_config();
         let port = {
             let l = std::net::TcpListener::bind("127.0.0.1:0").expect("bind loopback");
             l.local_addr().expect("local addr").port()

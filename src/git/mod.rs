@@ -1380,6 +1380,13 @@ mod tests {
         ops: Arc<dyn GitOps>,
         plant: impl FnOnce(&crate::config::RuntimePaths),
     ) -> Svc {
+        // Every service test funnels through here, so this is where this file enters the
+        // crate's one libgit2 gate. Almost all of them run `FakeOps` and never reach
+        // libgit2 at all — but `a_local_only_repo_syncs_to_a_real_commit` runs `RealOps`,
+        // and a thread that reaches git2 without passing this call first is exactly the
+        // unsynchronised case `hostile_global_config`'s SAFETY note describes. Gating the
+        // one choke point costs an atomic load and cannot be forgotten by the next test.
+        crate::git::merge::testkit::hostile_global_config();
         let dir = tempfile::tempdir().unwrap();
         let paths = crate::config::RuntimePaths::under(dir.path(), "com.example.test");
         paths.ensure().unwrap();
