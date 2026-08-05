@@ -666,8 +666,25 @@ pub fn sync(ctx: &OpCtx) -> Result<OpOutcome, GitError> {
     // A sync of a repo that was never materialised is a clone: the caller asked
     // for "make this tree match the remote", and there is no earlier step they
     // should have had to run first.
-    if !ctx.tree.exists() && ctx.def.remote.is_some() {
-        return clone(ctx);
+    //
+    // The test is `exists()` and not "is not a repository", deliberately: `clone`
+    // refuses a populated directory that is not one of ours with `not_a_repository`
+    // rather than writing over it, and both arms below have to treat "the directory
+    // is there but isn't ours" the same way — as somebody else's directory.
+    if !ctx.tree.exists() {
+        if ctx.def.remote.is_some() {
+            return clone(ctx);
+        }
+        // The same rule with nothing to clone from: README §9.4's `remote: null` is a
+        // local-only repo and `sync` is the only verb its child ever calls, so `init`
+        // is not an earlier step it should have had to run either. `init` and not a
+        // bare `create_dir_all`, because only `init` pins `refs/heads/<def.branch>`
+        // against the developer's global `init.defaultBranch`. It falls through rather
+        // than returning: an init leaves an unborn HEAD, and the commit below is the
+        // half of "sync" a local-only repo actually has. `open_tree`'s state gate is
+        // fine with what this leaves — `RepositoryState` is read from marker files a
+        // fresh init has none of, never from HEAD or the index.
+        init(ctx)?;
     }
 
     let repo = open_tree(ctx)?;
@@ -2944,6 +2961,79 @@ mod tests {
         );
         let err = commit(&op).expect_err("HEAD is on side, the repo is configured for main");
         assert_eq!(err.code(), GitErrorCode::BranchMismatch);
+    }
+
+    /// README §9.4: `remote: null` is a local-only repo whose `sync` "inits and commits
+    /// and reports `outcome: "committed"`". `sync` is the only verb such a repo's child
+    /// process ever calls, so finding no tree cannot mean sending the caller away to an
+    /// `init` they should never have had to run — that is the same argument the
+    /// tree-absent clone arm has always made, with nothing to clone from.
+    ///
+    /// The commit this writes is an empty root commit: the tree cannot be pre-populated
+    /// without creating the directory, which would take the fallthrough away. That is the
+    /// pre-existing shape of `stage_and_commit` against an unborn HEAD (`changed` is true
+    /// whenever there is no HEAD commit to compare against) and it is exactly what makes
+    /// the `committed` README promises true on the very first sync.
+    #[test]
+    fn sync_without_a_remote_initializes_the_tree_and_commits() {
+        let fx = Fixture::new(); // the fixture's git default is `master` ...
+        let def = fx.local_def("notes", "main"); // ... and this repo wants `main`
+        assert!(
+            !fx.tree("notes").exists(),
+            "the absent tree IS the case; a fixture that pre-creates it proves nothing"
+        );
+
+        let out = sync(&fx.op(def, JobOp::Sync, OpRequest::default()))
+            .expect("a local-only sync inits and commits");
+
+        assert_eq!(out.outcome, "committed");
+        assert!(
+            out.head_before.is_none() && out.head_after.is_some(),
+            "there was no HEAD to move and there is one now"
+        );
+        // `OpRequest::default()` carries `push: true`, so `!pushed` is what proves the
+        // `remote.is_none()` early return ran rather than merely that no remote was
+        // configured: without it the job would die in `push_branch`, not skip it.
+        assert!(
+            !out.fetched && !out.pushed,
+            "nothing to fetch from and nothing to publish to"
+        );
+
+        let repo = open(&fx.tree("notes"));
+        assert_eq!(
+            repo.head()
+                .expect("HEAD is born by the first sync")
+                .shorthand()
+                .expect("shorthand"), // 0.21: Result, not Option
+            "main",
+            "the fallthrough must go through `init`, which pins refs/heads/<def.branch>; \
+             a bare Repository::init would answer `master` on this fixture"
+        );
+    }
+
+    /// The other half of README §9.4, and a lock rather than a fix: this shape — tree
+    /// present, `remote: null` — has always worked, and nothing here goes red without the
+    /// fallthrough above. What it pins is the `remote.is_none()` early return that sits
+    /// between the commit and the fetch; delete that and both legs fail `remote_missing`
+    /// from `fetch`, which is the whole of what "local version history with nothing to
+    /// publish it to" means.
+    #[test]
+    fn sync_without_a_remote_commits_an_existing_tree_and_then_reports_no_changes() {
+        let fx = Fixture::new();
+        let def = fx.local_def("notes", "main");
+        init(&fx.op(def.clone(), JobOp::Init, OpRequest::default())).expect("init");
+        std::fs::write(fx.tree("notes").join("f.md"), "one\n").expect("write");
+
+        let out = sync(&fx.op(def.clone(), JobOp::Sync, OpRequest::default())).expect("sync");
+        assert_eq!(out.outcome, "committed");
+        assert!(out.committed);
+        assert_eq!(out.files_committed, 1);
+
+        // The idempotent leg: what stops an `auto_sync_secs` timer writing an empty
+        // commit every tick for as long as the app is open.
+        let again = sync(&fx.op(def, JobOp::Sync, OpRequest::default())).expect("sync");
+        assert_eq!(again.outcome, "no_changes");
+        assert!(!again.committed);
     }
 
     #[test]
