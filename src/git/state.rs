@@ -6,6 +6,7 @@
 //! 2 880 times a day. **Never contains a secret**, and a corrupt one is never fatal: it is a
 //! cache, so the only correct response to nonsense is to start empty.
 
+use crate::git::error::scrub;
 use crate::git::registry::open_private;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -94,7 +95,11 @@ impl StateStore {
         StateStore {
             path: path.to_path_buf(),
             file: Mutex::new(file),
-            load_error,
+            // The same reason `Registry::assembled` scrubs: this string quotes serde's complaint
+            // about a file a human may have hand-edited, serde echoes the offending value
+            // verbatim, and its only reader is a `git.log` line in a file created 0644. A cache
+            // documented as never containing a secret must also never republish one it was handed.
+            load_error: load_error.map(|e| scrub(&e, &[])),
         }
     }
 
@@ -262,6 +267,26 @@ mod tests {
             // A cache is regenerated, not quarantined: there is nothing here to hand back.
             assert!(path.exists(), "{body}");
         }
+    }
+
+    #[test]
+    fn a_load_error_never_republishes_a_password_a_hand_edit_put_in_front_of_it() {
+        // `load_error`'s only reader is a `git.log` startup line, in a file `supervisor::open_log`
+        // creates 0644, and serde echoes the offending value verbatim. A cache documented as
+        // never containing a secret must not republish one it was handed either.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("git-state.json");
+        std::fs::write(
+            &path,
+            r#"{"version":"https://u:hunter2correcthorse@github.com/x"}"#,
+        )
+        .expect("write");
+        let store = StateStore::load(&path);
+        let e = store
+            .load_error()
+            .expect("a wrongly typed version is a load error");
+        assert!(!e.contains("hunter2correcthorse"), "{e}");
+        assert!(e.contains("github.com"), "{e}");
     }
 
     #[test]

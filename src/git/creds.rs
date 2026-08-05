@@ -659,6 +659,19 @@ mod tests {
     }
 
     #[test]
+    fn a_credential_bound_to_nothing_is_withheld_from_a_remote_with_a_host() {
+        // The other half of those two Nones, and the half `Registry::put`'s carry-forward rule
+        // now cites by name: unbound is not a wildcard. Correct here since this file was
+        // written, which is why the theft needed the registry's rebind to be exploitable at all.
+        let stored = spec(r#"{"kind":"token","token":"local-token-value"}"#);
+        let r = resolve(None, Some(&stored), Some("https://evil.example/a/b.git"))
+            .expect("withholding is not an error");
+        assert!(r.cred.is_none());
+        assert!(r.unbound);
+        assert!(r.cred.secrets().is_empty());
+    }
+
+    #[test]
     fn stored_kind_none_is_never_reported_as_unbound() {
         // `kind: "none"` holds no secret, so a host change cannot leak anything.
         // Reporting it as unbound would turn every later auth demand into a

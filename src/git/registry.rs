@@ -7,7 +7,7 @@
 //! times a day.
 
 use crate::config::validate_branch_name;
-use crate::git::error::{GitError, GitErrorCode};
+use crate::git::error::{scrub, GitError, GitErrorCode};
 use crate::git::secret::Secret;
 use crate::git::util::now_ms;
 use serde::{Deserialize, Serialize};
@@ -757,16 +757,25 @@ impl Registry {
         #[cfg(unix)]
         tighten_mode(path, &mut notes);
 
-        let raw = match std::fs::read_to_string(path) {
-            Ok(t) => t,
+        // Bytes, not `read_to_string`: the string form collapses "the file could not be read" and
+        // "the file is not UTF-8" into one `io::Error`, and those two need opposite answers.
+        let bytes = match std::fs::read(path) {
+            Ok(b) => b,
             // The normal first-run state, not a problem.
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                 return Registry::assembled(path, repos_dir, defaults, empty_file(), None, notes)
             }
             Err(e) => {
+                // Deliberately NOT quarantined. Renaming a file we could not read is a bigger act
+                // than refusing to write one: one EACCES from a mis-chmod would retire the whole
+                // registry, credentials included. Leave it; `blocks_writes` latches writes shut.
                 let error = RegistryError {
                     code: "registry_corrupt",
-                    message: format!("repos.json cannot be read ({e})"),
+                    message: format!(
+                        "{} cannot be read ({e}); it was left exactly as it is, and registry \
+                         writes are refused until it can be read or moved aside",
+                        path.display()
+                    ),
                     quarantined_to: None,
                     rejected: Vec::new(),
                 };
@@ -778,6 +787,20 @@ impl Registry {
                     Some(error),
                     notes,
                 );
+            }
+        };
+        // Bytes we *have* and cannot use are a corruption like any other, so the author gets them
+        // back under a `.corrupt-` name and the registry stays writable.
+        let raw = match String::from_utf8(bytes) {
+            Ok(t) => t,
+            Err(e) => {
+                return quarantine(
+                    path,
+                    repos_dir,
+                    defaults,
+                    notes,
+                    format!("repos.json is not UTF-8 text ({e}); quarantined"),
+                )
             }
         };
 
@@ -922,6 +945,15 @@ impl Registry {
         Registry::assembled(path, repos_dir, defaults, file, error, notes)
     }
 
+    /// The one funnel every `load` return path and `quarantine` pass through — which is why the
+    /// scrub lives here rather than at the nine places that build a note.
+    ///
+    /// `notes` and `RegistryError` are built *from* `repos.json`, and `repos.json` is the one file
+    /// in the tree allowed to hold `https://user:pat@host/x.git`. They are then read straight out
+    /// into `git.log`, which `supervisor::open_log` creates 0644, and into the `registry_error` of
+    /// `GET /api/git` and `/api/status` — so the entry whose own refusal reads "a password in the
+    /// remote URL would be copied into log lines" was copying it into log lines, on every launch,
+    /// forever. Scrubbing the funnel is what stops a tenth note from re-opening it.
     fn assembled(
         path: &Path,
         repos_dir: &Path,
@@ -935,8 +967,11 @@ impl Registry {
             repos_dir: repos_dir.to_path_buf(),
             defaults,
             file: RwLock::new(file),
-            error,
-            notes,
+            error: error.map(scrub_registry_error),
+            // `&[]`: nothing here has resolved a credential, so `strip_userinfo` is the whole of
+            // the available defence — and it is the pass that matters, because a stored token
+            // reaches a note only by being quoted back inside a remote.
+            notes: notes.into_iter().map(|n| scrub(&n, &[])).collect(),
         }
     }
 
@@ -959,8 +994,43 @@ impl Registry {
         &self.repos_dir
     }
 
+    /// `Some(why)` when a `repos.json` we could not account for is still sitting at `path`.
+    /// Derived from `error` rather than stored, so no construction path can set one without the
+    /// other — a `writes_blocked: bool` written at one site is free to drift from the error it
+    /// came from, and `error` is immutable after `assembled`.
+    fn write_block(&self) -> Option<&RegistryError> {
+        self.error.as_ref().filter(|e| blocks_writes(e))
+    }
+
     pub fn writable(&self) -> bool {
-        self.defaults.registry_writes
+        self.defaults.registry_writes && self.write_block().is_none()
+    }
+
+    /// The gate every write goes through, and the only place either refusal is worded. `put` and
+    /// `remove` call this instead of reading `defaults.registry_writes` directly, so a registry
+    /// that latched shut at load cannot be written by a caller that reached `Registry` without
+    /// going through `GitService`.
+    ///
+    /// The latch is reported first: `registry_writes = false` is a choice the author already
+    /// knows about, while an unaccounted-for `repos.json` is a fault only this message will name.
+    /// Both are the same wire code deliberately — to a client they mean the same thing ("this
+    /// host will not persist registry edits, and retrying will not help"), and `GET /api/git`
+    /// already tells them apart without a second code: `registry_writable: false` **with** a
+    /// `registry_error` is the fault, without one it is the config key.
+    pub fn ensure_writable(&self) -> Result<(), GitError> {
+        if let Some(why) = self.write_block() {
+            return Err(GitError::new(
+                GitErrorCode::RegistryReadOnly,
+                format!(
+                    "repos.json cannot be written while its contents are unaccounted for: {}",
+                    why.message
+                ),
+            ));
+        }
+        if !self.defaults.registry_writes {
+            return Err(GitError::registry_read_only());
+        }
+        Ok(())
     }
 
     pub fn error(&self) -> Option<RegistryError> {
@@ -968,6 +1038,9 @@ impl Registry {
     }
 
     /// Non-fatal observations from `load`, for `git.log`. `registry.rs` has no logger.
+    ///
+    /// Already scrubbed — see `assembled`. The caller writes these into a 0644 file, so the
+    /// guarantee has to hold at the boundary, not at the caller's discretion.
     pub fn notes(&self) -> &[String] {
         &self.notes
     }
@@ -1008,9 +1081,7 @@ impl Registry {
     /// Create or replace one entry, then persist. A `PUT` is a whole-definition write: fields
     /// absent from `def` take their serde defaults, they are not merged with what was stored.
     pub fn put(&self, def: RepoDef) -> Result<PutOutcome, GitError> {
-        if !self.defaults.registry_writes {
-            return Err(GitError::registry_read_only());
-        }
+        self.ensure_writable()?;
         validate_id(&def.id)?;
 
         let mut def = def;
@@ -1027,24 +1098,37 @@ impl Registry {
                 // remote points at. Repointing a repo at an attacker's host and re-PUTting is the
                 // cheapest way to steal a PAT out of this service; dropping the credential here
                 // is what makes that attack yield nothing.
-                let keep = stored.is_none()
-                    || match (&bound, &remote_host_now) {
-                        (Some(b), Some(h)) => b == h,
-                        // Never bound (hand-written); `normalise_def` binds it below.
-                        (None, _) => true,
-                        // The remote was removed, so there is no host to stay bound to.
-                        (Some(_), None) => false,
-                    };
+                //
+                // Deliberately the same equality `creds::resolve` transmits by, `None` included.
+                // `normalise_def` binds every credential it stores, so an unbound one can only
+                // have been written next to a remote with no host at all — `file://`, a local
+                // path, or no remote — and it is keepable only while that is still true. Carrying
+                // it onto a remote that does have a host would hand it to `normalise_def` three
+                // lines below, which binds it to that host: the same theft, with the rebinding
+                // done for the attacker.
+                //
+                // `kind: "none"` short-circuits because its `bound_host` is always `None`:
+                // without that it would now "drop" to an identical value and warn the user to
+                // rebind a credential that does not exist.
+                let keep = stored.is_none() || bound == remote_host_now;
                 if keep {
                     def.credential = Some(stored);
                 } else {
+                    // Spelled out on both sides because either can be absent, and "(nothing)"
+                    // mid-sentence read like a placeholder that had failed to expand.
+                    let was = match &bound {
+                        Some(b) => format!("was bound to {b}"),
+                        None => "was never bound to a host".to_string(),
+                    };
+                    let points_at = match &remote_host_now {
+                        Some(h) => format!("this remote is {h}"),
+                        None => "this remote has no host".to_string(),
+                    };
                     warnings.push(Warning {
                         code: "auth_unbound",
                         message: format!(
-                            "the stored credential was bound to {} but this remote is {}; it was \
-                             dropped — send a replacement credential with this PUT",
-                            bound.as_deref().unwrap_or("(nothing)"),
-                            remote_host_now.as_deref().unwrap_or("(no remote)")
+                            "the stored credential {was} but {points_at}; it was dropped — send a \
+                             replacement credential with this PUT"
                         ),
                     });
                 }
@@ -1084,9 +1168,8 @@ impl Registry {
     /// touched here — deleting a user's files is `GitService::delete_repo`'s explicit
     /// `?purge=true` decision, not a side effect of editing the registry.
     pub fn remove(&self, id: &str) -> Result<RepoDef, GitError> {
-        if !self.defaults.registry_writes {
-            return Err(GitError::registry_read_only());
-        }
+        // Still checked before existence, so a probe cannot enumerate ids.
+        self.ensure_writable()?;
         let mut guard = self.write();
         let index = guard
             .repos
@@ -1110,6 +1193,19 @@ fn empty_file() -> RegistryFile {
     }
 }
 
+/// The one rule that decides whether the registry may write itself back: is there still a
+/// `repos.json` on disk whose contents we could not account for?
+///
+/// `save` publishes by `rename`, so the first `PUT` after such a load replaces that file
+/// wholesale — every other definition and every stored PAT in it, with no `.corrupt-` copy to
+/// recover from. A quarantined file is accounted for: the bytes moved aside.
+/// `registry_entries_rejected` is accounted for too: those entries were read, and `rejected_raw`
+/// writes them back verbatim. What is left is a `registry_corrupt` with nowhere to point —
+/// either the read failed, or the quarantine rename did.
+fn blocks_writes(error: &RegistryError) -> bool {
+    error.code == "registry_corrupt" && error.quarantined_to.is_none()
+}
+
 /// Rename, never delete and never truncate: a hand-written file deserves better than "we
 /// deleted it", and the author needs the bytes back to find their typo.
 fn quarantine(
@@ -1127,11 +1223,21 @@ fn quarantine(
         target = path.with_extension(format!("json.corrupt-{stamp}-{n}"));
         n += 1;
     }
-    let quarantined_to = match std::fs::rename(path, &target) {
-        Ok(()) => Some(target.display().to_string()),
+    let (quarantined_to, message) = match std::fs::rename(path, &target) {
+        Ok(()) => (Some(target.display().to_string()), message),
         Err(e) => {
             notes.push(format!("cannot quarantine {}: {e}", path.display()));
-            None
+            // Every caller's message ends "; quarantined", which is now untrue — and the operator
+            // has to know the file is still theirs to move, because until it is moved
+            // `ensure_writable` refuses every PUT and DELETE.
+            (
+                None,
+                format!(
+                    "{message} — but the rename failed ({e}); {} is still there and registry \
+                     writes are refused until it is moved aside",
+                    path.display()
+                ),
+            )
         }
     };
     let error = RegistryError {
@@ -1160,6 +1266,25 @@ fn tighten_mode(path: &Path, notes: &mut Vec<String>) {
         Ok(()) => notes.push(format!("tightened {} from {mode:o} to 600", path.display())),
         Err(e) => notes.push(format!("cannot tighten {}: {e}", path.display())),
     }
+}
+
+/// `RegistryError` crosses two surfaces that outlive the request — `git.log` and the
+/// `registry_error` field of `GET /api/git` and `/api/status` — and both of its text fields are
+/// quoted out of `repos.json`. `message` carries serde's complaint, and `serde_json::from_value`
+/// echoes the offending value verbatim (`invalid type: string "https://user:pat@host/x.git",
+/// expected u64`); `rejected[].id` is the raw `id` field of an entry too broken to have been
+/// validated yet.
+///
+/// Scrubbing `id` cannot cost a caller an identifying value: `valid_id` admits neither `:` nor
+/// `/`, so the only ids this rewrites are ones that were rejected anyway, and `rejected[].index`
+/// is the precise locator regardless. `quarantined_to` is a path this host built rather than file
+/// content, and is deliberately left intact.
+fn scrub_registry_error(mut error: RegistryError) -> RegistryError {
+    error.message = scrub(&error.message, &[]);
+    for entry in &mut error.rejected {
+        entry.id = entry.id.take().map(|id| scrub(&id, &[]));
+    }
+    error
 }
 
 /// Maps a validation failure onto the stable `rejected[].reason` vocabulary. `invalid_branch_name`
@@ -1890,6 +2015,170 @@ mod tests {
     }
 
     #[test]
+    fn a_registry_that_cannot_be_read_is_left_alone_and_latches_writes_shut() {
+        // A directory where the file belongs is the one read failure every OS and every uid
+        // agrees on — `chmod 000` is a no-op under root, so it cannot carry this on its own.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("repos.json");
+        std::fs::create_dir(&path).expect("plant a directory");
+        std::fs::write(path.join("marker"), "not ours to move").expect("marker");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            // `tighten_mode` would otherwise chmod this 0755 directory to 0600 and take the
+            // search bit with it, so the marker assertion below would fail on our own umask
+            // rather than on anything the fix does.
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).expect("chmod");
+        }
+
+        let reg = load_at(dir.path());
+        let err = reg.error().expect("registry_error");
+        assert_eq!(err.code, "registry_corrupt");
+        assert!(
+            err.quarantined_to.is_none(),
+            "renaming a file we could not read is a bigger act than refusing to write one"
+        );
+        assert!(err.message.contains("cannot be read"), "{}", err.message);
+        assert!(
+            err.message.contains(&path.display().to_string()),
+            "the operator has to be told which file: {}",
+            err.message
+        );
+        assert!(err.message.contains("moved aside"), "{}", err.message);
+
+        assert!(path.is_dir(), "nothing at `path` may be touched");
+        assert!(path.join("marker").exists(), "and nothing under it either");
+        assert!(
+            std::fs::read_dir(dir.path())
+                .expect("read_dir")
+                .filter_map(Result::ok)
+                .all(|e| !e.file_name().to_string_lossy().contains("corrupt-")),
+            "a file we never read must not be quarantined"
+        );
+
+        assert!(!reg.writable());
+        assert_eq!(
+            reg.put(def(r#"{"id":"notes"}"#))
+                .expect_err("an unaccounted-for repos.json refuses every write")
+                .code(),
+            GitErrorCode::RegistryReadOnly
+        );
+        assert_eq!(
+            reg.remove("notes")
+                .expect_err("remove too, and before existence")
+                .code(),
+            GitErrorCode::RegistryReadOnly
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_unreadable_registry_is_never_replaced_by_a_put() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("repos.json");
+        let original = r#"{"version":1,"repos":[{"id":"notes",
+            "credential":{"kind":"token","token":"ghp_SUPERSECRET"}}]}"#;
+        std::fs::write(&path, original).expect("write");
+        // `tighten_mode` leaves 000 alone: 000 & 0o077 == 0.
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).expect("chmod");
+        if std::fs::read_to_string(&path).is_ok() {
+            // Running as root, where a mode is advice. The precondition *is* the test, and the
+            // directory-based case above covers the same gate for every uid.
+            return;
+        }
+
+        let reg = load_at(dir.path());
+        assert!(!reg.writable());
+        assert_eq!(
+            reg.put(def(r#"{"id":"other"}"#))
+                .expect_err("a PUT must not publish over a file we could not read")
+                .code(),
+            GitErrorCode::RegistryReadOnly
+        );
+
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).expect("chmod");
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("read"),
+            original,
+            "`save` publishes by rename, so a PUT that got this far replaced every other \
+             definition and every stored PAT with no .corrupt- copy to recover from"
+        );
+    }
+
+    /// Restores the mode even if an assertion panics: `tempfile`'s cleanup needs the write bit
+    /// back, and a 0500 directory left in the system temp dir is litter no later run removes.
+    #[cfg(unix)]
+    struct RestoreMode(PathBuf);
+
+    #[cfg(unix)]
+    impl Drop for RestoreMode {
+        fn drop(&mut self) {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&self.0, std::fs::Permissions::from_mode(0o700));
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_quarantine_that_could_not_rename_latches_writes_shut() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("repos.json");
+        std::fs::write(&path, "{ this is not json").expect("write");
+        // `rename` needs write on the *directory*; 0o500 keeps the search bit so `load` can
+        // still read the file and fail at the move rather than at the read.
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o500))
+            .expect("chmod");
+        let _restore = RestoreMode(dir.path().to_path_buf());
+        if std::fs::write(dir.path().join("probe"), "x").is_ok() {
+            // Running as root: the rename would succeed and there would be nothing to observe.
+            return;
+        }
+
+        let reg = load_at(dir.path());
+        let err = reg.error().expect("registry_error");
+        assert!(err.quarantined_to.is_none());
+        assert!(
+            err.message.contains("rename failed"),
+            "every caller's message ends \"; quarantined\", which is untrue here: {}",
+            err.message
+        );
+        assert!(!reg.writable(), "the author's file is still at `path`");
+        assert!(
+            reg.notes().iter().any(|n| n.contains("cannot quarantine")),
+            "{:?}",
+            reg.notes()
+        );
+        assert!(path.exists());
+    }
+
+    #[test]
+    fn a_registry_that_is_not_utf8_is_quarantined_like_any_other_corruption() {
+        // The other half of the read split: these are bytes we hold and cannot use, which is a
+        // corruption like any other — the author gets them back and the registry stays writable.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("repos.json");
+        let original: &[u8] = &[0xff, 0xfe, b'{', 0x00];
+        std::fs::write(&path, original).expect("write");
+
+        let reg = load_at(dir.path());
+        let err = reg.error().expect("registry_error");
+        assert_eq!(err.code, "registry_corrupt");
+        let quarantine = err
+            .quarantined_to
+            .expect("bytes we hold are handed back under a .corrupt- name");
+        assert_eq!(std::fs::read(&quarantine).expect("read"), original);
+        assert!(!path.exists());
+        assert!(
+            reg.writable(),
+            "accounted for: there is nothing left at `path` for a write to destroy"
+        );
+        reg.put(def(r#"{"id":"notes"}"#))
+            .expect("a quarantined registry writes normally");
+    }
+
+    #[test]
     fn bad_entries_are_skipped_and_the_good_ones_load() {
         let dir = tempfile::tempdir().expect("tempdir");
         std::fs::write(
@@ -1950,6 +2239,50 @@ mod tests {
                     reason: "duplicate_id"
                 },
             ]
+        );
+    }
+
+    #[test]
+    fn no_load_note_or_registry_error_republishes_a_password_from_repos_json() {
+        // Every route out of `load` that quotes the file back at the operator, fed one password:
+        // the `insecure_remote` refusal — whose own text warns that a password in a remote URL
+        // reaches log lines — an id serde could read but `validate_id` could not accept, a URL in
+        // a field typed `u64`, and a bare string where a definition belongs. `notes` are read out
+        // into a `git.log` that `supervisor::open_log` creates 0644, and `RegistryError` is
+        // serialised into `GET /api/git` and `/api/status`, so neither may carry it.
+        const PASSWORD: &str = "hunter2correcthorse";
+        const REMOTE: &str = "https://user:hunter2correcthorse@github.com/acme/x.git";
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            dir.path().join("repos.json"),
+            format!(
+                r#"{{"version":1,"repos":[
+                    {{"id":"leaky","remote":"{REMOTE}"}},
+                    {{"id":"{REMOTE}"}},
+                    {{"id":"typed","auto_sync_secs":"{REMOTE}"}},
+                    "{REMOTE}"
+                ]}}"#
+            ),
+        )
+        .expect("write");
+
+        let reg = load_at(dir.path());
+        for note in reg.notes() {
+            assert!(!note.contains(PASSWORD), "{note}");
+        }
+        let err = reg.error().expect("registry_error");
+        assert_eq!(err.rejected.len(), 4, "all four routes must fire: {err:?}");
+        // The whole serialised shape, not just `message`: `rejected[].id` is the raw `id` of an
+        // entry too broken to have been validated, and it crosses the same two surfaces.
+        let wire = serde_json::to_string(&err).expect("RegistryError is Serialize");
+        assert!(!wire.contains(PASSWORD), "{wire}");
+
+        // Silence is the other way to pass this, and it would cost the operator the only signal
+        // they get about a hand-edit that failed.
+        assert!(
+            reg.notes().iter().any(|n| n.contains("github.com")),
+            "{:?}",
+            reg.notes()
         );
     }
 
@@ -2178,6 +2511,104 @@ mod tests {
     }
 
     #[test]
+    fn put_drops_an_unbound_credential_when_the_remote_gains_a_host() {
+        // Both ways a stored credential ends up bound to nothing: a remote with no resolvable
+        // host, and no remote at all. Deliberately not a bare absolute path as a third fixture —
+        // `validate_remote`'s `Path::is_absolute` fallback is false for "/srv/…" on Windows.
+        for stored_remote in [Some("file:///srv/git/notes.git"), None] {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let reg = load_at(dir.path());
+            let first = match stored_remote {
+                Some(r) => reg.put(token_def("notes", r)).expect("first put"),
+                None => reg
+                    .put(def(
+                        r#"{"id":"notes","credential":{"kind":"token","token":"ghp_SUPERSECRET"}}"#,
+                    ))
+                    .expect("first put"),
+            };
+            // Asserted before the repoint, so the fixture cannot rot into proving nothing.
+            assert_eq!(
+                first
+                    .repo
+                    .credential
+                    .as_ref()
+                    .and_then(CredentialSpec::bound_host),
+                None,
+                "{stored_remote:?} must store a credential bound to no host"
+            );
+
+            let out = reg
+                .put(def(
+                    r#"{"id":"notes","remote":"https://evil.example/acme/notes.git"}"#,
+                ))
+                .expect("repointed put");
+            assert!(
+                out.repo.credential.is_none(),
+                "an unbound credential was never approved for any host: {stored_remote:?}"
+            );
+            assert_eq!(out.warnings.len(), 1, "{:?}", out.warnings);
+            assert_eq!(out.warnings[0].code, "auth_unbound");
+            let msg = &out.warnings[0].message;
+            assert!(msg.contains("evil.example"), "{msg}");
+            assert!(msg.contains("never bound to a host"), "{msg}");
+            assert!(!msg.contains("(nothing)"), "{msg}");
+
+            let text = std::fs::read_to_string(dir.path().join("repos.json")).expect("read");
+            assert!(
+                !text.contains("ghp_SUPERSECRET"),
+                "carried forward, `normalise_def` would bind it to the attacker's host: {text}"
+            );
+        }
+    }
+
+    #[test]
+    fn put_drops_a_bound_credential_when_the_remote_is_removed() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let reg = load_at(dir.path());
+        reg.put(token_def("notes", "https://github.com/acme/notes.git"))
+            .expect("first put");
+
+        let out = reg
+            .put(def(r#"{"id":"notes"}"#))
+            .expect("put with no remote");
+        assert!(out.repo.credential.is_none());
+        assert_eq!(out.warnings.len(), 1, "{:?}", out.warnings);
+        assert_eq!(out.warnings[0].code, "auth_unbound");
+        let msg = &out.warnings[0].message;
+        assert!(msg.contains("github.com"), "{msg}");
+        // The drop itself has always happened here; the sentence claiming "this remote is (no
+        // remote)" is what made this arm's only coverage worth writing.
+        assert!(msg.contains("has no host"), "{msg}");
+    }
+
+    #[test]
+    fn put_keeps_an_unbound_credential_while_the_remote_still_has_no_host() {
+        // The guard against the tempting over-correction — dropping whenever `bound` is None
+        // would silently destroy the token of every file:// / local-path / remote-less repo on
+        // an unrelated edit, and contradict `creds::resolve`, which pins these two `None`s as a
+        // match. Nothing became reachable: the token still cannot be transmitted anywhere.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let reg = load_at(dir.path());
+        reg.put(token_def("notes", "file:///srv/git/notes.git"))
+            .expect("first put");
+
+        let out = reg
+            .put(def(
+                r#"{"id":"notes","remote":"file:///srv/git/moved.git","sync_on_start":true}"#,
+            ))
+            .expect("unrelated edit");
+        assert!(out.repo.credential.is_some());
+        assert_eq!(
+            out.repo
+                .credential
+                .as_ref()
+                .and_then(CredentialSpec::bound_host),
+            None
+        );
+        assert!(out.warnings.is_empty(), "{:?}", out.warnings);
+    }
+
+    #[test]
     fn put_replaces_rather_than_merges_a_credential() {
         let dir = tempfile::tempdir().expect("tempdir");
         let reg = load_at(dir.path());
@@ -2193,6 +2624,30 @@ mod tests {
         assert!(matches!(out.repo.credential, Some(CredentialSpec::None)));
         let text = std::fs::read_to_string(dir.path().join("repos.json")).expect("read");
         assert!(!text.contains("ghp_SUPERSECRET"), "{text}");
+    }
+
+    #[test]
+    fn put_carries_kind_none_forward_across_a_host_change_without_warning() {
+        // The `stored.is_none()` short-circuit, which the fixed predicate makes load-bearing in a
+        // new way: `CredentialSpec::None` always reports `bound_host` `None`, so without it a
+        // stored `{"kind":"none"}` would now "drop" to an identical value and warn the user to
+        // rebind a credential that does not exist — exactly what
+        // `creds.rs::stored_kind_none_is_never_reported_as_unbound` forbids at the other end.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let reg = load_at(dir.path());
+        reg.put(def(
+            r#"{"id":"notes","remote":"https://github.com/acme/notes.git",
+                 "credential":{"kind":"none"}}"#,
+        ))
+        .expect("first put");
+
+        let out = reg
+            .put(def(
+                r#"{"id":"notes","remote":"https://elsewhere.example/acme/notes.git"}"#,
+            ))
+            .expect("repointed put");
+        assert!(matches!(out.repo.credential, Some(CredentialSpec::None)));
+        assert!(out.warnings.is_empty(), "{:?}", out.warnings);
     }
 
     #[test]
