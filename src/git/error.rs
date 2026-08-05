@@ -567,6 +567,73 @@ impl GitError {
         )
     }
 
+    /// A checkout refused because the file already at that path is not git's to
+    /// replace.
+    ///
+    /// `dirty_tree` rather than a new code, deliberately: from the caller's side
+    /// this is the same situation `pull` already refuses with — uncommitted work
+    /// is in the way, deal with it and retry — and 409/non-retryable is already
+    /// the right answer. What this adds is the *paths*, because an untracked or
+    /// ignored file is one the caller may never have thought of as part of the
+    /// repo at all, and libgit2's own message for the refusal is a bare count.
+    pub fn checkout_would_overwrite(paths: &[String]) -> GitError {
+        // Bounded: this message ends up in a one-line `git.log` record and in a
+        // native dialog, and a merge that collides on a whole directory would
+        // otherwise produce a paragraph neither of them can show.
+        const SHOWN: usize = 10;
+        let named = paths
+            .iter()
+            .take(SHOWN)
+            .map(String::as_str)
+            .collect::<Vec<_>>()
+            .join(", ");
+        let more = match paths.len().saturating_sub(SHOWN) {
+            0 => String::new(),
+            n => format!(" and {n} more"),
+        };
+        // No path through `checkout_or_refuse` produces an empty list, but a
+        // libgit2 that refused without notifying would otherwise print a dangling
+        // colon and read like a bug in this function.
+        let which = if paths.is_empty() {
+            "local files it does not track".to_string()
+        } else {
+            format!("{named}{more}")
+        };
+        GitError::new(
+            GitErrorCode::DirtyTree,
+            format!(
+                "the merge would overwrite {which}; commit, move or delete them \
+                 and run it again"
+            ),
+        )
+    }
+
+    /// A repository half-way through an operation **a human started**.
+    ///
+    /// Deliberately `DirtyTree` and deliberately not a new code: `fill_status` has
+    /// shipped this exact predicate — `repo.state() != Clean` — as `dirty_tree`
+    /// since task 7, and one condition answering two different strings on the two
+    /// surfaces this module exists to unify is what the add-never-rename rule is
+    /// protecting against. Not `RepoLocked` either: that one is `retryable = true`,
+    /// and an interrupted merge is the opposite of transient — nothing changes
+    /// until a human acts, so a retry loop would spin forever.
+    ///
+    /// The message carries the whole recovery, `confirm` included: the reset body
+    /// is mandatory (`confirm_required` is a 422), so an operator told only to
+    /// "POST /reset" gets a second error instead of a repair.
+    pub fn repo_state_not_clean(state: git2::RepositoryState, repo_id: &str) -> GitError {
+        GitError::new(
+            GitErrorCode::DirtyTree,
+            format!(
+                "repository state is {state:?}, not Clean: an interrupted merge, rebase or \
+                 cherry-pick that this host did not start is still in progress. Finish it by \
+                 hand in the working tree, or discard it with POST \
+                 /api/git/repos/{repo_id}/reset {{\"to\":\"head\",\"confirm\":true}}"
+            ),
+        )
+        .with_repo(repo_id)
+    }
+
     pub fn merge_path_type_conflict(path: &Path) -> GitError {
         GitError::new(
             GitErrorCode::MergePathTypeConflict,
