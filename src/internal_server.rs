@@ -831,7 +831,10 @@ options = ["light", "dark"]
         let (_state, port, _dir) = spawn_git_state(true, Arc::new(StubOps)).await;
         put_notes(port, json!({})).await;
 
-        for verb in ["clone", "pull", "push", "sync"] {
+        // `sync` is deliberately not in this list. §9.4: `remote: null` is a local-only
+        // repo whose sync stages and commits — an impossible request is one with no arm
+        // left to run, and sync has one. See `sync_is_admitted_on_a_repo_with_no_remote`.
+        for verb in ["clone", "pull", "push"] {
             let r = post(port, &format!("/repos/notes/{verb}"), json!({})).await;
             assert_eq!(r.status(), 422, "{verb} with no remote");
             let body: serde_json::Value = r.json().await.unwrap();
@@ -871,6 +874,26 @@ options = ["light", "dark"]
 
         let r = post(port, "/repos/notes/commit", json!({"messsage": "typo"})).await;
         assert_eq!(r.status(), 422, "a silently-ignored key is a data-loss bug");
+    }
+
+    /// The other half of `the_mutating_routes_refuse_impossible_requests`: removing
+    /// `sync` from that loop must not quietly remove the coverage. `StubOps` means this
+    /// proves admission only — `git::tests::a_local_only_repo_syncs_to_a_real_commit` is
+    /// what proves the work.
+    #[tokio::test]
+    async fn sync_is_admitted_on_a_repo_with_no_remote() {
+        let (_state, port, _dir) = spawn_git_state(true, Arc::new(StubOps)).await;
+        put_notes(port, json!({})).await; // no `remote` key at all
+        let r = post(port, "/repos/notes/sync", json!({})).await;
+        assert_eq!(
+            r.status(),
+            202,
+            "§9.4: a local-only sync stages and commits"
+        );
+        assert!(r.headers().contains_key("location"));
+        let body: serde_json::Value = r.json().await.unwrap();
+        assert_eq!(body["job"]["op"], "sync");
+        assert_eq!(body["job"]["repo_id"], "notes");
     }
 
     #[tokio::test]

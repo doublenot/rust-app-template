@@ -770,10 +770,13 @@ impl GitService {
         let def = self.registry.snapshot(repo_id)?;
 
         // Refused before admission, so a request that cannot possibly succeed never
-        // creates a job record for the caller to poll.
-        if def.remote.is_none()
-            && matches!(op, JobOp::Clone | JobOp::Pull | JobOp::Push | JobOp::Sync)
-        {
+        // creates a job record for the caller to poll. `sync` is deliberately not in
+        // this list: §9.4's `remote: null` is a local-only repo whose sync stages and
+        // commits (`ops::sync`'s early return), so the verb still has an arm to run.
+        // The rule is that admission refuses a verb only when EVERY mode of it is
+        // impossible — which is why `reset` is not here either: `to: "upstream"` needs
+        // an upstream and fails in the worker, `to: "head"` needs nothing.
+        if def.remote.is_none() && matches!(op, JobOp::Clone | JobOp::Pull | JobOp::Push) {
             return Err(GitError::remote_missing().with_repo(repo_id));
         }
         if op == JobOp::Reset && !req.reset.as_ref().is_some_and(|r| r.confirm) {
@@ -1313,7 +1316,11 @@ mod tests {
     }
 
     /// A `GitOps` that records what it was asked to do and hands back a canned answer.
-    /// Every test in this file is therefore a test of the service, never of libgit2.
+    /// Almost every test in this file is therefore a test of the service, never of
+    /// libgit2. The one deliberate exception is `a_local_only_repo_syncs_to_a_real_commit`,
+    /// which uses `RealOps` because the arm it covers was dead code for as long as
+    /// admission refused the verb — a `FakeOps` version would prove only that the gate
+    /// opened, and would leave that arm dead a second time.
     struct FakeOps {
         calls: std::sync::Mutex<Vec<(JobOp, String)>>,
         result: std::sync::Mutex<Result<OpOutcome, GitError>>,
@@ -1397,8 +1404,8 @@ mod tests {
     }
 
     /// Never dialled: every test that uses it replaces `ops::run` with a fake. It exists
-    /// because `start_job` refuses `clone`/`pull`/`push`/`sync` on a repo with no remote
-    /// before admission, so a job test needs one configured to get past that guard.
+    /// because `start_job` refuses `clone`/`pull`/`push` on a repo with no remote before
+    /// admission, so a job test needs one configured to get past that guard.
     const REMOTE: &str = "/nonexistent/origin.git";
 
     fn repo_def(id: &str, remote: Option<&str>) -> RepoDef {
@@ -2127,22 +2134,116 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn network_verbs_need_a_remote_and_reset_needs_confirmation() {
+    async fn remote_verbs_need_a_remote_and_reset_needs_confirmation() {
         let fx = service("[git]\n", FakeOps::ok()).await;
         fx.svc.put_repo("notes", repo_def("notes", None)).unwrap();
 
-        for op in [JobOp::Clone, JobOp::Pull, JobOp::Push, JobOp::Sync] {
+        for op in [JobOp::Clone, JobOp::Pull, JobOp::Push] {
             let err = refused(
                 fx.svc.start_job("notes", op, OpRequest::manual()),
                 "no remote",
             );
             assert_eq!(err.code(), GitErrorCode::RemoteMissing, "{op:?}");
         }
+        assert!(
+            matches!(
+                fx.svc.start_job("notes", JobOp::Sync, OpRequest::manual()),
+                Ok(StartOutcome::Started(_))
+            ),
+            "§9.4: a local-only sync is admitted, not refused"
+        );
         let err = refused(
             fx.svc.start_job("notes", JobOp::Reset, OpRequest::manual()),
             "unconfirmed reset",
         );
         assert_eq!(err.code(), GitErrorCode::ConfirmRequired);
+    }
+
+    /// §9.4: `remote: null` is "local version history for the child process".
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_local_only_repo_syncs_to_a_real_commit() {
+        let fx = service("[git]\n", Arc::new(RealOps)).await;
+        fx.svc.put_repo("notes", repo_def("notes", None)).unwrap();
+        let tree = fx.svc.tree_path("notes");
+
+        // Through the `init` verb and not a hand-rolled `Repository::init`: `ops::init`
+        // pins refs/heads/<def.branch> against the developer's global
+        // init.defaultBranch, so the branch assertion below cannot pass by accident. A
+        // bare `create_dir_all` would be worse still — it leaves a plain directory that
+        // is not a repository, `ops::sync` sees `tree.exists()` and skips its own init,
+        // and the job dies in `open_tree`.
+        let started = fx
+            .svc
+            .start_job("notes", JobOp::Init, OpRequest::manual())
+            .unwrap();
+        settle(&fx.svc, "notes", started.slot()).await;
+        std::fs::write(tree.join("inbox.md"), b"# hello\n").unwrap();
+
+        let StartOutcome::Started(slot) = fx
+            .svc
+            .start_job("notes", JobOp::Sync, OpRequest::manual())
+            .expect("§9.4 admits a sync on a repo with no remote")
+        else {
+            panic!("expected a freshly started job");
+        };
+        settle(&fx.svc, "notes", &slot).await;
+
+        let job = slot.view(fx.svc.host_instance());
+        assert_eq!(job.state, JobState::Succeeded, "job error: {:?}", job.error);
+        let result = job.result.expect("a succeeded job publishes its result");
+        assert_eq!(result["outcome"], "committed"); // README.md:549, verbatim
+        assert_eq!(result["committed"], true);
+        assert_eq!(result["files_committed"], 1);
+        assert_eq!(result["fetched"], false, "a local-only sync must not fetch");
+        // `OpRequest::manual()` carries `push: true` (OpRequest::default), so this is
+        // the assertion that proves `ops::sync`'s early return rather than merely a
+        // missing remote: without it the job would fail in `push_branch`.
+        assert_eq!(result["pushed"], false);
+        assert!(result["merge"].is_null());
+
+        // The history, not the report.
+        let repo = git2::Repository::open(&tree).expect("sync left a repository");
+        let head = repo.head().expect("HEAD is born after the first sync");
+        assert_eq!(head.shorthand().expect("shorthand"), "main");
+        let commit = head.peel_to_commit().unwrap();
+        assert_eq!(
+            commit.parent_count(),
+            0,
+            "the first sync writes a root commit"
+        );
+        assert!(commit
+            .tree()
+            .unwrap()
+            .get_path(Path::new("inbox.md"))
+            .is_ok());
+        let first = commit.id();
+
+        // The idempotent leg: what stops a 30-second timer writing an empty commit a
+        // thousand times a day.
+        let StartOutcome::Started(again) = fx
+            .svc
+            .start_job("notes", JobOp::Sync, OpRequest::manual())
+            .unwrap()
+        else {
+            panic!("expected a freshly started job");
+        };
+        settle(&fx.svc, "notes", &again).await;
+        let result = again.view(fx.svc.host_instance()).result.expect("result");
+        assert_eq!(result["outcome"], "no_changes");
+        assert_eq!(result["committed"], false);
+        assert_eq!(
+            repo.head().unwrap().target().unwrap(),
+            first,
+            "HEAD did not move"
+        );
+
+        // GitStatusSummary and git-state.json cope with a repo that has no remote.
+        let last = fx.svc.status_summary().repos[0]
+            .last_sync
+            .clone()
+            .expect("after_job recorded the sync");
+        assert!(last.ok);
+        assert_eq!(last.outcome.as_deref(), Some("no_changes"));
     }
 
     #[tokio::test]
@@ -2616,15 +2717,15 @@ mod tests {
             std::sync::Arc::new(SettingsOps { changed }),
         );
         svc.start();
-        // A remote is required for `sync` to be admitted at all — `remote_missing`
-        // is refused before a job record exists. `SettingsOps` never opens it, so
-        // the URL only has to be well-formed.
+        // No `remote`: §9.4's local-only repo is admitted for `sync`, and `SettingsOps`
+        // never opens anything anyway. The earlier fake URL existed only to get past an
+        // admission guard that should never have refused `sync` in the first place —
+        // which makes this fixture a free mutation check on that guard.
         svc.put_repo(
             "notes",
             serde_json::from_value(serde_json::json!({
                 "id": "notes",
                 "sync_settings": true,
-                "remote": dir.path().join("origin.git").display().to_string(),
             }))
             .unwrap(),
         )
