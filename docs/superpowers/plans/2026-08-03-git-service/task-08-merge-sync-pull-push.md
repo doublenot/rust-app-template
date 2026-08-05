@@ -7,7 +7,20 @@ reports success, and a missing `push_update_reference` drain reports a push that
 happened. None of those produce an error. All of them are caught only by a test that asserts
 on the *bytes on disk* afterwards, which is what the §10.3 matrix at the end of this task is.
 
-Three decisions run through the whole task, and the comments in the code say so:
+> **Amended by the post-execution audit (F5b, F6, F7).** Three corrections, all in this task's
+> code blocks and all corrected in place:
+> - **Every checkout on the merge path** now goes through one `checkout_or_refuse` (step 3),
+>   which is `safe()` and never `force()`, and which the two ref-moving arms call **before**
+>   they move a ref. The shipped code forced, and moved the ref first — which lost untracked
+>   data on a *successful* fast-forward, not merely on a failing one. See decision 4 below.
+> - **`merge_prefer_local`'s trailing `cleanup_state()`** kept its comment claiming to be
+>   defensive while it could in fact reach a human's merge state. `open_tree` now refuses such a
+>   tree before any of this runs (task 7), so the comment is true again.
+> - **`ops::sync` on an absent tree with no remote** refused with `no_worktree` instead of
+>   `init`ing. §9.4 promises a `remote: null` repo's sync "inits and commits", and the spec's own
+>   ops test plan had listed "sync with `remote: null` → `committed`" all along.
+
+Four decisions run through the whole task, and the comments in the code say so:
 
 1. **Never `Repository::merge`.** It writes `MERGE_HEAD`/`MERGE_MSG`, checks out immediately,
    and leaves `RepositoryState::Merge` behind until someone calls `cleanup_state()`.
@@ -21,6 +34,21 @@ Three decisions run through the whole task, and the comments in the code say so:
    normal.** libgit2 sets `ANALYSIS_FASTFORWARD` *together with* `ANALYSIS_NORMAL` (and
    together with `ANALYSIS_UNBORN`), so testing `is_normal()` first writes a spurious merge
    commit for every fast-forward.
+4. **The merge path checks out `safe()`, and always before it moves a ref.** Prefer-local is a
+   rule about files *git is tracking*; a file it is not is never overwritten, and a collision
+   with one refuses the whole operation with `409 dirty_tree` naming every blocked path. The
+   refusal is atomic — libgit2 counts the conflicts before it writes anything — which is what
+   makes checking out first the cheap option: a refused merge is byte-identical to where it
+   started and the next sync simply redoes it. Four tests assert exactly that, one per arm plus
+   the ignored-file case an unattended `auto_sync_secs` tick is the one that actually reaches:
+   `a_merge_refuses_to_overwrite_an_untracked_file`,
+   `a_fast_forward_refuses_to_overwrite_an_untracked_file`,
+   `adopting_a_remote_history_refuses_to_overwrite_an_untracked_file` and
+   `a_merge_refuses_to_overwrite_a_locally_ignored_file`. A fifth,
+   `every_mutating_verb_refuses_a_merge_a_human_left_behind`, sweeps task 7's state gate across
+   Sync/Pull/Commit/Push/Branch — its message assertions are load-bearing, because for `Branch`
+   libgit2's own safe checkout over an unmerged index produces the same `DirtyTree` code and
+   names neither the state nor `/reset`.
 
 **House rules for every step below:** unit tests live in a `#[cfg(test)] mod tests` at the
 bottom of the file they test; `tempfile` for filesystem tests; comments explain WHY (an
@@ -123,7 +151,8 @@ testkit` so both test modules use one copy.
     `clone_at(&Origin, &str) -> PathBuf`, `write_file(&Path, &str, &str)`,
     `read_file(&Path, &str) -> String`, `commit_all(&Path, &str) -> git2::Oid`,
     `push_main(&Path)`, `fetch_main(&Path) -> git2::Oid`, `head_of(&Path) -> git2::Oid`,
-    `origin_main(&Origin) -> git2::Oid`, `Job { pub ctx: OpCtx, .. }`,
+    `origin_main(&Origin) -> git2::Oid`, `hostile_global_config()`,
+    `Job { pub ctx: OpCtx, .. }`,
     `job(&Origin, &Path, JobOp) -> Job`, `job_local(&Path, JobOp) -> Job`,
     `job_with(Option<&Origin>, &Path, JobOp, OpRequest) -> Job`,
     `assert_no_merge_state(&Path)`.
@@ -344,7 +373,107 @@ pub fn conflict_path_bytes(c: &git2::IndexConflict) -> Result<Vec<u8>, GitError>
         .map(|e| e.path.clone())
         .ok_or_else(|| GitError::internal("index conflict with no entry on any stage"))
 }
+
+/// The one checkout on the merge path, shared by all three arms of `analyse`
+/// and by `merge_prefer_local`. None of them may `force()`.
+///
+/// Two independent switches are needed and the second is not implied by the
+/// first — libgit2's action table for a path the target ADDS which also exists
+/// in the working directory (`checkout.c`, `checkout_action_with_wd`) is:
+///
+/// ```text
+/// if (ignored) DONT_OVERWRITE_IGNORED ? CONFLICT : UPDATE_BLOB
+/// else                          FORCE ? UPDATE_BLOB : CONFLICT
+/// ```
+///
+/// So `force` overwrites an untracked `todo.md` **in place** — `remove_untracked`
+/// was never what protected it, that flag governs only files the target does not
+/// mention at all — and safe mode *on its own* still clobbers a gitignored
+/// `secret.env` the remote happens to track.
+///
+/// `recreate_missing(true)` is set on purpose: it fires only for a path with no
+/// working-directory entry, so it can destroy nothing, and without it a file the
+/// user deleted between `pull`'s dirty check and this call would turn a sync into
+/// a failure instead of simply being restored.
+///
+/// The refusal is atomic. `checkout_get_actions` counts every conflict and
+/// returns `GIT_ECONFLICT` before the remove and update passes run, so on `Err`
+/// nothing in the working tree, the index or any ref has moved — which is what
+/// lets the callers check out *before* they move a ref and treat a refusal as a
+/// perfect no-op the next sync simply redoes.
+///
+/// `checkout_tree`, never `checkout_head`: with no baseline supplied libgit2
+/// defaults it to the HEAD tree, so `checkout_head` has target == baseline, every
+/// delta is UNMODIFIED, and safe mode maps UNMODIFIED to "do nothing". A safe
+/// `checkout_head` is a silent no-op that reports success.
+fn checkout_or_refuse(
+    repo: &git2::Repository,
+    target: &git2::Object<'_>,
+    ctx: &OpCtx,
+) -> Result<(), GitError> {
+    ctx.phase(Phase::CheckingOut);
+    // libgit2's message for a refused checkout is a bare count — checkout.c
+    // formats "%zu conflict(s) prevent(s) checkout" and nothing else — and a count
+    // is not something the child process can act on. The notify callback is the
+    // only place the paths exist.
+    //
+    // Not `dry_run()`, which looks like it was made for this and is not: git2 0.21
+    // spells it as GIT_CHECKOUT_NONE, and checkout.c returns `*action = NONE` at
+    // the top of every action function, above every notify call. A dry run reports
+    // zero conflicts, notifies nothing and returns Ok.
+    let blocked: RefCell<Vec<String>> = RefCell::new(Vec::new());
+    let mut co = git2::build::CheckoutBuilder::new();
+    // `.safe()` FIRST, and never anywhere else in this chain: git2 0.21 spells
+    // safe/force/dry_run as `checkout_opts &= !((1 << 4) - 1)`, and
+    // GIT_CHECKOUT_RECREATE_MISSING is 1 << 2 — inside that mask. Tidying these
+    // five calls into a different order silently un-sets recreate_missing, and no
+    // test in this suite can see it. This comment is the only guard there is.
+    // (`overwrite_ignored` is 1 << 19 and survives either order.)
+    co.safe()
+        .overwrite_ignored(false)
+        .recreate_missing(true)
+        .notify_on(git2::CheckoutNotificationType::CONFLICT)
+        .notify(|_why, path, _baseline, _target, _workdir| {
+            if let Some(p) = path {
+                blocked.borrow_mut().push(p.display().to_string());
+            }
+            // Keep going: returning false stops the walk at the first collision,
+            // and one message naming every blocked file is worth more than one
+            // failure per file across as many retries.
+            true
+        });
+    let checked_out = repo.checkout_tree(target, Some(&mut co));
+    // Dropped explicitly, and before `into_inner`: `co` holds the closure, and the
+    // closure holds a borrow of `blocked`.
+    drop(co);
+    let blocked = blocked.into_inner();
+    match checked_out {
+        Ok(()) => Ok(()),
+        // Matched on the code rather than left to `classify`, which maps
+        // ErrorCode::Conflict to `merge_unresolvable` — right for an index that
+        // would not settle, wrong here, where the merge settled fine and it is the
+        // disk that says no.
+        Err(e) if e.code() == git2::ErrorCode::Conflict => Err(ctx.scrub_err(
+            GitError::checkout_would_overwrite(&blocked)
+                .with_repo(&ctx.def.id)
+                .with_git2(&e),
+        )),
+        Err(e) => Err(ctx.classify_err(&e)),
+    }
+}
 ```
+
+> **Amended by the post-execution audit (F6).** `checkout_or_refuse` did not exist: all three
+> arms of `analyse` and `merge_prefer_local` each built their own `CheckoutBuilder`, called
+> `co.force()`, and two of them moved a ref *first*. Measured against the vendored libgit2 1.9.6,
+> `force` does not *delete* an untracked file — it **overwrites** the ones that collide with the
+> target tree — so the shipped fast-forward lost data on **success**, not only on failure, and the
+> comment claiming "forcing is safe here and only here" was reasoning about tracked files only.
+> `.safe()` alone would still have clobbered a gitignored path the remote tracks, which is what
+> `overwrite_ignored(false)` is for and why M-C2 (deleting it and watching *only* the ignored-file
+> test go red) is the mutation that separates a complete fix from a half one.
+
+`checkout_or_refuse` needs `use std::cell::RefCell;` above the `crate::` imports.
 
 `Phase`, `bytes_to_path`, `now_ms` and `utc_stamp` are imported now because every later step in
 this task adds code that uses them; importing them here keeps the `use` block in one place.
@@ -385,9 +514,17 @@ existing `#[cfg(test)] mod tests` line:
 /// It lives here rather than in `ops.rs` because both test modules need it and a
 /// second copy would drift. It is `pub(crate)` and `#[cfg(test)]`, so it exists
 /// in no shipped build.
+///
+/// It is also **the crate's single gate onto libgit2 in tests**: every entry point
+/// below that names `git2` — plus `job_with`, whose `OpCtx` is handed straight to
+/// production code that does — opens with `hostile_global_config()`. The three that
+/// do neither (`origin_with_main`, `job`, `job_local`) delegate to one that does
+/// before touching anything, so the gate is already shut by the time they arrive.
+/// Read that function's SAFETY note before adding an entry point that skips it.
 #[cfg(test)]
 pub(crate) mod testkit {
     use std::path::{Path, PathBuf};
+    use std::sync::OnceLock;
     use std::time::{Duration, Instant};
 
     use tempfile::TempDir;
@@ -408,6 +545,33 @@ pub(crate) mod testkit {
         pub root: TempDir,
         pub bare: PathBuf,
     }
+
+    /// Move `hostile_global_config` here from `ops::tests` (task 7) and make it
+    /// `pub(crate)`, then delete task 7's copy and have `ops::tests::Fixture` call this
+    /// one. **Do not leave two copies**: a second `OnceLock` is a second, unordered
+    /// mutation of the same libgit2 global, which is the race the amendment below
+    /// records.
+    ///
+    /// > **Amended by the post-execution audit.** Task 7's helper mutates libgit2
+    /// > PROCESS-GLOBAL state — `git2::opts::set_search_path` for four `ConfigLevel`s —
+    /// > and its SAFETY comment argued the `OnceLock` sufficed because "every test enters
+    /// > through `Fixture::*` before it touches git2". This module made that false: its
+    /// > tests could be *inside* libgit2 while an ops fixture flipped the search path.
+    /// > Measured before the fix: 40 consecutive full-suite runs, 1 failed, `clone_at`
+    /// > panicking with "the repository is not empty". `clone_into` refuses when
+    /// > `git_repository_is_empty` is false, and that compares HEAD's symbolic target
+    /// > against `git_repository_initialbranch`, which reads `init.defaultBranch` back
+    /// > through the search path — so a flip between a clone's `git_repository_init` and
+    /// > its emptiness check makes a fresh repository stop looking empty. Deliberately
+    /// > reproduced: 172–188 of 400 clones failed with one thread flipping, 0 of 400
+    /// > without. `git::mod`'s `service_planted` and `git::error`'s refused-connect test
+    /// > need the gate too, and they are outside this task's two files — take them anyway
+    /// > (task 9 and task 3), because a partially closed race is worse than an obvious one.
+    /// > A race cannot be pinned by an assertion, so verify empirically: 250 consecutive
+    /// > full-suite runs, 250 passed.
+    ///
+    /// (Body: verbatim from `ops::tests`, with the corrected SAFETY comment.)
+    pub(crate) fn hostile_global_config() { /* … */ }
 
     /// Remotes are the bare repo's plain absolute path, never a `file://` URL:
     /// that sidesteps Windows drive-letter parsing in libgit2 entirely.
@@ -1339,35 +1503,42 @@ pub fn analyse(repo: &git2::Repository, ctx: &OpCtx) -> Result<MergeOutcome, Git
     }
 
     if analysis.is_unborn() {
-        // Reachable only when the tree was genuinely empty: sync commits
-        // everything before it fetches, so an unborn HEAD here means there was
-        // nothing to commit and the forced checkout below can lose nothing.
-        ctx.phase(Phase::CheckingOut);
+        // "Nothing to commit" is not "nothing on disk". A `pull` never stages at
+        // all and a `sync` skips everything .gitignore covers, so an unborn HEAD
+        // still allows a working tree full of files this history knows nothing
+        // about — and with no HEAD there is no baseline, so libgit2 sees every
+        // remote path as an add and every local file at one of them as a
+        // collision. Check out first and let it refuse; create the branch and
+        // attach HEAD only once the tree has accepted the history, so a refusal
+        // does not leave a `main` standing over a tree that never matched it.
+        let their_commit = repo
+            .find_commit(their_oid)
+            .map_err(|e| ctx.classify_err(&e))?;
+        checkout_or_refuse(repo, their_commit.as_object(), ctx)?;
         repo.reference(&refname, their_oid, true, "sync: adopt remote history")
             .map_err(|e| ctx.classify_err(&e))?;
         repo.set_head(&refname).map_err(|e| ctx.classify_err(&e))?;
-        let mut co = git2::build::CheckoutBuilder::new();
-        co.force();
-        repo.checkout_head(Some(&mut co))
-            .map_err(|e| ctx.classify_err(&e))?;
         return Ok(MergeOutcome::AdoptedRemote { head: their_oid });
     }
 
     if analysis.is_fast_forward() {
         // Repository::merge does NOT fast-forward and does NOT move HEAD; it
-        // leaves RepositoryState::Merge behind for someone else to clean up.
-        // Do the ref surgery ourselves.
-        ctx.phase(Phase::CheckingOut);
+        // leaves RepositoryState::Merge behind for someone else to clean up. Do
+        // the ref surgery ourselves — but only after the working tree has taken
+        // the remote's version. This is the one shape where the remote's tree
+        // lands verbatim, so it is also the one most likely to claim a path some
+        // local scratch file already occupies; moving the branch first would leave
+        // that refusal looking like a checkout that merely never ran.
+        let their_commit = repo
+            .find_commit(their_oid)
+            .map_err(|e| ctx.classify_err(&e))?;
+        checkout_or_refuse(repo, their_commit.as_object(), ctx)?;
         let mut r = repo
             .find_reference(&refname)
             .map_err(|e| ctx.classify_err(&e))?;
         r.set_target(their_oid, "sync: fast-forward")
             .map_err(|e| ctx.classify_err(&e))?;
         repo.set_head(&refname).map_err(|e| ctx.classify_err(&e))?;
-        let mut co = git2::build::CheckoutBuilder::new();
-        co.force();
-        repo.checkout_head(Some(&mut co))
-            .map_err(|e| ctx.classify_err(&e))?;
         return Ok(MergeOutcome::FastForward { head: their_oid });
     }
 
@@ -1876,8 +2047,20 @@ pub fn sync(ctx: &OpCtx) -> Result<OpOutcome, GitError> {
     // A sync of a repo that was never materialised is a clone: the caller asked
     // for "make this tree match the remote", and there is no earlier step they
     // should have had to run first.
-    if !ctx.tree.exists() && ctx.def.remote.is_some() {
-        return clone(ctx);
+    if !ctx.tree.exists() {
+        if ctx.def.remote.is_some() {
+            return clone(ctx);
+        }
+        // The same rule with nothing to clone from: README §9.4's `remote: null` is a
+        // local-only repo and `sync` is the only verb its child ever calls, so `init`
+        // is not an earlier step it should have had to run either. `init` and not a
+        // bare `create_dir_all`, because only `init` pins `refs/heads/<def.branch>`
+        // against the developer's global `init.defaultBranch`. It falls through rather
+        // than returning: an init leaves an unborn HEAD, and the commit below is the
+        // half of "sync" a local-only repo actually has. `open_tree`'s state gate is
+        // fine with what this leaves — `RepositoryState` is read from marker files a
+        // fresh init has none of, never from HEAD or the index.
+        init(ctx)?;
     }
 
     let repo = open_tree(ctx)?;
@@ -2125,28 +2308,29 @@ pub fn merge_prefer_local(
         ts = utc_stamp(now_ms()),
     );
 
-    // Parent 0 is ours and parent 1 is theirs, which is what makes
-    // `git show <merge>^2:<path>` the recovery command the message promises.
-    // Some("HEAD") advances the branch ref and leaves HEAD attached.
     let tree = repo
         .find_tree(tree_oid)
         .map_err(|e| ctx.classify_err(&e))?;
+
+    // Check out BEFORE committing, which is what makes a refusal safe to have at
+    // all. `merge_commits` never touched the repository, so up to this line the
+    // whole merge is still a no-op; putting the one step that can refuse ahead of
+    // the one step that moves a ref is what leaves a refused merge byte-identical
+    // to where it started, so the next sync simply redoes it. The other order can
+    // only ever fail after HEAD is already on a tree nobody wrote.
+    checkout_or_refuse(repo, tree.as_object(), ctx)?;
+
+    // Parent 0 is ours and parent 1 is theirs, which is what makes
+    // `git show <merge>^2:<path>` the recovery command the message promises.
+    // Some("HEAD") advances the branch ref and leaves HEAD attached.
     let merge_commit = repo
         .commit(Some("HEAD"), &sig, &sig, &msg, &tree, &[&ours, &theirs])
         .map_err(|e| ctx.classify_err(&e))?;
 
-    ctx.phase(Phase::CheckingOut);
-    // Forcing is safe here and only here: the merged tree was computed from
-    // `ours`, which the commit-all step already wrote, so there is no
-    // uncommitted tracked work for it to destroy. `force` alone does not remove
-    // untracked files — `remove_untracked` is deliberately not set.
-    let mut co = git2::build::CheckoutBuilder::new();
-    co.force();
-    repo.checkout_head(Some(&mut co))
-        .map_err(|e| ctx.classify_err(&e))?;
-    // Defensive: merge_commits sets no MERGE_HEAD, so there should be nothing to
-    // clean. If an earlier operation left state behind, this is the one place
-    // that reliably runs after a successful merge.
+    // Defensive, and it can no longer reach a human's merge state: `open_tree`
+    // refuses a non-Clean repository before any of this runs, and merge_commits
+    // sets no MERGE_HEAD of its own. The one window nothing can close is a human
+    // running `git merge` in the tree while this job is already running.
     let _ = repo.cleanup_state();
 
     Ok(Some(MergeResult {
@@ -2761,7 +2945,7 @@ These two lock in decisions that are invisible in a diff: one line that was *not
 
 ```rust
     #[test]
-    fn untracked_file_survives_a_merge_sync() {
+    fn an_ignored_file_survives_a_merge_sync() {
         let o = origin_with_main();
         let a = clone_at(&o, "a");
         // Ignored, so `git add -A` does not quietly turn it into a tracked file
@@ -2790,8 +2974,10 @@ These two lock in decisions that are invisible in a diff: one line that was *not
         let out = ops::sync(&fx.ctx).expect("sync");
 
         assert_eq!(out.outcome, "merged");
-        // The merge checks out with force(); force alone does not remove
-        // untracked files, and `remove_untracked` is deliberately never set.
+        // `scratch.txt` is on neither side of the remote, so the merge tree has no
+        // delta for it at all: only `remove_ignored` could have taken it, and that
+        // is deliberately never set. The *colliding* ignored file is a different
+        // arm — see `a_merge_refuses_to_overwrite_a_locally_ignored_file`.
         assert_eq!(read_file(&a, "scratch.txt"), "not committed\n");
 
         let repo = git2::Repository::open(&a).expect("open a");
@@ -2858,11 +3044,13 @@ Expected: PASS — `test result: ok. 17 passed; 0 failed`. **These two are expec
 the first run**: no production code changes for them, because the behaviour they lock in is
 already correct. That makes them worth falsifying once, so you know they are not vacuous:
 
-1. In `merge_prefer_local`, temporarily change `co.force();` to
-   `co.force().remove_untracked(true);` and re-run.
-   Expected: FAIL — `untracked_file_survives_a_merge_sync` panics with
+1. In `checkout_or_refuse`, temporarily add `.remove_ignored(true)` to the builder chain
+   and re-run.
+   Expected: FAIL — `an_ignored_file_survives_a_merge_sync` panics with
    `read file: Os { code: 2, kind: NotFound, message: "No such file or directory" }`.
-   Revert.
+   Revert. (`remove_untracked(true)`, which this step used to prescribe, changes nothing
+   here: the scratch file is gitignored — it has to be, or `sync`'s `add -A` would commit
+   it — and an ignored file is invisible to `remove_untracked`.)
 2. In `merge_prefer_local`, temporarily replace the `let _ = repo.cleanup_state();` line with
    `repo.merge(&[], None, None).ok();` and re-run.
    Expected: FAIL — `no_merge_state_is_ever_left` panics on
@@ -2877,9 +3065,9 @@ Confirm `cargo test --bin chrome-host-app git::merge` is green again before comm
 git add src/git/merge.rs
 git commit -m "test(git): lock in the two merge decisions that are invisible in a diff
 
-remove_untracked is never set on the merge's forced checkout, and
-Repository::merge is never called. Both are absences, so only a test that
-asserts on the tree afterwards can defend them."
+remove_ignored is never set on the merge's safe checkout, and Repository::merge
+is never called. Both are absences, so only a test that asserts on the tree
+afterwards can defend them."
 ```
 
 ---

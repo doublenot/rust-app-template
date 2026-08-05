@@ -6,6 +6,18 @@ progress throttling, and in-memory retention. It has **no `git2` import** — th
 primitive over `FnOnce`, and the fact that it never names libgit2, axum, tokio or the
 filesystem is what makes 21 tests run in under a millisecond with **zero `sleep` calls**.
 
+> **Amended by the post-execution audit (F1, F8).** Two corrections, both about *ownership of an
+> index entry*, and they are one rule seen twice — say so in the comments, because a reader who
+> meets them separately will read them as a coincidence:
+> - **Step 48's `drop_job`** removed the `by_request` entry unconditionally. `admit` re-points that
+>   key at a fresh job when a failed op is retried under the same `request_id`, so evicting the
+>   superseded record deleted the **live successor's** entry and turned the next matching retry
+>   into the 409 the replay-before-busy rule promises is impossible. Corrected in place below.
+> - **`Inner.busy`** was `BTreeMap<String, JobId>`, so the host itself had no way to take the
+>   entry and `put_repo`/`delete_repo` could only sample it. Its value type is now `BusyBy`
+>   throughout this task, and **Step 63** (appended at the end) adds `hold_repo`, `RepoHold` and
+>   the file-private `repo_locked` constructor.
+
 Three decisions drive the whole design and every one of them is load-bearing:
 
 1. **One flat `std::sync::Mutex`.** Not `tokio::sync`: the only writer of `Progress` is
@@ -13,7 +25,9 @@ Three decisions drive the whole design and every one of them is load-bearing:
    never `.await`, so an async mutex there is a bug waiting to be written.
 2. **Per-repo exclusion is a `BTreeMap` entry**, not a mutex per repo. No allocation, no
    lifetime question, no poisoning from a panicking job, and two different repos are
-   parallel for free because they are two different keys.
+   parallel for free because they are two different keys. One entry, two possible holders
+   (`BusyBy::Job` / `BusyBy::Maintenance`) — never two maps, because a second map is a hole
+   in the exclusion that no compiler error points at.
 3. **The clock is injected** (`NowFn`, from task 3). Retention has three time-based rules
    and progress has one; testing any of them against the wall clock would mean sleeping.
 
@@ -129,6 +143,7 @@ written. Do not re-wrap the code — rustfmt will split it straight back.
   impl Admission { pub fn slot(&self) -> &std::sync::Arc<JobSlot>; }
 
   pub struct RepoLease;                    // no public constructor
+pub struct RepoHold;                     // no public constructor either; `hold_repo` (step 63)
   impl RepoLease { pub fn job(&self) -> &std::sync::Arc<JobSlot>; }
   impl Drop for RepoLease;
 
@@ -142,6 +157,10 @@ written. Do not re-wrap the code — rustfmt will split it straight back.
       pub fn get(&self, id: &JobId) -> Option<std::sync::Arc<JobSlot>>;
       pub fn lookup(&self, raw: &str) -> Result<std::sync::Arc<JobSlot>, GitError>;
       pub fn list(&self, filter: &JobFilter) -> Vec<std::sync::Arc<JobSlot>>;
+      pub fn hold_repo(self: &std::sync::Arc<Self>, repo_id: &str)
+                   -> Result<RepoHold, GitError>;              // step 63
+      /// The `BusyBy::Job` arm only — a `RepoHold` answers `None`, so nothing may use
+      /// this to decide whether a repo is free.
       pub fn busy(&self, repo_id: &str) -> Option<std::sync::Arc<JobSlot>>;
       pub fn live_jobs(&self) -> Vec<std::sync::Arc<JobSlot>>;
       pub fn set_draining(&self, draining: bool);
@@ -1415,8 +1434,9 @@ impl Drop for RepoLease {
             .finish_if_running(GitError::internal("git worker terminated unexpectedly"));
         let mut inner = self.store.lock();
         // Only clear the entry if it is still ours: `forget_repo` may have dropped it,
-        // and clearing a *different* job's lock would break exclusion.
-        if inner.busy.get(&self.repo_id) == Some(&self.job.id) {
+        // and clearing a *different* holder's entry — another job's, or a `RepoHold`'s —
+        // would break exclusion.
+        if matches!(inner.busy.get(&self.repo_id), Some(BusyBy::Job(id)) if *id == self.job.id) {
             inner.busy.remove(&self.repo_id);
         }
     }
@@ -1429,11 +1449,25 @@ pub struct JobStore {
     now: NowFn,
 }
 
+/// Who holds a repo. Two arms of one value rather than two maps: `busy` is THE lock, and
+/// a reader that pattern-matches on it cannot forget that the host itself takes repos
+/// too — a second `maintenance` set could grow a hole in the exclusion with nobody
+/// noticing, whereas changing this map's value type makes every missed reader a compile
+/// error. Step 63 adds the second arm's producer.
+enum BusyBy {
+    /// A running job. `Admission::Busy` hands it back and `status.busy_job` reports it.
+    Job(JobId),
+    /// `put_repo`/`delete_repo`: the host rewriting the registry entry, and on DELETE
+    /// removing the tree. There is no job to embed, which is why an admission blocked by
+    /// one is an `Err(repo_locked)` and not an `Admission`.
+    Maintenance,
+}
+
 #[derive(Default)]
 struct Inner {
     jobs: BTreeMap<JobId, Arc<JobSlot>>,
-    /// repo_id -> the job holding it. THE LOCK.
-    busy: BTreeMap<String, JobId>,
+    /// repo_id -> whoever holds it. THE LOCK.
+    busy: BTreeMap<String, BusyBy>,
 }
 
 impl JobStore {
@@ -1476,7 +1510,13 @@ impl JobStore {
         // Busy check. The map entry is the lock, not the job's state: `after_job` still
         // has work to do after a slot goes terminal, and a second libgit2 operation on
         // the same working tree would corrupt the index.
-        let busy_id = inner.busy.get(repo_id).cloned();
+        let busy_id = match inner.busy.get(repo_id) {
+            Some(BusyBy::Job(id)) => Some(id.clone()),
+            // The host itself holds it (step 63). An `Err` and not an `Admission`,
+            // because there is no job to hand back.
+            Some(BusyBy::Maintenance) => return Err(repo_locked(repo_id)),
+            None => None,
+        };
         if let Some(busy_id) = busy_id {
             match inner.jobs.get(&busy_id).cloned() {
                 Some(busy) => return Ok(Admission::Busy(busy)),
@@ -1497,7 +1537,7 @@ impl JobStore {
             self.now.clone(),
         ));
         inner.jobs.insert(slot.id.clone(), slot.clone());
-        inner.busy.insert(repo_id.to_string(), slot.id.clone());
+        inner.busy.insert(repo_id.to_string(), BusyBy::Job(slot.id.clone()));
         drop(inner);
 
         let lease = RepoLease {
@@ -1514,8 +1554,14 @@ impl JobStore {
 
     pub fn busy(&self, repo_id: &str) -> Option<Arc<JobSlot>> {
         let inner = self.lock();
-        let id = inner.busy.get(repo_id)?;
-        inner.jobs.get(id).cloned()
+        match inner.busy.get(repo_id)? {
+            BusyBy::Job(id) => inner.jobs.get(id).cloned(),
+            // A hold is not a job: `status.busy_job` and `error.job` are job references
+            // and there is nothing to point them at while the host owns the repo. Which
+            // is exactly why nothing may use this to decide whether a repo is free —
+            // see `hold_repo` in step 63.
+            BusyBy::Maintenance => None,
+        }
     }
 
     pub fn live_jobs(&self) -> Vec<Arc<JobSlot>> {
@@ -1661,8 +1707,8 @@ Add the third field to `Inner`:
 #[derive(Default)]
 struct Inner {
     jobs: BTreeMap<JobId, Arc<JobSlot>>,
-    /// repo_id -> the job holding it. THE LOCK.
-    busy: BTreeMap<String, JobId>,
+    /// repo_id -> whoever holds it. THE LOCK.
+    busy: BTreeMap<String, BusyBy>,
     by_request: BTreeMap<(String, String), JobId>,
 }
 ```
@@ -1702,7 +1748,7 @@ and index the new job, replacing the `inner.busy.insert(...)` / `drop(inner);` p
 the end of `admit` with:
 
 ```rust
-        inner.busy.insert(repo_id.to_string(), slot.id.clone());
+        inner.busy.insert(repo_id.to_string(), BusyBy::Job(slot.id.clone()));
         if let Some(rid) = request_id {
             inner
                 .by_request
@@ -2064,8 +2110,8 @@ struct Inner {
     jobs: BTreeMap<JobId, Arc<JobSlot>>,
     /// Oldest first. Live jobs are never in here, which is what makes rule 3 free.
     terminal: VecDeque<JobId>,
-    /// repo_id -> the job holding it. THE LOCK.
-    busy: BTreeMap<String, JobId>,
+    /// repo_id -> whoever holds it. THE LOCK.
+    busy: BTreeMap<String, BusyBy>,
     by_request: BTreeMap<(String, String), JobId>,
 }
 ```
@@ -2124,9 +2170,23 @@ impl Inner {
     fn drop_job(&mut self, id: &JobId) {
         self.terminal.retain(|q| q != id);
         if let Some(slot) = self.jobs.remove(id) {
-            // Rule 5: the id becomes reusable the moment its record goes.
+            // Rule 5: the id becomes reusable the moment its record goes — but only
+            // while the index still names *this* job. `admit` re-points the key at a
+            // fresh job when a failed op is retried under the same `request_id`, and the
+            // superseded record stays here until retention takes it, so evicting it must
+            // not delete the successor's entry: that would answer the next matching
+            // retry with the 409 the replay-before-busy rule promises is impossible.
+            // Same ownership test `RepoLease::drop` applies to `busy`, for the same
+            // reason — the two are one rule about two indexes, not a coincidence.
+            //
+            // Sound only because `jobs` is keyed by `JobId` and `slot.id == *id`; a
+            // future change that files a slot under some other key must compare against
+            // `Some(&slot.id)` instead.
             if let Some(rid) = slot.request_id.clone() {
-                self.by_request.remove(&(slot.repo_id.clone(), rid));
+                let key = (slot.repo_id.clone(), rid);
+                if self.by_request.get(&key) == Some(id) {
+                    self.by_request.remove(&key);
+                }
             }
         }
     }
@@ -2148,7 +2208,7 @@ Wire it into the three call sites.
         let mut inner = self.store.lock();
         // Only clear the entry if it is still ours: `forget_repo` may have dropped it,
         // and clearing a *different* job's lock would break exclusion.
-        if inner.busy.get(&self.repo_id) == Some(&self.job.id) {
+        if matches!(inner.busy.get(&self.repo_id), Some(BusyBy::Job(id)) if *id == self.job.id) {
             inner.busy.remove(&self.repo_id);
         }
         inner.terminal.push_back(self.job.id.clone());
@@ -2479,3 +2539,123 @@ git commit -m "chore(git): fmt and clippy pass over the job store"
 
 If `cargo fmt` changed nothing there is nothing to commit here; skip the commit and the
 task is done at Step 60.
+
+- [ ] **Step 63: `hold_repo` — let the host itself take a repo** *(post-execution audit, F8)*
+
+> **Added by the post-execution audit.** `JobStore::busy` drops the lock before it returns, so
+> `GitService::put_repo`/`delete_repo` were only ever **sampling** it: an auto-sync tick admitted
+> in the gap between the sample and the purge left libgit2 writing into the directory
+> `remove_dir_all` was walking, and the refused-purge early return left a `last_sync` row and job
+> records behind for an id that was no longer registered. `BusyBy` (step 30) is half of the fix;
+> this step is the other half. Task 9's `put_repo`/`delete_repo` take a `RepoHold` for the whole
+> call — see the amendment there.
+
+Add the constructor and the guard type to `src/git/jobs.rs`, immediately after
+`impl Drop for RepoLease`:
+
+```rust
+/// The host itself holds the repo: a `PUT` or `DELETE` is rewriting the registry entry
+/// and, on `DELETE`, removing the tree.
+///
+/// Not `repo_busy`, which embeds the running job in `error.job` and which `api.rs`
+/// documents a client as keying off: a maintenance hold has no job to embed, and
+/// inventing a job-shaped thing to point at would put an unpollable record with no
+/// progress and no result into `GET /api/git/jobs`. `RepoLocked` is 409/retryable, which
+/// is honest here — the hold is released before the call that took it returns.
+///
+/// Lives here rather than beside `error::repo_busy` only to keep this change set's file
+/// sets disjoint; it belongs there once the audit's three groups have landed.
+fn repo_locked(repo_id: &str) -> GitError {
+    GitError::new(
+        GitErrorCode::RepoLocked,
+        format!("repo {repo_id:?} is locked while its definition or tree is being changed"),
+    )
+    .with_repo(repo_id)
+}
+
+#[must_use = "the repo is released when this is dropped; bind it for the whole call"]
+pub struct RepoHold {
+    store: Arc<JobStore>,
+    repo_id: String,
+}
+
+impl Drop for RepoHold {
+    fn drop(&mut self) {
+        let mut inner = self.store.lock();
+        // Same ownership guard as `RepoLease::drop`, defensively: nothing today can
+        // replace a hold with another holder, and this is what keeps a future path that
+        // can from having this drop clear a job's lock.
+        if matches!(inner.busy.get(&self.repo_id), Some(BusyBy::Maintenance)) {
+            inner.busy.remove(&self.repo_id);
+        }
+    }
+}
+```
+
+Add `GitErrorCode` to the file's `use crate::git::error::…` list, and add to `impl JobStore`,
+immediately after `admit`:
+
+```rust
+    /// Take a repo for the host itself. `repo_busy` when a job holds it — the same 409 a
+    /// second job gets, naming the op the caller can see running — and `repo_locked`
+    /// when another maintenance call already has it.
+    ///
+    /// Deliberately not a `JobOp` admitted through `admit`: a DELETE has no progress, no
+    /// result and nothing to poll, and a job record for it would outlive the repo it
+    /// names. It reads and writes the same map entry under the same one acquisition of
+    /// `inner`, which is the whole of the exclusion.
+    ///
+    /// No `draining` check, unlike `admit`: it would turn DELETE into 503 during quit for
+    /// no benefit. DELETE is idempotent, and exclusion against the quit-syncs already
+    /// comes from their leases.
+    pub fn hold_repo(self: &Arc<Self>, repo_id: &str) -> Result<RepoHold, GitError> {
+        let mut inner = self.lock();
+        let busy_op = match inner.busy.get(repo_id) {
+            Some(BusyBy::Job(id)) => inner.jobs.get(id).map(|slot| slot.op),
+            Some(BusyBy::Maintenance) => return Err(repo_locked(repo_id)),
+            None => None,
+        };
+        if let Some(op) = busy_op {
+            return Err(GitError::repo_busy(repo_id, op.as_str()));
+        }
+        // Falling through overwrites a `Job` entry with no slot behind it: that is not a
+        // lock, and `admit` heals it the same way.
+        inner.busy.insert(repo_id.to_string(), BusyBy::Maintenance);
+        drop(inner);
+        Ok(RepoHold {
+            store: self.clone(),
+            repo_id: repo_id.to_string(),
+        })
+    }
+```
+
+**Replay still runs first.** `admit`'s `by_request` lookup precedes the `BusyBy::Maintenance` arm,
+so a *matching* `request_id` replays past a hold — a replay hands back an existing record and
+touches no tree, which is what keeps §3.4's "a matching `request_id` can never come back as 409"
+true now that a PUT/DELETE holds the repo for its whole call. An *unknown* `request_id` falls
+through to the hold check like any other admission.
+
+Five tests, at the end of `mod tests`:
+
+- `a_maintenance_hold_and_a_job_exclude_each_other` — hold an idle repo; `admit` (with and
+  without an unknown `request_id`) errs `repo_locked`; a second `hold_repo` errs `repo_locked`;
+  `busy("notes").is_none()` and `list(&default)`/`live_jobs()` are empty, because a hold is not a
+  job; `admit("other")` is `Started`; drop; `admit("notes")` is `Started` again.
+- `repo_locked_is_a_retryable_409_that_names_the_repo` — code `RepoLocked`,
+  `repo_id == Some("notes")`, `http_status() == 409`, `retryable() == true`.
+- `a_hold_is_refused_while_a_job_owns_the_repo` — `hold_repo` errs `repo_busy` naming the op;
+  after the worker joins it succeeds, and `admit` then errs `repo_locked` — which proves the
+  lease's guard did not clear the hold on its way out.
+- `a_hold_and_an_admission_can_never_both_win` — the race, with real threads and no sleeps: 64
+  rounds, a fresh store per round, two threads and two `Barrier(2)` so both outcomes are
+  simultaneous rather than sequential; `assert_ne!(admitted, held)`.
+- `forget_repo_never_clears_a_hold` — guards the invariant that a future `forget_repo` touching
+  `busy` would unlock the repo one line before the purge.
+
+And two for F1's guard in `drop_job` (step 48), which is a different index and the same rule:
+
+- `evicting_a_superseded_record_keeps_the_live_successors_request_id` — fail a job under `"r1"`,
+  retry under `"r1"` (`Started`), advance the injected clock past `JOB_TTL_SECS`, and a third
+  `admit` with `"r1"` must be `Replay(fresh)`. Eviction is driven through `admit`'s own `evict()`,
+  never by calling `drop_job` directly; no sleeps.
+- `forget_repo_leaves_a_live_successors_request_id_alone` — the other `drop_job` call site.

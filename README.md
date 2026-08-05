@@ -131,7 +131,7 @@ Full documentation in §9.
 | `tray_sync` | bool | `false` | Adds a "Sync now" entry to the tray menu, immediately above "Restart App". It only appears once at least one repo is defined. |
 | `error_dialogs` | bool | `false` | Show a native dialog when a repo's sync starts failing, **and** when a sync succeeded but overwrote a remote edit (§9.2). Both are suppressed while the app is in tray mode. |
 | `status_api` | bool | `false` | Adds a `git` key to `GET /api/status` summarising each repo's last sync. Off by default so the response stays byte-identical to a host with no `[git]` section. |
-| `registry_writes` | bool | `true` | `false` makes `<data-dir>/repos.json` author-owned: `PUT` and `DELETE /api/git/repos/{id}` answer `403 registry_read_only`, and the app can only sync the repos you shipped. |
+| `registry_writes` | bool | `true` | `false` makes `<data-dir>/repos.json` author-owned: `PUT` and `DELETE /api/git/repos/{id}` answer `403 registry_read_only`, and the app can only sync the repos you shipped. Not the only thing that closes writes — a `repos.json` the host could neither read nor quarantine does too (§9.7) — so a client must not read `registry_writable: false` in `GET /api/git` as "the author set this key". The fault case is the one that also carries a `registry_error`. |
 | `default_branch` | string | `"main"` | Branch used by repo definitions that do not name one. Must be a valid branch name: non-empty, ≤ 200 bytes, only `[A-Za-z0-9._/-]`, no `..`, no `//`, no leading `-` or `/`, no trailing `/`, not ending in `.lock`, not exactly `@`, no ASCII control characters. |
 | `author_name` | string | `""` | Commit author name. Empty means `[app].name`. Must not contain `<`, `>` or newlines — a git signature cannot represent them. |
 | `author_email` | string | `""` | Commit author email. Empty means `<identifier>@<hostname>`. If set, must contain `@` and no `<`, `>` or whitespace. |
@@ -229,12 +229,18 @@ every git endpoint. Three consequences worth acting on:
   loopback caller can still *use* a stored credential to push, so scope what it
   can reach.
 - **A stored credential is only ever sent to the host it was stored against.**
-  Its `bound_host` is recorded when you save it. A `PUT` that repoints the
-  remote at a different host **drops** the credential and returns an
-  `auth_unbound` warning, and an operation that would need an unbound
-  credential fails `auth_unbound` rather than transmitting it. That closes the
-  worst primitive the feature would otherwise create: repoint a repo at an
-  attacker's host, trigger a fetch, receive the user's PAT.
+  Its `bound_host` is recorded when you save it, and a `PUT` that omits
+  `credential` keeps the stored one **only while the remote still resolves to
+  that same host** — the plain equality, with "no host" as a value like any
+  other. An absent `bound_host` is not a wildcard: a credential saved next to a
+  hostless remote (`file://`, a local path, or no remote at all) is bound to
+  nothing, and it is kept only while that stays true. So all three of these
+  **drop** it and return an `auth_unbound` warning: repointing the remote at a
+  different host, removing the remote, and giving a hostless remote a real one.
+  An operation that would need an unbound credential fails `auth_unbound`
+  rather than transmitting it. That closes the worst primitive the feature
+  would otherwise create: repoint a repo at an attacker's host, trigger a
+  fetch, receive the user's PAT.
 - **If your repos are author-declared, set `registry_writes = false`.** The app
   can then only sync the remotes you shipped; `PUT` and `DELETE` answer
   `403 registry_read_only`.
@@ -273,7 +279,7 @@ startup):
 | `settings.json` | Persisted settings values, keyed by settings field `key`. |
 | `app.lock` | Single-instance lock file; prevents two copies of the app running against the same identifier at once. |
 | `repos/` | One working tree per defined repo, at `repos/<id>/`. Each is an ordinary git repository you can `cd` into and run `git` in. Created by the git service on first use; never created when `[git]` is absent. |
-| `repos.json` | Git repo definitions, **including credentials**. `0600` on unix. Written only by `PUT`/`DELETE /api/git/repos/{id}` — never by a sync, a timer or a job. Read once at startup; not hot-reloaded. A file that fails to parse is renamed to `repos.json.corrupt-<epoch_ms>` and never deleted. |
+| `repos.json` | Git repo definitions, **including credentials**. `0600` on unix. Written only by `PUT`/`DELETE /api/git/repos/{id}` — never by a sync, a timer or a job. Read once at startup; not hot-reloaded. Bytes the host **has** and cannot use — not UTF-8, not valid JSON, wrong shape — are renamed to `repos.json.corrupt-<epoch_ms>` and never deleted, and the registry stays writable. A file it could not **read** at all (permissions, I/O, a directory in its place) is deliberately left exactly where it is: renaming a file we never read is a bigger act than refusing to write one, so instead every registry write is refused until it can be read or moved aside (§9.7). |
 | `git-state.json` | Host-owned volatile git state: each repo's last sync outcome and its pinned SSH host fingerprint. Rewritten after every finished job. Never contains a secret; safe to delete, at the cost of the last-sync record and the host-key pin. |
 
 ## 7. Building and packaging
@@ -478,8 +484,39 @@ Non-overlapping edits to the same file merge normally — the whole-file rule
 only applies to a hunk git could not reconcile on its own. Deletes follow the
 same rule: a local delete beats a remote modify, and a local modify beats a
 remote delete. A local file colliding with a remote *directory* of the same
-name is refused outright (`merge_path_type_conflict`) rather than guessed at;
-the tree is left untouched.
+name is refused outright (`merge_path_type_conflict`) rather than guessed at.
+
+**Prefer-local only ever applies to files git is tracking.** A file it is not —
+untracked, or covered by `.gitignore` — is never overwritten. If the remote
+starts tracking a path such a file already occupies, the whole operation is
+refused with `409 dirty_tree`, not retryable, naming every colliding path. That
+is deliberately not the same rule as the merge above: an untracked file has no
+second parent to recover it from, so there is no version of "keep the local
+copy" that also lets the remote's copy land. It refuses even when the two files
+are byte-identical — nothing has told git the local one is the same. That is
+mostly a `pull` story, since `pull` never stages; a `sync` stages first, so its
+untracked files become tracked ones and take the prefer-local path instead.
+Ignored files are the case that survives staging, and so the case an unattended
+timer actually hits.
+
+Every refusal on this path leaves the repository byte-identical to where it
+started — the working tree, the index and every ref, the `merge_path_type_conflict`
+case included. The checkout runs *before* any ref moves and libgit2 counts the
+collisions before it writes anything, so a refused sync is a perfect no-op that
+the next sync simply redoes once the file is out of the way.
+
+> **A repository this host finds mid-merge, mid-rebase or mid-cherry-pick was
+> put there by a human.** Nothing in this service leaves one that way: its own
+> merge is computed in memory and never writes `MERGE_HEAD`. So every mutating
+> verb except `reset` refuses such a tree with `409 dirty_tree`, naming the
+> state and handing back the exact reset body that discards it. That includes
+> `push`, which real git allows mid-merge — a `push`-shaped hole in the rule is
+> something every future reader would have to re-derive, and the cost is one
+> `reset` or `git merge --abort` before publishing. The service never runs
+> `cleanup_state()` or `reset --hard` on its own initiative: committing over an
+> interrupted merge would stage the `<<<<<<<` markers as resolved content,
+> record the branch being merged nowhere, delete the `MERGE_HEAD` that proves
+> what was in flight, and then publish all of it.
 
 ### 9.3 Endpoints
 
@@ -511,22 +548,38 @@ milliseconds and carry an `_ms` suffix.
 Notes on the shape:
 
 - **`sync` is the verb you want**, and the only one most callers need. Tree
-  absent → clone. No `remote` → stage and commit only. Otherwise: stage
-  everything not ignored, commit if dirty, fetch, merge (§9.2), push. Send
-  `push: false` to keep it local.
+  absent → clone, or `init` when there is no remote. No `remote` → stage and
+  commit only. Otherwise: stage everything not ignored, commit if dirty, fetch,
+  merge (§9.2), push. Send `push: false` to keep it local.
 - **The three GET reads are synchronous, not jobs**, and they deliberately do
   *not* wait for a job running on the same repo — observing a repo while it
   syncs is the main reason you would call them. They are bounded at 2 seconds
   and answer `504 status_timeout` past that. A read taken mid-checkout is a
   snapshot; the job's `result` is authoritative.
 - **`PUT` is whole-object create-or-replace.** There is no PATCH: one verb, no
-  merge rules to document. A `PUT` on a repo with a job in flight is `409` —
-  the job snapshotted its definition at admission, so a replace would silently
-  not apply.
+  merge rules to document. A `PUT` on a repo with a job in flight is
+  `409 repo_busy` with the running job in `error.job` — the job snapshotted its
+  definition at admission, so a replace would silently not apply.
+- **`PUT` and `DELETE` take the repo for the length of the call**, rather than
+  checking that it looks idle and hoping. While one is in flight every other
+  call for that id is refused with `repo_locked` — the other mutator and every
+  job start, an `auto_sync_secs` tick included, which simply logs it and skips.
+  Over HTTP that is a `409` with **no** `error.job`, because the holder is the
+  host itself and there is nothing to poll. It is retryable, and the hold is
+  released before the call that took it returns. This is what makes
+  `?purge=true` safe: no libgit2 write can start against a tree while
+  `remove_dir_all` is walking it. One honest wart: `status.busy_job` is a *job*
+  reference, so it reads `null` while a hold is open — a caller polling through
+  a slow purge sees "idle" and then gets `409 repo_locked` if it acts on it.
 - **`branch` collapses create, checkout and set-upstream** into one call.
   `create: false`, `checkout: false` and no `upstream` is `422` ("nothing to
   do").
-- **`reset` requires `confirm: true`.** Without it, `422 confirm_required`.
+- **`reset` requires `confirm: true`.** Without it, `422 confirm_required`. It
+  is also the only verb that will open a repository in a non-Clean state, and
+  `{"to":"head","confirm":true}` is what discards an interrupted merge (§9.2) —
+  worth knowing, because that is the exact body the refusal message hands you.
+  The one gap: during a **rebase** HEAD is detached, so `reset` answers
+  `detached_head` and the repair has to happen by hand in the tree.
 - **There is no cancel endpoint and no file endpoint.** libgit2 is
   interruptible only inside its transfer callbacks, so a cancel would work
   during fetch and silently no-op during merge, checkout and TCP connect;
@@ -562,7 +615,21 @@ A `PUT` answers `201` the first time and `200` on every later replace, so a
 `[server]` child can redefine its repos unconditionally on every boot. With
 `[git].registry_writes = false` both `PUT` and `DELETE` answer
 `403 registry_read_only` instead: `repos.json` is yours to write, and the app
-can only sync the repos you shipped with it.
+can only sync the repos you shipped with it. **The same 403 has a second
+producer**: a `repos.json` on disk that the host could neither read nor
+quarantine closes writes too (§9.7). `GET /api/git` tells them apart without a
+second error code — `registry_writable: false` **with** a `registry_error` is
+the fault, without one it is the config key.
+
+**Omitting `credential` on a replace does not erase it, and does not always
+keep it.** The stored credential is carried forward — which is what keeps a PAT
+off the loopback socket on every unrelated edit — but only while the remote in
+*this* `PUT` still resolves to the host that credential is bound to. A `PUT`
+that changes that host, that removes the remote, or that gives a previously
+hostless remote (`file://`, a local path, `null`) a real one drops it, answers
+`200` and returns an `auth_unbound` warning naming both sides. Send a
+replacement credential in the same call when you intend that move; see §5 for
+why an absent `bound_host` is not treated as a wildcard.
 
 The response never contains a secret. A stored credential comes back as
 `token_stored: true` / `private_key_stored: true` / `passphrase_stored: true`,
@@ -582,7 +649,10 @@ rate-limited token.
 Every mutating call returns `202` immediately with a job body and a
 `Location: /api/git/jobs/<job_id>` header. **One job per repo at a time**: a
 second call while one is running is `409 repo_busy`, with `Retry-After: 1` and
-the running job embedded in `error.job`.
+the running job embedded in `error.job`. The same slot is what a `PUT` or
+`DELETE` takes for the length of its call (§9.3), so a job start can also come
+back `409 repo_locked` — same 409, no `error.job`, because the holder is the
+host and not a job.
 
 Send a `request_id` (free-form, ≤128 printable ASCII characters) on every
 mutating call. It is scoped to the repo, and it is checked *before* the busy
@@ -596,8 +666,16 @@ check, so:
   a fresh job is admitted. Retrying a failed operation with the same id is
   meant to work.
 
+Retention never takes an id back from a live job: when the superseded record of
+a failed attempt ages out of the fifty-job window, the successor admitted under
+that same `request_id` keeps the entry, so the replay rules above still hold
+however long the retry runs.
+
 Because a matching `request_id` can never produce a 409, a 409 always means
-*someone else* holds the repo.
+someone else holds the repo — where "someone else" can be **the host itself**,
+mid-`PUT` or mid-`DELETE`. Branch on `error.job`: present means a job you can
+poll (`repo_busy`), absent means a host-side hold that will be gone in
+milliseconds (`repo_locked`).
 
 A job body carries `state` (`running` / `succeeded` / `failed`), `phase`
 (`preparing`, `cloning`, `staging`, `committing`, `fetching`, `merging`,
@@ -666,6 +744,12 @@ already matches HEAD is a no-op, a push that already landed reports
   immediately above "Restart App", and only while at least one repo is defined.
   It admits one sync per repo, skips busy repos with a log line, and returns
   instantly.
+- **A `remote: null` repo is synced by all four of these.** It counts towards
+  the "at least one repo" the tray entry needs, and **Sync now**, the
+  `auto_sync_secs` timer, `sync_on_start` and `sync_on_quit` all really commit
+  for it — staging and committing is the half of "sync" a local-only repo has
+  (§9.4). There is nothing to fetch or push, so `fetched` and `pushed` stay
+  `false` and the outcome is `committed` or `no_changes`.
 - **`[git].error_dialogs = true`** covers **both** halves of "something you
   should know about happened":
   - a native **error** dialog on a repo's `ok → failing` transition — once per
@@ -726,14 +810,34 @@ already matches HEAD is a no-op, a push that already landed reports
 - **You own `.gitignore`.** A sync stages everything the repo does not ignore.
   A `node_modules` inside a repo tree *will* be committed. Git's ignore rules
   are honoured and nothing is ever force-added, but the tree is yours by
-  design.
+  design. There is exactly one way an ignored file stops a sync: if the remote
+  starts *tracking* a path this machine ignores, the sync refuses with
+  `dirty_tree` rather than replacing your copy (§9.2), and on an
+  `auto_sync_secs` timer the repo then sits in `failing` — one dialog, one log
+  line per tick — until a human moves the file. Deliberate: the alternative is
+  losing it silently.
 - **`repos.json` is not hot-reloaded.** It is read once at startup and
   rewritten only by `PUT` / `DELETE` — never by a sync, a timer or a job. Hand-
   edit it while the app is closed. Entries the host cannot parse are skipped,
   reported in `registry_error`, and **written back verbatim** on every
   subsequent rewrite, so a typo never costs you the rest of your file. A file
-  that fails to parse at all is renamed to `repos.json.corrupt-<epoch_ms>` and
-  the host still starts.
+  whose bytes it has but cannot use is renamed to
+  `repos.json.corrupt-<epoch_ms>` and the host still starts, writable, with
+  zero repos.
+
+  A file it could not **read** — a permission it lacks, an I/O error, a
+  directory sitting at that path — is the one case that stops writes. The host
+  still starts, `GET /api/git` carries the `registry_error` saying so, and
+  `PUT` / `DELETE` answer `403 registry_read_only` until the file is readable
+  or moved aside. That is a real availability trade: a child that re-declares
+  its repos with a boot-time `PUT` gets a hard 403 and runs with zero repos
+  until a human intervenes, where before it "worked" by renaming a temp file
+  over the definitions and credentials it could not read. On Windows, a backup
+  agent or scanner briefly holding the file is enough to trip it, and since the
+  registry is not hot-reloaded the lock-out lasts until the next restart.
+  The `registry_error` is scrubbed on its way out, so what you read there is
+  not byte-identical to what is in your file — a URL's `user:password@` is
+  gone.
 - **Everything is logged** to `<data-dir>/logs/git.log`, one line per outcome,
   rotating at 5 MB into `git.log.old`:
 
@@ -743,10 +847,21 @@ already matches HEAD is a no-op, a push that already landed reports
   ```
 
   URLs are stripped of their userinfo and stored secrets are replaced with
-  `***` before anything is written.
+  `***` before anything is written. That covers the `startup` lines too (`op`
+  is `startup`, `job` is `-`), which are built from `repos.json` itself: a
+  rejected entry quoting a remote with a password in it is reported with the
+  password gone, and with the host still there so the line stays debuggable.
+  One shape it cannot catch: a secret typed into a field that is not a URL —
+  `"auto_sync_secs": "ghp_…"` — comes back inside serde's own "invalid type"
+  complaint, because nothing at load time knows that string was meant to be a
+  token. Worth caring about, because unlike `repos.json` the log files are
+  created under the ordinary umask rather than forced to `0600`.
 - **Windows.** `<data-dir>/repos/<id>/` plus a deep repository path can cross
   `MAX_PATH`, so keep ids short. A filename that is not valid UTF-8 produces an
-  explicit `io_failed` rather than a silently mangled path.
+  explicit `io_failed` rather than a silently mangled path. The §9.2 collision
+  check is the filesystem's, not git's, so it is case-insensitive here and on
+  macOS and case-sensitive on Linux: a local `Inbox.md` against a remote
+  `inbox.md` refuses on two platforms out of three.
 - **Network integration tests.** Four `#[ignore]`d tests in `src/git/mod.rs`
   cover what an offline CI cannot. Run them by hand:
 

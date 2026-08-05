@@ -120,7 +120,7 @@ listed here rather than dropped because the fix pass was cut short by an account
 | 10 | *(smoke, run under Xvfb on `:77` so nothing touched the user's desktop)* All four of step 39's checks verified against a real bare remote: clone → `cloned`; a genuine both-sides edit → one merge commit, the local copy kept, `conflicts_resolved=["shared.txt"]` and the `git show <oid>^2:<path>` hint, with `GitConflictsResolved` reaching the tao loop; a second sync → `no_changes`; the remote moved away and synced **twice** → two `err` lines in `git.log` but exactly **one** `GitFailed` line in `host.log`, which is the ok→fail gate holding end to end; and closing the Chrome window (`on_close = "quit"`) → `quit` → `children: killed` → the quit sync committing and pushing `onquit.txt` **after** the children were gone. Also re-ran with `[git]` absent: `/api/status` byte-identical, `/api/git` → 404 `git_disabled`, and the data dir holding only `app.lock`, `chrome-profile` and `logs/{host,chrome}.log`. Not covered: the *visual* appearance of the two rfd modals — the run set `error_dialogs = false` so nothing blocked, and the events that drive them were asserted instead |
 | 11 | §14 risk 11's accepted settings write race is now a WHY comment at the `write_settings(&sc.settings_file, …)` call in `settings_apply_back`: last-writer-wins over one small document, never corruption (`settings::save` writes the whole map in one call, so no reader sees a half-written file), worst case one lost update that the next save or sync republishes. The comment also forbids the tempting "fix" — skipping the write when the file moved underneath would silently drop the *remote's* values instead, which is the strictly worse loss |
 | 11 | *(found during execution)* Step 11's `origin_with_settings` fixture calls `testkit::clone_at(&o, "seed")`, but `origin_with_main` already creates and keeps a `seed` tree at that path; libgit2 refuses with `"'…/seed' exists and is not an empty directory"`. The fixture now reuses that tree |
-| 11 | *(same)* Step 16's `settings_sync_events` fixture defines its repo with no `remote`, so `start_job(…, JobOp::Sync, …)` refuses admission with `remote_missing` before a job record exists and both restart tests panic in the fixture. It now points at a path inside the tempdir; `SettingsOps` never opens it |
+| 11 | *(same)* Step 16's `settings_sync_events` fixture defines its repo with no `remote`, so `start_job(…, JobOp::Sync, …)` refuses admission with `remote_missing` before a job record exists and both restart tests panic in the fixture. It now points at a path inside the tempdir; `SettingsOps` never opens it. **Superseded by F5a below** — the admission guard was the defect, not the fixture. The fake remote is gone again and the fixture is back to `remote: null`, which is what task 11 wrote in the first place |
 | 11 | *(same)* Step 11's `mirror_job` helper takes `host_settings: &PathBuf`, which fails `clippy::ptr_arg` under `-D warnings`. Changed to `&std::path::Path` |
 | 11 | Steps 17/18 came out the way the plan predicted: both restart tests pass with **no** edit to `decide_restart`. Mutation-verified rather than assumed — deleting the `|| out.settings_changed` OR-term gives "expected exactly one restart request, got []", and pinning `reason` to `"requested"` gives "a restart caused by the settings mirror must say so" |
 | 11 | *(same)* The plan's claim that task 8 added `use crate::git::merge::testkit;` to `ops.rs`'s test module is wrong — task 8 put the testkit to work in `merge.rs`, not `ops.rs`. The import is added here |
@@ -135,9 +135,73 @@ listed here rather than dropped because the fix pass was cut short by an account
 
 Nothing. Every row above was applied and re-measured during execution.
 
-Two contract-vs-task drifts were also flagged and left alone as additive rather than contradictory:
-task 9 consumes `Registry::notes() -> &[String]` and `StateStore::load_error() -> Option<&str>`,
-neither of which appears in contract §5.4/§5.5.
+One of the two contract-vs-task drifts flagged here is now closed: `Registry::notes()` is in
+contract §5.4, because the post-execution audit gave it a guarantee (scrubbed at construction)
+that has to be stated somewhere a caller will look. `StateStore::load_error() -> Option<&str>`
+is still absent from §5.5 and still additive rather than contradictory.
+
+## Post-execution audit fixes
+
+A full audit of the shipped subsystem found **eight** defects, fixed across eight commits, plus a
+test-suite race found and fixed in a ninth while verifying them. **None widened the wire
+vocabulary**: `GitErrorCode`, `as_str`, `http_status`, `retryable` and `classify` are byte-identical
+before and after — `git diff a7427cc..HEAD -- src/git/error.rs` adds two named constructors and one
+test-only line and touches nothing else — so the error-code tables in README §9.5, spec §5.6 and
+contract §3.4 gained **zero rows**. Two footnote-level edits were owed and are applied:
+`repo_locked` moved from execution-only to also an admission code, and it gained a second producer.
+
+**How the plan and task files were treated.** Every task step reproduces the code it landed, so the
+steps behind these eight would have rebuilt the defects on a re-execution — one of them a
+credential-theft primitive. The rule applied, uniformly: **where the fix replaced a block a step
+writes, the step is corrected in place and carries an `> Amended by the post-execution audit`
+blockquote** naming what it used to say and why the shipped shape differs; **where the fix added a
+facility the task never had, it is appended as an explicitly labelled step at the end of that task**
+(task 5's step 63, `hold_repo`). That is the convention this repo already used for the task-2 and
+task-3 amendments in the spec and the contract: the code blocks are instructions and have to be safe
+to follow, while this ledger is where the history lives. A step file that silently disagrees with
+`src/` is the one outcome worse than either. Touched: tasks 3, 4, 5, 7, 8, 9 and 12, plus
+`interface-contract.md` and the spec.
+
+| fix | task | finding |
+|---|---|---|
+| **F1** | 5 | `drop_job` lacked the ownership test `RepoLease::drop` has, so retention evicting a superseded failed record deleted the **live successor's** `request_id` entry and turned the next matching retry into the 409 that §6.2's replay-before-busy rule promises is impossible. Guarded on `by_request.get(&key) == Some(id)`; the two guards now cross-reference each other as one rule about two indexes. Spec §6.5 rule 5 was stating the defect and is reworded |
+| **F2** | 4 | `put`'s carry-forward predicate treated an absent `bound_host` as permission to bind to **any** host (`(None, _) => true`). A loopback PUT repointing a repo at an attacker's remote kept the stored PAT, and `normalise_def` then rebound it to the attacker's host — the theft with the rebinding done for free. Now the same equality `creds::resolve` transmits by, `None` included, with the `kind: "none"` short-circuit kept so a credential that does not exist is never "dropped" with a warning. The warning is rebuilt from two half-clauses so `(Some, None)` and `(None, Some)` both read as English |
+| **F3** | 4 | `load` turned every non-`NotFound` read error into `registry_corrupt` with `quarantined_to: None` **while leaving the bytes at `path`**, and `writable()` consulted only the config key — so the first `PUT` renamed a temp file over a `repos.json` full of other definitions and stored PATs, with no `.corrupt-` copy. The read is split (`fs::read` + `from_utf8`: bytes we hold and cannot use are quarantined, bytes we never got are left alone), and the latch is derived from `error` by one predicate shared by `writable` and the new `ensure_writable`. `quarantine`'s failed-rename arm no longer claims "; quarantined". Accepted trade, documented in README §9.7: a child that re-declares its repos on boot now gets a hard 403 and zero repos until a human intervenes |
+| **F4** | 4 | `Registry::load` built every note and `RegistryError` with `format!` over `repos.json` and handed them out unscrubbed into `git.log` and into `GET /api/git`; the `insecure_remote` refusal that warns about passwords in remote URLs was itself printing one, on every launch, forever. `Registry::assembled` — the one funnel all eleven return paths pass through — now scrubs `notes` and the error, `rejected[].id` included; `StateStore::load` got the same one-line treatment. Still open and accepted: a secret typed into a wrongly-typed field comes back inside serde's own echo, because nothing at load time knows that string is a secret |
+| **F5a** | 9, 11 | Step 43's admission guard listed `JobOp::Sync` among the verbs a `remote: null` repo may not run, contradicting spec §5.6 (which lists only `clone`/`pull`/`push`) and README §9.4 (which promises such a repo's sync "inits and commits"). A local-only repo could therefore never sync at all — the task-11 fixture row above was a workaround for exactly this. The rule the guard now states: admission refuses a verb only when **every** mode of it is impossible, which is also why `reset` is not in the list |
+| **F5b** | 8 | `ops::sync` refused an absent tree with `no_worktree` when there was no remote to clone from. It now `init`s and falls through — `init` and not `create_dir_all`, because only `init` pins `refs/heads/<def.branch>` against the developer's global `init.defaultBranch`. The spec's own ops test plan had listed "sync with `remote: null` → `committed`" and it was never written; it is written now |
+| **F6** | 8 | All three merge checkouts forced, and two of the three moved a ref **first**. Measured against the vendored libgit2 1.9.6: `force` does not *delete* an untracked file, it **overwrites** the ones that collide with the target tree (`checkout.c`: `GIT_DELTA_ADDED` with a workdir entry → `FORCE ? UPDATE_BLOB : CONFLICT`), so the shipped fast-forward lost data on **success**, not only on failure — and safe mode alone still clobbers a gitignored path the remote tracks, which needs the separate `overwrite_ignored(false)`. Now one `checkout_or_refuse` — `safe()` **first**, `overwrite_ignored(false)`, `recreate_missing(true)`, `notify_on(CONFLICT)` — run **before** any ref moves, in all three arms. The builder-call order is load-bearing and untestable: `safe()`/`force()`/`dry_run()` are `checkout_opts &= !((1 << 4) - 1)` and `RECREATE_MISSING` is `1 << 2`, inside that mask, so reordering silently un-sets it and no assertion in the suite can see it. Guarded by a comment, and that is all there is |
+| **F7** | 7, 8 | Nothing on the write path read `repo.state()`, so a tree a human left in `RepositoryState::Merge` was accepted by every mutating verb: `add_all` staged the `<<<<<<<` markers as stage 0, the commit took HEAD as its only parent so the merged branch vanished, `merge_prefer_local`'s `cleanup_state()` then deleted their `MERGE_HEAD`, and `push` published it. Measured, not reasoned — the pre-fix `sync` returned `Ok`/`"merged"`. `open_tree` now calls `require_clean_state`, shared with `fill_status` so the status read and the refusal are one message; `reset` opens through `open_tree_any_state` because `git_reset` ends in `git_repository_state_cleanup`. `push` is gated deliberately even though real git allows it |
+| **F8** | 5, 9 | `JobStore::busy` drops the lock before returning, so `put_repo`/`delete_repo` only **sampled** it; an auto-sync tick admitted in the gap left libgit2 writing into the directory `remove_dir_all` was walking. `busy` now maps to a `BusyBy` (a job **or** the host), `hold_repo` takes the same entry `admit` takes under one acquisition, and the refused-purge early return no longer leaves a `last_sync` row and job records for an unregistered id. `repo_locked` rather than `repo_busy`, because there is no job to embed and `api.rs` documents a client as keying off `error.job`'s presence |
+| **flake** | 7, 8 | *(found while verifying the eight, not by the audit)* `ops::tests::hostile_global_config` mutates libgit2 **process-global** state — `git2::opts::set_search_path` for four `ConfigLevel`s — and its SAFETY comment argued the `OnceLock::get_or_init` was sufficient synchronisation because "every test enters through `Fixture::*` before it touches git2". That premise was false: `merge::testkit` never called it, so merge tests could be **inside** libgit2 while an ops fixture flipped the search path. Measured before the fix: 40 consecutive full-suite runs, 1 failed, `testkit::clone_at` panicking with `"the repository is not empty"`. Mechanism, read out of vendored libgit2 1.9.6: `clone_into` (clone.c) refuses when `git_repository_is_empty` is false, and that function (repository.c) compares HEAD's symbolic target against `git_repository_initialbranch`, which reads `init.defaultBranch` back through the global search path — flip the path between a clone's `git_repository_init` and its emptiness check and the fresh repository stops looking empty. Reproduced deliberately with a throwaway probe (one thread flipping, one cloning): 172–188 of 400 clones failed with that exact error, against 0 of 400 with no flipper. The helper is hoisted into `merge::testkit` as the crate's **single gate onto libgit2 in tests**, called at the top of every entry point there that can reach it — plus `git::mod`'s `service_planted` and `git::error`'s refused-connect test, which reach libgit2 without naming it. `ops::tests::Fixture` calls testkit's rather than keeping a copy: a second `OnceLock` would be a second, unordered mutation of the same global. A race cannot be pinned by an assertion, so verification is empirical: 250 consecutive full-suite runs, 250 passed. At the pre-fix rate that outcome has probability ~0.002 |
+
+### Known gaps left open by this audit
+
+- **F7's gate is not uniform across every verb.** `ops::clone`'s idempotent branch and `ops::init`'s
+  `Exists` branch open the repository with `git2::Repository::open` directly rather than through
+  `open_tree`, so on a wedged tree they answer `200 up_to_date` / `200 initialized` while every
+  other verb answers `409 dirty_tree`. Measured by dispatching each verb through `ops::run` against
+  one tree with a planted `.git/MERGE_HEAD`. Neither damages the tree — `init` only adds a missing
+  remote, `clone` only reads `head_oid` — so this is a consistency defect, not corruption, but it is
+  **new**: before F7 all three agreed. `open_tree`'s doc comment currently claims the gate is
+  exhaustive ("Every verb that touches an existing tree comes through here"), which it is not.
+- **F7's gate is TOCTOU.** A human who runs `git merge` in a tree *while a job is already running*
+  still reaches `merge_prefer_local`'s `cleanup_state()`. The window shrinks from "any time at all"
+  to "during a running job"; closing it would need a re-check inside `stage_and_commit` that nothing
+  can reach, and unreachable code is banned here.
+- **A mid-rebase repo is gated but may not be repairable through the API.** During a rebase HEAD is
+  detached, so `reset` hits `require_branch` first and answers `detached_head`. F7's message says
+  "Finish it by hand in the working tree, **or** discard it with POST …/reset" precisely so it is
+  not a lie in that case, but the escape hatch is genuinely narrower for rebase than for merge.
+- **The replay-past-a-hold ordering is true and untested.** `admit`'s `by_request` replay lookup
+  precedes its `BusyBy::Maintenance` arm, which is what keeps "a matching `request_id` can never
+  come back as 409" true now that `put_repo`/`delete_repo` hold the repo for their whole call.
+  Nothing asserts it: a mutation returning `repo_locked` ahead of the replay check leaves the whole
+  suite green. `jobs::tests::a_maintenance_hold_and_a_job_exclude_each_other` states the property in
+  a comment and then tests an *unknown* `request_id`, which is behaviourally the same as the `None`
+  case asserted two lines above.
+- **F6 leaves a dangling tree object on every refused merge**, from `idx.write_tree_to(repo)`.
+  Unreferenced, gc-able, no correctness impact — but it now happens more often than it did.
 
 ## Definition of done for the whole feature
 

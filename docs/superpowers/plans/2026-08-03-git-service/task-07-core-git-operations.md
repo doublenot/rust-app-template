@@ -35,13 +35,31 @@ Six details in here are not stylistic — each one is a bug that ships silently 
 5. **`checkout_tree` BEFORE `set_head`**, and a hard `reset` ignores any `CheckoutBuilder`
    you hand it (libgit2 hard-codes `GIT_CHECKOUT_FORCE` in `reset.c`), so untracked cleanup
    has to be a separate `checkout_head` call.
-6. **`status` reads `repo.state()` and reports a non-`Clean` one as `state: "error"`.** This
-   is the visible half of §6.6's decision that startup runs no `cleanup_state()` and no
-   `reset --hard`: our own merge is pure (§7.6) and never leaves `RepositoryState::Merge`, so
-   a `MERGE_HEAD` in one of these trees was put there by a human running git by hand, and
-   discarding their staged resolution would be unrecoverable. Skip the check and the repo
-   reads back as `clean` while every mutating verb fails for a reason the caller cannot see.
-   The error names the state and points at `POST /reset`, which is the sanctioned way out.
+6. **`repo.state()` is checked on both surfaces, through one function.** `require_clean_state`
+   is called by `open_tree`, so every mutating verb refuses a repository a human left mid-merge,
+   mid-rebase or mid-cherry-pick with `409 dirty_tree`; and by `fill_status`, so `status` reports
+   the same condition as `state: "error"` with the same message. This is the other half of §6.6's
+   decision that startup runs no `cleanup_state()` and no `reset --hard`: our own merge is pure
+   (§7.6) and never leaves `RepositoryState::Merge`, so a `MERGE_HEAD` in one of these trees was
+   put there by a human running git by hand, and discarding their staged resolution would be
+   unrecoverable. `reset` is the single verb that may open such a tree — through
+   `open_tree_any_state` — because `git_reset` ends in `git_repository_state_cleanup`, and the
+   refusal message hands the caller that exact request body.
+
+   > **Amended by the post-execution audit (F7).** This decision originally covered `status`
+   > only, and its own wording gave the game away: "the repo reads back as `clean` while every
+   > mutating verb fails for a reason the caller cannot see" describes a refusal that did not
+   > exist. Nothing on the write path read `repo.state()`, so a `sync` on a wedged tree returned
+   > `Ok`/`"merged"` — measured — after `add_all` staged the `<<<<<<<` markers as resolved
+   > content, the commit recorded the merged branch nowhere, `cleanup_state()` deleted the
+   > human's `MERGE_HEAD`, and `push` published all of it. `open_tree` is split below and
+   > `fill_status`'s inlined error becomes a call to the shared function.
+   >
+   > Known gap, left open: `ops::clone`'s idempotent branch and `ops::init`'s `Exists` branch
+   > open the repository directly rather than through `open_tree`, so they still answer
+   > `up_to_date`/`initialized` on a wedged tree. Neither writes to it, so this is a consistency
+   > defect rather than corruption — but `open_tree`'s doc comment claims the gate is exhaustive
+   > and it is not.
 
 Three git2 0.21 API facts the design document's sketches predate. Use these, not the sketch:
 
@@ -168,6 +186,7 @@ Three git2 0.21 API facts the design document's sketches predate. Use these, not
   pub const MAX_DIRTY_FILES: usize = 200;
 
   pub fn open_tree(ctx: &OpCtx) -> Result<git2::Repository, GitError>;
+  pub fn open_tree_any_state(ctx: &OpCtx) -> Result<git2::Repository, GitError>;  // reset only
   pub fn require_branch(repo: &git2::Repository, branch: &str) -> Result<(), GitError>;
   pub fn ensure_branch(repo: &git2::Repository, def: &RepoDef) -> Result<(), GitError>;
   pub fn stage_and_commit(repo: &git2::Repository, ctx: &OpCtx)
@@ -248,6 +267,14 @@ these names, reuse it rather than duplicating it.
     /// ambient default happening to agree. And it stops the developer's real
     /// `~/.gitconfig` — `init.defaultBranch`, `core.autocrlf`, `commit.gpgsign`, a global
     /// `core.excludesFile` — from deciding whether these tests pass.
+    ///
+    /// **Amended by the post-execution audit.** Its original SAFETY comment argued the
+    /// `OnceLock` was sufficient synchronisation because "every test enters through
+    /// `Fixture::*` before it touches git2". That premise was false the moment task 8 added
+    /// a second test module with its own fixtures, and the resulting race is measured and
+    /// recorded in the plan index. Task 8 moves this function into `merge::testkit` and
+    /// makes `Fixture` call it there — a second `OnceLock` would be a second, unordered
+    /// mutation of the same global.
     fn hostile_global_config() {
         // The search path is process-global and must outlive every test, so the directory
         // is deliberately never dropped: a static is not dropped at process exit. It is
@@ -260,11 +287,26 @@ these names, reuse it rather than duplicating it.
                 "[init]\n\tdefaultBranch = master\n",
             )
             .expect("write .gitconfig");
-            // SAFETY: `set_search_path` mutates libgit2 process-global state and is
-            // documented as needing external synchronisation. `OnceLock::get_or_init` is
-            // that synchronisation: every test enters through `Fixture::*` before it
-            // touches git2, and `get_or_init` blocks every other thread until this
-            // closure returns.
+            // SAFETY: `set_search_path` mutates libgit2 process-global state behind no
+            // lock of its own, so it is sound only if it happens-before every libgit2 call
+            // in the process — including calls on the other threads cargo is running tests
+            // on right now.
+            //
+            // `get_or_init` supplies exactly that edge, and nothing more. The thread that
+            // runs this closure finishes all four writes before any other thread returns
+            // from `get_or_init`, and the writes never happen again. So the ordering holds
+            // for a thread if and only if that thread calls `hostile_global_config` BEFORE
+            // its own first libgit2 call. It buys nothing for a thread already inside
+            // libgit2 — which is why this must live in the one module every test reaches
+            // git2 through, rather than in one module's private fixture. Task 8 hoists it
+            // into `merge::testkit` for that reason; see the note below.
+            //
+            // The cost of missing it is silent rather than loud: `git_repository_is_empty`
+            // compares HEAD's symbolic target against `git_repository_initialbranch`,
+            // which reads `init.defaultBranch` back through this very search path. Flip
+            // the path between a clone's `git_repository_init` and its emptiness check and
+            // the fresh repository stops looking empty — the clone dies with "the
+            // repository is not empty" in a test that never mentioned config at all.
             unsafe {
                 for level in [
                     git2::ConfigLevel::Global,
@@ -593,7 +635,28 @@ fn head_oid(repo: &git2::Repository) -> Option<String> {
 }
 
 /// Open the working tree and reconcile its `origin` with the current definition.
+///
+/// Refuses a repository left mid-merge, mid-rebase or mid-cherry-pick: see
+/// `require_clean_state`. Every verb that touches an existing tree comes through
+/// here, so the gate is one line and a verb added later gets it without being
+/// told. `reset` is the single exception and says so at its own call site.
 pub fn open_tree(ctx: &OpCtx) -> Result<git2::Repository, GitError> {
+    let repo = open_tree_any_state(ctx)?;
+    require_clean_state(&repo, &ctx.def.id)?;
+    Ok(repo)
+}
+
+/// `open_tree` without the state gate. **Only `reset` may call this.**
+///
+/// The repository it returns may be half-way through somebody's merge, so the
+/// only thing that may be done with it is the operation that repairs that:
+/// libgit2's `git_reset` ends every non-soft reset in
+/// `git_repository_state_cleanup` (1.9.6, reset.c), which is what makes `reset`
+/// the documented way out. Staging, committing, merging or checking out through
+/// this handle would do exactly the damage the gate exists to prevent — which is
+/// also why there is no second, defensive check further down: nothing else can
+/// ever be holding such a handle.
+pub fn open_tree_any_state(ctx: &OpCtx) -> Result<git2::Repository, GitError> {
     if !ctx.tree.exists() {
         return Err(GitError::no_worktree(&ctx.def.id));
     }
@@ -616,6 +679,28 @@ pub fn open_tree(ctx: &OpCtx) -> Result<git2::Repository, GitError> {
         }
     }
     Ok(repo)
+}
+
+/// Refuse a repository that is half-way through an operation a human started.
+///
+/// §6.6: our own merge is pure (§7.6) and never enters `RepositoryState::Merge` —
+/// measured at every step of a real conflicting sync — so a non-Clean state in one
+/// of these trees was created by a human running git by hand in it. Nothing here
+/// may touch such a tree: `add_all` drops the three conflict stages and stages the
+/// `<<<<<<< HEAD` text as resolved content, the commit takes `head_commit.iter()`
+/// as its ONLY parent so the branch they were merging is recorded nowhere, the
+/// merge that follows calls `cleanup_state()` and deletes their MERGE_HEAD, and
+/// with `push` defaulting to true the markers are published. Refusing is the only
+/// reading that cannot lose their work.
+///
+/// Shared with `fill_status` on purpose: one condition, one code, one message,
+/// whether the caller asked for a status or a sync.
+fn require_clean_state(repo: &git2::Repository, repo_id: &str) -> Result<(), GitError> {
+    let state = repo.state();
+    if state != git2::RepositoryState::Clean {
+        return Err(GitError::repo_state_not_clean(state, repo_id));
+    }
+    Ok(())
 }
 
 /// Mutating ops refuse to guess which branch the caller meant.
@@ -1634,8 +1719,9 @@ Add to the same test module:
         // MERGE_HEAD in one of these trees was left by a human running git by hand. The
         // deliberate decision is that startup does NOT run cleanup_state() or reset --hard,
         // because that would silently discard their staged resolution. This is the other
-        // half of that decision: the state has to be *visible*, or the repo just looks
-        // clean while every mutating verb fails for a reason the caller cannot see.
+        // half of that decision: `open_tree`'s gate is the refusal, and this is the report.
+        // Same call, same code, same message — which is why asserting the substrings here
+        // and in merge.rs's verb sweep is what keeps the two from drifting apart.
         //
         // Verified against libgit2 1.9.6: writing .git/MERGE_HEAD is by itself enough to
         // make repo.state() report Merge, on a freshly opened handle and on an open one.
@@ -1883,19 +1969,11 @@ fn fill_status(
     // or reset --hard would throw away their staged resolution unrecoverably. Returning Err
     // hands `status` the "error" state and attaches the reason; everything above is already
     // filled in, so head, branch, dirty and ahead/behind still reach the caller.
-    let repo_state = repo.state();
-    if repo_state != git2::RepositoryState::Clean {
-        return Err(GitError::new(
-            GitErrorCode::DirtyTree,
-            format!(
-                "repository state is {repo_state:?}, not Clean: an interrupted merge, rebase \
-                 or cherry-pick is still in progress and no git operation can run until it \
-                 is finished by hand or discarded with POST /api/git/repos/{}/reset",
-                def.id
-            ),
-        )
-        .with_repo(&def.id));
-    }
+    //
+    // The same call `open_tree` makes, deliberately: one condition, one code, one message,
+    // whether the caller asked for a status or a sync. That is what makes this message's
+    // "discard it with POST …/reset" a description of the system rather than advice.
+    require_clean_state(repo, &def.id)?;
 
     out.state = if out.unborn {
         "unborn"
@@ -2546,7 +2624,11 @@ pub fn reset(ctx: &OpCtx) -> Result<OpOutcome, GitError> {
     if !request.confirm {
         return Err(GitError::confirm_required());
     }
-    let repo = open_tree(ctx)?;
+    // The one verb that may open a wedged tree, because it is the one that repairs it:
+    // libgit2's `git_reset` ends every non-soft reset in `git_repository_state_cleanup`,
+    // which is what the refusal message in `require_clean_state` promises. Routing this
+    // through the gated `open_tree` would close the only escape hatch there is.
+    let repo = open_tree_any_state(ctx)?;
     require_branch(&repo, &ctx.def.branch)?;
     let head_before = head_oid(&repo);
 

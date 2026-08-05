@@ -106,14 +106,22 @@ Example: `job_7c1e93aa_00002b`.
 
 Admission: `git_disabled` `unauthorized` `invalid_repo_id` `invalid_request` `insecure_remote`
 `settings_sync_unavailable` `remote_missing` `confirm_required` `repo_not_found` `repo_busy`
-`job_not_found` `registry_read_only` `path_refused` `registry_corrupt` `registry_entries_rejected`
-`registry_write_failed` `purge_failed` `status_timeout` `shutting_down` `internal`
+`repo_locked`† `job_not_found` `registry_read_only` `path_refused` `registry_corrupt`
+`registry_entries_rejected` `registry_write_failed` `purge_failed` `status_timeout`
+`shutting_down` `internal`
 
 Execution: `auth_failed` `auth_missing` `auth_unbound` `host_key_mismatch` `certificate_invalid`
 `network_failed` `timeout` `canceled` `not_fast_forward` `push_rejected` `remote_not_found`
 `no_worktree` `already_exists` `not_a_repository` `branch_mismatch` `detached_head` `unborn_branch`
-`dirty_tree` `merge_path_type_conflict` `merge_unresolvable` `repo_locked`
+`dirty_tree` `merge_path_type_conflict` `merge_unresolvable` `repo_locked`†
 `io_failed`
+
+† **`repo_locked` is in both lists.** As an execution code it is libgit2's `ErrorCode::Locked` and
+its message names a lock file's absolute path. As an admission code — added by the post-execution
+audit (F8) — it is `jobs::repo_locked(repo_id)`, returned **synchronously** by `JobStore::hold_repo`
+and therefore by `GitService::put_repo`, `delete_repo` and `start_job` while a `PUT`/`DELETE` for
+that id is in flight; that form names the *repo* and carries no `error.job`, because the holder is
+the host itself and there is no job to embed. Same code, same 409, same `retryable = true`.
 
 `shutting_down` is a **[CONTRACT DECISION]**: §6.6 requires it, §5.6's table omits it.
 
@@ -172,7 +180,10 @@ variant are both deleted.
 <epoch_ms> <op> repo=<id> job=<job_id> ok code=- <scrubbed message>
 <epoch_ms> <op> repo=<id> job=<job_id> err code=<code> <scrubbed message>
 ```
-Startup lines use `op=startup` and `job=-`.
+Startup lines use `op=startup` and `job=-`. **Every form carries the same redaction guarantee**,
+the startup ones included: they are built from `Registry::notes()` and `Registry::error()`, which
+are scrubbed at construction rather than by this caller, because the file is created under the
+ordinary umask and not at `0600`.
 
 ### 3.19 Fingerprint format
 `SHA256:<standard-base64-of-32-bytes, '=' padding stripped>`
@@ -310,7 +321,7 @@ pub enum GitErrorCode {
 | `DirtyTree` | `dirty_tree` | 409 | false |
 | `MergePathTypeConflict` | `merge_path_type_conflict` | 409 | false |
 | `MergeUnresolvable` | `merge_unresolvable` | 409 | false |
-| `RepoLocked` | `repo_locked` | 409 | **true** |
+| `RepoLocked` | `repo_locked` | 409 | **true** | *(two producers — see the † footnote in §3.4)* |
 | `IoFailed` | `io_failed` | 500 | false | *(a failed TCP connect is class `Os` but maps to `NetworkFailed` — see the amendment in spec §5.6)* |
 | `Internal` | `internal` | 500 | false |
 
@@ -639,9 +650,10 @@ pub struct JobStore { /* Mutex<Inner>, instance: String, seq: AtomicU64, now: No
 struct Inner {
     jobs: BTreeMap<JobId, Arc<JobSlot>>,
     terminal: VecDeque<JobId>,             // oldest first
-    busy: BTreeMap<String, JobId>,         // repo_id -> live job  <- THE LOCK
+    busy: BTreeMap<String, BusyBy>,        // repo_id -> whoever holds it  <- THE LOCK
     by_request: BTreeMap<(String, String), JobId>,
 }
+enum BusyBy { Job(JobId), Maintenance }    // private; Maintenance = a PUT/DELETE in flight
 
 pub enum Admission {
     Started(std::sync::Arc<JobSlot>, RepoLease),
@@ -651,6 +663,13 @@ pub enum Admission {
 
 pub struct RepoLease { /* Arc<JobStore>, repo_id: String, job: Arc<JobSlot> */ }
 // No public constructor. Drop: finish_if_running(internal) -> remove busy -> push terminal -> evict.
+// The busy removal is guarded on `Some(BusyBy::Job(id)) if *id == self.job.id` — clearing a
+// different holder's entry, another job's or a RepoHold's, would break the exclusion.
+
+#[must_use]
+pub struct RepoHold { /* Arc<JobStore>, repo_id: String */ }
+// No public constructor either; `JobStore::hold_repo` is the only source. Drop: remove the
+// `BusyBy::Maintenance` entry, under the same ownership guard.
 
 #[derive(Debug, Clone, Default)]
 pub struct JobFilter { pub repo_id: Option<String>, pub state: Option<JobState>, pub limit: usize }
@@ -1183,6 +1202,9 @@ impl GitError {
     pub fn branch_mismatch(actual: &str, expected: &str) -> GitError;
     pub fn unborn_branch(what: &str) -> GitError;
     pub fn dirty_tree(what: &str) -> GitError;
+    pub fn checkout_would_overwrite(paths: &[String]) -> GitError;          // DirtyTree; F6
+    pub fn repo_state_not_clean(state: git2::RepositoryState,
+                                repo_id: &str) -> GitError;                 // DirtyTree; F7
     pub fn merge_path_type_conflict(path: &std::path::Path) -> GitError;
     pub fn merge_unresolvable() -> GitError;
     pub fn push_rejected(refname: &str, status: &str) -> GitError;
@@ -1205,6 +1227,16 @@ constructors.** They have zero call sites across tasks 4–12 and would survive 
 `AuthMissing`, `AuthUnbound`, `Canceled` and `Timeout` all remain in §3.4/§4.3 — only the four
 never-called named constructors are deleted.
 
+**Two `GitError`s are deliberately constructed at their call sites rather than here**, both added by
+the post-execution audit and both reusing an existing code, so neither widens this vocabulary:
+`jobs::repo_locked(repo_id)` (`RepoLocked`, §3.4's † footnote) and the write-latch refusal built
+inline in `registry::ensure_writable` (`RegistryReadOnly`, whose existing `registry_read_only()`
+message — "`[git].registry_writes` is false" — would be an outright lie on that path). Both belong
+beside `repo_busy` and `registry_read_only` in `error.rs`; they are elsewhere only because the file
+sets of the three fix groups had to stay disjoint. **[CONTRACT DECISION]** the audit added **no**
+`GitErrorCode` variant, renamed none, and left `as_str`, `http_status`, `retryable` and `classify`
+byte-identical.
+
 `classify`'s `(_, ErrorClass::Callback)` arm: `AbortReason::Timeout => Timeout`,
 `AbortReason::Shutdown => Canceled`, `AbortReason::None => NetworkFailed`.
 `scrub`: strip `scheme://user:pw@` → `scheme://`, then literal-replace every secret with more than
@@ -1224,13 +1256,24 @@ impl RepoView { pub fn new(def: &RepoDef, repos_dir: &std::path::Path) -> RepoVi
 impl CredentialView { pub fn of(spec: &CredentialSpec) -> CredentialView; }
 
 impl Registry {
-    /// Never fails: a corrupt file is quarantined and an empty registry is returned.
+    /// Never fails, but does not always leave itself writable. Bytes it HAS and cannot use are
+    /// quarantined and an empty, writable registry is returned; a file it could not READ, or a
+    /// quarantine whose rename failed, is left exactly where it is and latches writes shut.
     pub fn load(path: &std::path::Path, repos_dir: &std::path::Path, defaults: RegistryDefaults) -> Registry;
     pub fn path(&self) -> &std::path::Path;
     /// The one copy of the repos directory. `GitService` holds no second copy — see §4.12.
     pub fn repos_dir(&self) -> &std::path::Path;
+    /// `defaults.registry_writes && write_block().is_none()` — the config key is not the only
+    /// thing that can turn this off, so `GET /api/git`'s `registry_writable` is not a mirror of it.
     pub fn writable(&self) -> bool;
+    /// The gate every mutator goes through; the latch is reported before the config key.
+    pub fn ensure_writable(&self) -> Result<(), GitError>;                  // registry_read_only
+    /// Scrubbed at construction (`Registry::assembled`), so the guarantee is the type's and not
+    /// the caller's: `message` and every `rejected[].id` have had URL userinfo stripped.
     pub fn error(&self) -> Option<RegistryError>;
+    /// Non-fatal observations from `load`, for `git.log`. Scrubbed at construction for the same
+    /// reason: the caller writes these into a file created under the ordinary umask.
+    pub fn notes(&self) -> &[String];
     pub fn count(&self) -> usize;
     pub fn ids(&self) -> Vec<String>;
     pub fn list(&self) -> Vec<RepoDef>;
@@ -1243,11 +1286,27 @@ impl Registry {
 pub(crate) fn save(path: &std::path::Path, file: &RegistryFile) -> Result<(), GitError>;
 pub(crate) fn open_private(path: &std::path::Path) -> std::io::Result<std::fs::File>;
 ```
-`Registry::put` is responsible for: `validate_def`, branch/timestamp normalisation, `bound_host`
-population from `remote_host(remote)`, dropping a stored credential whose `bound_host` no longer
-matches (emitting `Warning{code:"auth_unbound"}`), clamping `auto_sync_secs` into
-`AUTO_SYNC_MIN_SECS..=AUTO_SYNC_MAX_SECS` (emitting `Warning{code:"auto_sync_clamped"}`; `0` → `None`,
-not clamped), and the atomic 0600 `save`.
+`Registry::put` is responsible for: `ensure_writable`, `validate_def`, branch/timestamp
+normalisation, `bound_host` population from `remote_host(remote)`, dropping a stored credential
+whose `bound_host` no longer matches (emitting `Warning{code:"auth_unbound"}`), clamping
+`auto_sync_secs` into `AUTO_SYNC_MIN_SECS..=AUTO_SYNC_MAX_SECS` (emitting
+`Warning{code:"auto_sync_clamped"}`; `0` → `None`, not clamped), and the atomic 0600 `save`.
+
+> **Amended by the post-execution audit (F2, F3, F4).** Three corrections to this block, all of
+> them things the old wording made it possible to get wrong:
+> - "no longer matches" is a plain equality over `Option<String>`, **`None` included**. An absent
+>   `bound_host` is not a wildcard: `normalise_def` binds every credential it stores, so an unbound
+>   one can only have been written next to a remote with no host at all, and it is keepable only
+>   while that stays true. Carrying it onto a remote that *does* have a host would hand it to
+>   `normalise_def` three lines later, which binds it to that host — the theft, with the rebinding
+>   done for the attacker. `kind: "none"` short-circuits, since its `bound_host` is always `None`.
+> - `writable()` is derived, and `put`/`remove` go through `ensure_writable` rather than reading
+>   `defaults.registry_writes`, so a caller that reaches `Registry` without going through
+>   `GitService` cannot write a registry that latched shut at load.
+> - `notes()` and `error()` are scrubbed at the funnel (`Registry::assembled`), not by their
+>   callers. `PutOutcome.warnings` is deliberately **not** scrubbed: those messages carry hosts
+>   only, never a credential, and widening the guarantee speculatively would hide the host names
+>   the `auth_unbound` warning exists to show.
 
 ### 5.5 `git/state.rs` — task 4
 ```rust
@@ -1308,10 +1367,16 @@ impl JobStore {
     pub fn with_clock(host_instance: String, now: NowFn) -> std::sync::Arc<JobStore>;
     pub fn host_instance(&self) -> &str;
     pub fn admit(self: &std::sync::Arc<Self>, repo_id: &str, op: JobOp, request_id: Option<&str>)
-        -> Result<Admission, GitError>;                     // Err = shutting_down
+        -> Result<Admission, GitError>;                     // Err = shutting_down | repo_locked
+    /// Take the repo for the host itself, for the length of a `PUT`/`DELETE`.
+    pub fn hold_repo(self: &std::sync::Arc<Self>, repo_id: &str)
+        -> Result<RepoHold, GitError>;                      // Err = repo_busy | repo_locked
     pub fn get(&self, id: &JobId) -> Option<std::sync::Arc<JobSlot>>;
     pub fn lookup(&self, raw: &str) -> Result<std::sync::Arc<JobSlot>, GitError>;   // job_not_found
     pub fn list(&self, filter: &JobFilter) -> Vec<std::sync::Arc<JobSlot>>;         // newest first, GCs first
+    /// The `BusyBy::Job` arm only. A `RepoHold` answers `None` — a hold is not a job and
+    /// `status.busy_job`/`error.job` have nothing to point at — so **nothing may use this to
+    /// decide whether a repo is free**. `hold_repo` is how you take it.
     pub fn busy(&self, repo_id: &str) -> Option<std::sync::Arc<JobSlot>>;
     pub fn live_jobs(&self) -> Vec<std::sync::Arc<JobSlot>>;
     pub fn set_draining(&self, draining: bool);
@@ -1327,6 +1392,16 @@ busy check. `admit` takes `&Arc<Self>` because `RepoLease` holds `Arc<JobStore>`
 
 Admission order inside one lock: GC expired terminal jobs → **replay check** (running/succeeded →
 `Replay`; failed → consume the index entry and fall through) → busy check → insert/mark busy/index.
+
+> **Amended by the post-execution audit (F1, F8).** Two changes to this surface:
+> - The busy check now has two arms. `BusyBy::Job` still yields `Admission::Busy(slot)`;
+>   `BusyBy::Maintenance` yields `Err(repo_locked)`, an `Err` and not an `Admission` because there
+>   is no job to hand back. Replay still runs first, so a matching `request_id` replays past a
+>   hold — a replay hands back an existing record and touches no tree, which is what keeps §3.4's
+>   "a matching `request_id` can never come back as 409" true now that `put_repo`/`delete_repo`
+>   hold the repo for their whole call.
+> - Dropping a job's record removes its `by_request` entry **only while the index still names that
+>   job** (spec §6.5 rule 5). The same ownership test `RepoLease::drop` applies to `busy`.
 
 ### 5.7 `git/creds.rs` — task 6
 ```rust
@@ -1388,7 +1463,12 @@ pub fn commit(ctx: &OpCtx) -> Result<OpOutcome, GitError>;
 pub fn branch(ctx: &OpCtx) -> Result<OpOutcome, GitError>;
 pub fn reset(ctx: &OpCtx)  -> Result<OpOutcome, GitError>;
 // task 7 — shared preamble + reads
+/// Gated: refuses a `repo.state() != Clean` with 409 `dirty_tree`. Every verb that touches an
+/// existing tree comes through here, so a verb added later is gated without being told.
 pub fn open_tree(ctx: &OpCtx) -> Result<git2::Repository, GitError>;
+/// The same open with no state gate. **Only `reset` may call this** — it is the verb that
+/// repairs a wedged tree, because `git_reset` ends in `git_repository_state_cleanup`.
+pub fn open_tree_any_state(ctx: &OpCtx) -> Result<git2::Repository, GitError>;
 pub fn require_branch(repo: &git2::Repository, branch: &str) -> Result<(), GitError>;
 pub fn ensure_branch(repo: &git2::Repository, def: &RepoDef) -> Result<(), GitError>;
 pub fn stage_and_commit(repo: &git2::Repository, ctx: &OpCtx)
@@ -1449,8 +1529,15 @@ impl GitService {
     pub fn run_quit_syncs(self: &std::sync::Arc<Self>, timeout: std::time::Duration);
     pub async fn read_status(&self, repo_id: &str) -> Result<RepoWithStatus, GitError>;
     pub async fn read_branches(&self, repo_id: &str) -> Result<BranchesResponse, GitError>;
+    /// `validate_id` -> `registry.ensure_writable` -> `jobs.hold_repo` -> `registry.put`
+    /// -> `spawn_auto_timer`. Writability before the hold, so a read-only host answers 403
+    /// rather than taking a lock it is about to refuse to use.
     pub fn put_repo(self: &std::sync::Arc<Self>, id: &str, body: RepoDef)
         -> Result<PutOutcome, GitError>;
+    /// Same preamble, then: containment check -> `registry.remove` -> `state.forget` ->
+    /// `jobs.forget_repo` -> `purge_tree`. The two forgets sit under `remove` and not under
+    /// the purge: they belong to the definition, so a refused purge must not leave a
+    /// `last_sync` row or a job record for the next `PUT` of that id to inherit.
     pub fn delete_repo(&self, id: &str, purge: bool) -> Result<DeleteOutcome, GitError>;
     pub fn repo_view(&self, id: &str) -> Result<RepoView, GitError>;
     pub fn list_views(&self) -> Vec<RepoView>;

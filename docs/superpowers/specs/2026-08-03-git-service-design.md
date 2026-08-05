@@ -300,17 +300,21 @@ Location `<data-dir>/repos.json`, mode `0600` on unix. **Created only by the fir
 
 ### 4.4 Corrupt / partial file at startup
 
-Two tiers, because a hand-written file deserves better than "we deleted it":
+Three tiers, because a hand-written file deserves better than "we deleted it" — and a file we never managed to read deserves better than "we renamed it":
 
-1. **File-level failure** — not valid JSON, top level not an object, `repos` not an array, `version != 1`, or duplicate ids. The file is **renamed** to `repos.json.corrupt-<epoch_ms>` (never deleted, never overwritten in place), the host starts with an empty in-memory registry, and `registry_error` is populated:
+1. **File-level failure, bytes in hand** — not UTF-8, not valid JSON, top level not an object, `repos` not an array, `version != 1`, or duplicate ids. The file is **renamed** to `repos.json.corrupt-<epoch_ms>` (never deleted, never overwritten in place), the host starts with an empty in-memory registry, and `registry_error` is populated:
    ```json
    { "code": "registry_corrupt",
      "message": "repos.json is not valid JSON (line 12 column 3); quarantined",
      "quarantined_to": "/…/repos.json.corrupt-1785000000000" }
    ```
-   Endpoints keep working; the first `PUT` writes a fresh file.
+   Endpoints keep working; the first `PUT` writes a fresh file. **That last sentence is true of this tier only** — it is `quarantined_to` being non-null that says the old contents are accounted for and a fresh file costs nothing.
 
-2. **Entry-level failure** — the file parses but an entry has a bad id, an unknown key, an out-of-range `auto_sync_secs`, or `sync_settings` with no schema. The bad entries are **skipped, not quarantined**, and reported:
+2. **Bytes we never got** — the read itself failed (a permission, an I/O error, a directory at that path), or the tier-1 quarantine rename failed. Same `registry_corrupt` code, `quarantined_to: null`, and **nothing on disk is touched**. The host starts with an empty registry and every `PUT`/`DELETE` answers `403 registry_read_only` until the file can be read or is moved aside. Renaming a file we could not read is a bigger act than refusing to write one: a single mis-chmod would otherwise retire a registry full of definitions and stored PATs, with no `.corrupt-` copy to recover from, on the first `PUT` after boot.
+
+> **Amended by the post-execution audit (F3).** Tier 2 did not exist: every non-`NotFound` read error produced tier 1's shape *without* the rename, and `writable()` consulted only `[git].registry_writes`, so the first `PUT` renamed a temp file over a `repos.json` the host had never read. The latch is one predicate — `code == "registry_corrupt" && quarantined_to.is_none()` — shared by `writable()` and the new `Registry::ensure_writable()`, so the two tiers cannot disagree about which one a given error is. Pinned by `registry::tests::a_registry_that_cannot_be_read_is_left_alone_and_latches_writes_shut`, `::an_unreadable_registry_is_never_replaced_by_a_put` and `::a_quarantine_that_could_not_rename_latches_writes_shut`.
+
+3. **Entry-level failure** — the file parses but an entry has a bad id, an unknown key, an out-of-range `auto_sync_secs`, or `sync_settings` with no schema. The bad entries are **skipped, not quarantined**, and reported:
    ```json
    { "code": "registry_entries_rejected",
      "message": "2 of 5 repo definitions were rejected",
@@ -319,7 +323,7 @@ Two tiers, because a hand-written file deserves better than "we deleted it":
    ```
    The good entries load and work. **The rejected raw entries are retained as `serde_json::Value` and written back verbatim on every subsequent rewrite**, so fixing a typo never costs the author the rest of their file.
 
-3. A stray `repos.json.tmp` is deleted and logged (a crash between `sync_all` and `rename`; the real file is intact).
+4. A stray `repos.json.tmp` is deleted and logged (a crash between `sync_all` and `rename`; the real file is intact).
 4. `#[cfg(unix)]` a mode with group/other bits is tightened to `0600` in place and logged.
 5. A file that parses to exactly what we would write is not rewritten (no gratuitous `updated_at_ms` churn).
 
@@ -627,7 +631,7 @@ Two surfaces, **one vocabulary**: a synchronously-detectable problem becomes an 
 | `repo_not_found` | 404 | id not in the registry |
 | `repo_busy` | 409 | a live job owns the repo |
 | `job_not_found` | 404 | unknown, evicted, or foreign-instance job id |
-| `registry_read_only` | 403 | `registry_writes = false` |
+| `registry_read_only` | 403 | `registry_writes = false`, **or** a `repos.json` on disk the host could neither read nor quarantine (§4.4 tier 2) — the latch is reported first, and `GET /api/git` tells them apart by whether `registry_error` is also present |
 | `path_refused` | 403 | purge target resolves outside `<data-dir>/repos/` |
 | `registry_corrupt` / `registry_entries_rejected` | — | reported in `registry_error`, never as a status |
 | `registry_write_failed` | 500 | `repos.json` could not be persisted |
@@ -659,7 +663,7 @@ Two surfaces, **one vocabulary**: a synchronously-detectable problem becomes an 
 | `dirty_tree` | false | `ErrorCode::{Uncommitted,IndexDirty}`, or pull/checkout/reset would lose work |
 | `merge_path_type_conflict` | false | a path is a file on one side and a directory on the other (§7.6) |
 | `merge_unresolvable` | false | conflicts survived resolution; `ErrorCode::{Unmerged,Conflict,MergeConflict}` |
-| `repo_locked` | **true** | `ErrorCode::Locked`; message names the lock file's absolute path |
+| `repo_locked` | **true** | `ErrorCode::Locked`; message names the lock file's absolute path. **Also an admission code** — see the footnote below |
 | `settings_invalid` | false | (never fatal today — surfaces as `result.settings_rejected`) |
 | `io_failed` | no | classes `Os`, `Filesystem`, `std::io::Error`, **except** a failed TCP connect |
 
@@ -669,6 +673,8 @@ Two surfaces, **one vocabulary**: a synchronously-detectable problem becomes an 
 >
 > `io_failed` is now flatly **not** retryable rather than "maybe": with the connect case moved out, every remaining member is a local errno where retrying spins.
 | `internal` | false | fallback |
+
+> **Amended by the post-execution audit (F8) — `repo_locked` is in this table and in the admission table.** It gained a second producer that is not libgit2's: `JobStore::hold_repo`, which `put_repo` and `delete_repo` take for the whole call so that a job cannot be admitted against a definition being replaced or a tree being purged. That form is returned **synchronously**, from the service call itself, and its message names the *repo* — `repo "notes" is locked while its definition or tree is being changed` — not a lock file. It stays 409/retryable, which is honest: the hold is released before the call that took it returns. Not `repo_busy`, because there is no job to embed in `error.job` and `api.rs` documents a client as keying off that field's presence. Asserted by `jobs::tests::repo_locked_is_a_retryable_409_that_names_the_repo` and `git::tests::delete_and_put_take_the_repo_rather_than_sampling_it`.
 
 ```rust
 fn classify(e: &git2::Error) -> Code {
@@ -737,7 +743,8 @@ pub struct JobStore { inner: std::sync::Mutex<Inner>, instance: String, seq: Ato
 struct Inner {
     jobs:       BTreeMap<JobId, Arc<JobSlot>>,
     terminal:   VecDeque<JobId>,                    // oldest first
-    busy:       BTreeMap<String, JobId>,            // repo_id -> live job  ← THE LOCK
+    busy:       BTreeMap<String, BusyBy>,           // repo_id -> whoever holds it  ← THE LOCK
+                                                    // enum BusyBy { Job(JobId), Maintenance }
     by_request: BTreeMap<(String, String), JobId>,  // (repo_id, request_id)
 }
 ```
@@ -747,6 +754,8 @@ struct Inner {
 **One flat `std::sync::Mutex`, no nesting, no actor.** `std::sync` and not `tokio::sync` because the only writer of `Progress` is a libgit2 callback on a blocking thread with no runtime context, and it must never `.await`. Every critical section is a handful of field writes; the nested `Mutex<Map<Id, Arc<Mutex<Record>>>>` shape would buy nothing and introduce a lock-ordering hazard between the progress callback and the completion path. `admit()` needs the lock only across check → allocate → mark-busy; the spawn happens after the guard is dropped, which is why a single-owner actor is unnecessary here.
 
 **Per-repo mutual exclusion is a `BTreeMap` entry**, not a mutex per repo: no allocation, no lifetime question, no deadlock possible, no poisoning from a panicking job. Different repos are parallel for free because they are different keys.
+
+> **Amended by the post-execution audit (F8).** The value was `JobId`, so the host itself had no way to take the entry and `put_repo`/`delete_repo` merely *sampled* `busy()` before proceeding — an auto-sync tick admitted in that gap left libgit2 writing into the directory `remove_dir_all` was walking. It is now a two-armed `BusyBy`, taken by `JobStore::hold_repo` under the same one acquisition of `inner` that `admit` uses. Two arms of one value rather than a second `maintenance` set, deliberately: `busy` is THE lock, and changing its value type turned every one of the four readers (`admit`, `busy`, `RepoLease::drop`, and the new `hold_repo`) into a compile error that had to be answered, where a parallel set would have grown a hole in the exclusion with nobody noticing. `busy()` answers `None` for the `Maintenance` arm — a hold is not a job and `status.busy_job` has nothing to point at — which is exactly why nothing may use `busy()` to decide whether a repo is free. `jobs::tests::a_hold_and_an_admission_can_never_both_win` exercises the exclusion under real threads.
 
 ### 6.2 Admission and the RAII lease
 
@@ -845,7 +854,9 @@ On every insert and every `GET /api/git/jobs*`:
 2. While `terminal.len() > MAX_JOB_RECORDS` (50), pop the oldest.
 3. **Never evict a live job**, regardless of count.
 4. **Never evict a terminal job younger than `JOB_MIN_AGE_SECS` (60)**, regardless of count. This closes a real race: a client gets 202, and before it polls, a burst of auto-syncs evicts its record.
-5. Evicting a job drops its `by_request` entry (the id becomes reusable).
+5. Evicting a job drops its `by_request` entry — but **only while the index still names the evicted job**. A successor admitted under the same `(repo_id, request_id)` owns the entry and keeps it; the id becomes reusable when *that* job's record goes.
+
+> **Amended by the post-execution audit (F1).** Rule 5 was unconditional, and rule 5 plus the retry rule in §6.2 contradicted each other: `admit` re-points the key at a fresh job when a failed op is retried under the same `request_id`, and the superseded failed record then sat in retention until it aged out — at which point its eviction deleted the *successor's* entry and the next matching retry came back `409 repo_busy`, the one answer §6.2 promises a matching `request_id` can never produce. `drop_job` now applies the same ownership test `RepoLease::drop` applies to `busy`; they are one rule about two indexes. Consequence to be aware of: a `(repo_id, request_id)` entry now outlives the eviction of an older job that once owned it. It cannot leak — the key always names the newest job for the pair, and that job's own eviction clears it — but any future code assuming "record evicted ⇒ id free" has to read the guard first. Pinned by `jobs::tests::evicting_a_superseded_record_keeps_the_live_successors_request_id` and `::forget_repo_leaves_a_live_successors_request_id_alone`.
 
 **Published contract**, in `GET /api/git` and the README: *poll within `job_ttl_secs`; results younger than 60 s are always available.* Evicted ids 404 as `job_not_found` — which is why `last_sync` lives in `git-state.json`: the durable outcome survives eviction *and* a process restart.
 
@@ -877,6 +888,13 @@ unsafe {
 
 ```rust
 fn open_tree(ctx: &OpCtx) -> Result<Repository, GitError> {
+    let repo = open_tree_any_state(ctx)?;
+    require_clean_state(&repo, &ctx.def.id)?;          // see the amendment below
+    Ok(repo)
+}
+
+/// `open_tree` without the state gate. **Only `reset` may call this.**
+fn open_tree_any_state(ctx: &OpCtx) -> Result<Repository, GitError> {
     let path = ctx.tree.clone();                       // repos_dir.join(validated id)
     if !path.exists() { return Err(GitError::no_worktree(&ctx.def.id)); }
     let repo = Repository::open(&path)?;
@@ -891,6 +909,15 @@ fn open_tree(ctx: &OpCtx) -> Result<Repository, GitError> {
     Ok(repo)
 }
 
+/// Refuse a repository half-way through an operation A HUMAN started.
+fn require_clean_state(repo: &Repository, repo_id: &str) -> Result<(), GitError> {
+    let state = repo.state();
+    if state != RepositoryState::Clean {
+        return Err(GitError::repo_state_not_clean(state, repo_id));   // 409 dirty_tree
+    }
+    Ok(())
+}
+
 /// Mutating ops refuse to guess which branch the caller meant.
 fn require_branch(repo: &Repository, branch: &str) -> Result<(), GitError> {
     if repo.is_empty()? { return Ok(()); }                       // unborn is fine
@@ -901,6 +928,12 @@ fn require_branch(repo: &Repository, branch: &str) -> Result<(), GitError> {
     Ok(())
 }
 ```
+
+> **Amended by the post-execution audit (F7).** `open_tree` had no state gate, so nothing on the write path ever read `repo.state()` and a tree a human left in `RepositoryState::Merge` was accepted by every mutating verb: `add_all` drops the three conflict stages and stages the `<<<<<<< HEAD` text as *resolved* content, the commit takes `head_commit.iter()` as its only parent so the branch being merged is recorded nowhere, `merge_prefer_local`'s trailing `cleanup_state()` then deletes their `MERGE_HEAD`, and with `push` defaulting to true the markers are published. Measured, not reasoned: a `sync` on such a tree returned `Ok`, `outcome = "merged"`, `conflicts_resolved = ["f.md"]`.
+>
+> The gate lives here rather than at admission because `GitService::start_job` runs on the axum request thread and may not open a `git2::Repository` — and here it is one line that a verb added later inherits without being told. `reset` is the single exception and goes through `open_tree_any_state`, because libgit2's `git_reset` ends every non-soft reset in `git_repository_state_cleanup` (1.9.6, reset.c), which is what makes `reset` the documented way out; the refusal message hands the caller that exact request body. `fill_status` calls the same `require_clean_state`, so the status read and the refusal are one condition, one code and one message. `init` and `clone` never reach `open_tree` at all — see the known gap recorded against them in the plan index.
+>
+> Known-narrow window, accepted: a human who runs `git merge` in the tree *while a job is already running* still reaches `cleanup_state()`. The window shrinks from "any time at all" to "during a running job", and closing it would need a re-check inside `stage_and_commit` that nothing can reach.
 
 Non-UTF-8 index paths are legal in git and `String::from_utf8_lossy` produces a path that no longer addresses the entry:
 
@@ -1021,7 +1054,9 @@ Author precedence: request `author` → `def.author` → `[git].author_*` → `[
 `sync` = `[settings copy] → commit-all → fetch → merge → [settings write-back] → push`.
 `pull` = `fetch → merge` only; if the tree is dirty and `commit_local` is false it fails fast with `dirty_tree` rather than silently committing on the caller's behalf. `commit_local: true` makes `pull ≡ sync` with `push: false`.
 
-Committing everything **before** the fetch is load-bearing, not merely convenient: after that step every tracked file in the working tree is at a committed state, which is what makes the later `CheckoutBuilder::force()` provably non-destructive, and it collapses "HEAD is unborn" to "the tree really was empty".
+A `sync` on an **absent** tree is `clone`, or `init` when the repo has no remote — the caller asked for "make this tree match", and there is no earlier step they should have had to run first. `init` and not a bare `create_dir_all`, because only `init` pins `refs/heads/<def.branch>` against the developer's global `init.defaultBranch`; it falls through rather than returning, since an init leaves an unborn HEAD and the commit below is the half of "sync" a local-only repo actually has.
+
+Committing everything **before** the fetch is load-bearing, not merely convenient: after that step every tracked file in the working tree is at a committed state, which is what keeps the merge's *safe* checkout from **refusing** a sync over the user's own uncommitted edit (§7.6's amendment), and it collapses "HEAD is unborn" to "the tree really was empty of anything git tracks".
 
 **Fetch**
 
@@ -1055,23 +1090,64 @@ Branch **in this order** — a fast-forward situation sets `ANALYSIS_NORMAL | AN
 |---|---|---|---|
 | 1 | `analysis.is_up_to_date()` | nothing | `up_to_date` |
 | 2 | `analysis.is_unborn()` | adopt remote | `fast_forward` |
-| 3 | `analysis.is_fast_forward()` | move ref + force checkout | `fast_forward` |
+| 3 | `analysis.is_fast_forward()` | safe checkout, **then** move ref | `fast_forward` |
 | 4 | `analysis.is_normal()` | prefer-local merge | `merged` / `merged_unrelated` |
 
 ```rust
-// 2. UNBORN — reachable only when the tree was genuinely empty (see above).
+// 2. UNBORN — "nothing to commit" is not "nothing on disk": with no HEAD there is
+//    no baseline, so every remote path is an add and every local file at one of
+//    them is a collision. Check out first; attach HEAD only once the tree took it.
 let refname = format!("refs/heads/{}", ctx.def.branch);
+let their_commit = repo.find_commit(their.id())?;
+checkout_or_refuse(repo, their_commit.as_object(), ctx)?;
 repo.reference(&refname, their.id(), true, "sync: adopt remote history")?;
 repo.set_head(&refname)?;
-repo.checkout_head(Some(git2::build::CheckoutBuilder::new().force()))?;
 
 // 3. FAST-FORWARD — Repository::merge() does NOT fast-forward and does NOT move
-//    HEAD (verified); it also leaves RepositoryState::Merge. Do the ref surgery.
+//    HEAD (verified); it also leaves RepositoryState::Merge. Do the ref surgery
+//    ourselves — but only after the working tree has accepted the remote's tree.
+let their_commit = repo.find_commit(their.id())?;
+checkout_or_refuse(repo, their_commit.as_object(), ctx)?;
 let mut r = repo.find_reference(&refname)?;
 r.set_target(their.id(), "sync: fast-forward")?;
 repo.set_head(&refname)?;
-repo.checkout_head(Some(git2::build::CheckoutBuilder::new().force()))?;
 ```
+
+`checkout_or_refuse` is the one checkout on the merge path, shared by all three arms:
+
+```rust
+fn checkout_or_refuse(repo: &Repository, target: &Object<'_>, ctx: &OpCtx) -> Result<(), GitError> {
+    ctx.phase(Phase::CheckingOut);
+    let blocked: RefCell<Vec<String>> = RefCell::new(Vec::new());
+    let mut co = git2::build::CheckoutBuilder::new();
+    // `.safe()` FIRST and never anywhere else: git2 0.21 spells safe/force/dry_run as
+    // `checkout_opts &= !((1 << 4) - 1)`, and GIT_CHECKOUT_RECREATE_MISSING is 1 << 2 —
+    // inside that mask. Reordering these calls silently un-sets recreate_missing, and
+    // no test can see it. (`overwrite_ignored` is 1 << 19 and survives either order.)
+    co.safe()
+        .overwrite_ignored(false)
+        .recreate_missing(true)
+        .notify_on(git2::CheckoutNotificationType::CONFLICT)
+        .notify(|_why, path, _b, _t, _w| {
+            if let Some(p) = path { blocked.borrow_mut().push(p.display().to_string()); }
+            true            // one message naming every blocked file, not one failure per file
+        });
+    let checked_out = repo.checkout_tree(target, Some(&mut co));
+    drop(co);                                   // `co` holds the closure, which borrows `blocked`
+    match checked_out {
+        Ok(()) => Ok(()),
+        Err(e) if e.code() == ErrorCode::Conflict =>
+            Err(GitError::checkout_would_overwrite(&blocked.into_inner())),   // 409 dirty_tree
+        Err(e) => Err(ctx.classify_err(&e)),
+    }
+}
+```
+
+> **Amended by the post-execution audit (F6).** All three arms forced, and the two above moved a ref *first*. Measured against the vendored libgit2 1.9.6: `force` does not *delete* an untracked file, it **overwrites** the ones that collide with the target tree — `checkout.c`'s action table for a path the target ADDS which also exists in the working directory is `if (ignored) DONT_OVERWRITE_IGNORED ? CONFLICT : UPDATE_BLOB; else FORCE ? UPDATE_BLOB : CONFLICT` — so the shipped fast-forward lost data on **success**, not merely on failure, and `remove_untracked` was never what protected the file. Two independent switches are needed and the second is not implied by the first: safe mode alone still clobbers a gitignored path the remote tracks.
+>
+> Checking out before any ref moves is what makes a refusal safe to have at all: `checkout_get_actions` counts every conflict and returns `GIT_ECONFLICT` before the remove and update passes run, measured three ways including a 21-file target with the collision sorted first and last — so on `Err` the working tree, the index and every ref are bit-identical and the next sync simply redoes the whole thing. `checkout_tree` and never `checkout_head`: with no baseline supplied libgit2 defaults it to the HEAD tree, so a *safe* `checkout_head` has target == baseline, every delta is UNMODIFIED, and it is a silent no-op reporting success. And not `dry_run()`, which git2 0.21 spells as `GIT_CHECKOUT_NONE` — checkout.c returns `*action = NONE` above every notify call, so a dry run reports zero conflicts and detects nothing.
+>
+> `ensure_branch` (a tree the clone just created) and `reset` (confirm-gated, and libgit2 hard-codes `GIT_CHECKOUT_FORCE` for a hard reset anyway) keep their `force()` and must **not** be routed through this helper.
 
 **4. The prefer-local merge** (`merge.rs`):
 
@@ -1177,7 +1253,7 @@ pub fn merge_prefer_local(repo: &Repository, their_oid: Oid, ctx: &OpCtx)
 - Conflict markers can never reach the working tree, even transiently, because the only thing ever checked out is a tree built from an index with `has_conflicts() == false` — and with `FileFavor::Normal` plus explicit resolution, libgit2 is never asked to synthesise marker content in the first place.
 - There is no "resume the merge" state for a human or a later job to reason about.
 
-`repo.checkout_head(force)` is correct *here* because the merge tree was computed from `ours`, which is exactly what the commit-all step wrote; forcing cannot destroy uncommitted tracked work, and `force` alone does not remove untracked files (`remove_untracked` is not set).
+The merge arm checks out through the same `checkout_or_refuse` as the other two, and it does so **before** `repo.commit(...)`: `merge_commits` never touched the repository, so up to that line the whole merge is still a no-op, and putting the one step that can refuse ahead of the one step that moves a ref is what leaves a refused merge byte-identical to where it started. (This paragraph previously argued that `checkout_head(force)` was "correct *here*" because the merge tree was computed from `ours`. That reasoning covered tracked files only, which is the half of the problem F6 found; see the amendment above.)
 
 ### 7.7 `push`
 
@@ -1255,6 +1331,8 @@ if let Some(up) = &body.upstream {
 ```
 
 ### 7.10 `reset`
+
+The one verb that opens through `open_tree_any_state` (§7.2), because it is the one that repairs a wedged tree: libgit2's `git_reset` ends every non-soft reset in `git_repository_state_cleanup`, so `{"to":"head","confirm":true}` is what discards an interrupted merge — measured `Merge → reset → Clean`, `MERGE_HEAD` gone, index unconflicted, and a normal sync afterwards.
 
 ```rust
 let target = match body.to.as_deref().unwrap_or("head") {
@@ -1423,11 +1501,13 @@ A learned fingerprint travels back with the job outcome and is persisted by `Git
 |---|---|
 | GET responses | `Secret` has no `Serialize`; `RepoView`/`CredentialView` have no secret-shaped fields. Two structural barriers, zero conventions to remember. |
 | URLs | A `remote` with a userinfo password is rejected at define time (422 `insecure_remote`) — libgit2 quotes URLs into its error strings, which land in job records, `git.log`, and dialogs. |
-| Error messages | `scrub(msg, &cred)` runs on every `GitError` before it reaches a job record, `git-state.json`, `git.log`, or a dialog: strip `scheme://user:pw@` → `scheme://`, then literal-replace every exposed secret longer than 6 chars with `***`. |
+| Error messages | `scrub(msg, secrets)` runs on **every message built from `repos.json` or from libgit2** before it reaches a job record, `git-state.json`, `git.log`, or a dialog: strip `scheme://user:pw@` → `scheme://`, then literal-replace every exposed secret longer than 6 chars with `***`. |
 | `Debug` | `Secret`'s `Debug` prints `Secret(***)`; `RepoDef`'s is derived on top of it. |
 | Process env / argv | libgit2 is a **library**. No `git` subprocess ever runs, so no credential appears in argv or a child's environment. |
 | Credential helpers | Never invoked; `~/.git-credentials` and `osxkeychain`/`manager-core` are never read. |
 | On disk | `repos.json` at `0600` on unix, written via a `0600` temp file + rename. |
+
+> **Amended by the post-execution audit (F4).** That row read "runs on every `GitError`", which is *why* the leak existed: `Registry::load` reports through plain `String` notes and a `RegistryError`, neither of which is a `GitError`, so nothing on that path was scrubbed. Every one of them is `format!`ed over the contents of `repos.json`, and the `insecure_remote` refusal — whose whole message warns that a password in a remote URL would be copied into log lines — was copying one into `git.log` on every launch, forever. The scrub now sits at `Registry::assembled`, the single funnel all eleven `load` return paths and `quarantine` pass through, and at `StateStore::load`; `Registry::notes()` and `error()` return scrubbed text as a guarantee of the type rather than a duty of the caller. `rejected[].id` is scrubbed too, which is a visible change of shape for a URL-shaped id (`https://u:pw@h/x` → `https://h/x`) — bounded, because `valid_id` admits neither `:` nor `/`, so only ids that were rejected anyway are ever rewritten and `rejected[].index` stays the exact locator. Pinned by `registry::tests::no_load_note_or_registry_error_republishes_a_password_from_repos_json` and `git::tests::a_rejected_entrys_password_never_reaches_git_log`. **Still open, accepted:** a secret typed into a wrongly-typed field comes back inside serde's own echo (`"auto_sync_secs": "ghp_…"` → `invalid type: string "ghp_…", expected u64`); nothing at load time knows that string is a secret.
 
 An auditor greps for `\.expose()` and must find exactly four call sites, all inside the `cb.credentials` closure.
 

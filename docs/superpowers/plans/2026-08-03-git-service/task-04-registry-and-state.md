@@ -10,19 +10,43 @@ author can keep `repos.json` under version control without it churning.
 Neither file may name `git2`, `axum`, `tokio`, `App`, `Children` or `HostEvent`. If you find
 yourself wanting any of them, the code belongs in a later slice.
 
-**The three load-bearing decisions in this task:**
+> **Amended by the post-execution audit (F2, F3, F4).** Four blocks in this task shipped defects
+> and have been **corrected in place**; the amendment notes at each site say what they used to be.
+> Read them before re-executing, because two of the four are security defects and the old code is
+> the kind that looks right:
+> - **Step 26's `Registry::load`** read with `read_to_string`, which collapses "could not read the
+>   file" and "the file is not UTF-8" into one `io::Error` — and those two need opposite answers.
+>   Now `fs::read` + `String::from_utf8`, and a third load tier (below).
+> - **Step 27's `assembled`, `writable` and `quarantine`**, plus the `put`/`remove` preambles:
+>   the scrub at the funnel (F4), and the write latch with `write_block`/`blocks_writes`/
+>   `ensure_writable` (F3).
+> - **Step 43's carry-forward predicate** treated an absent `bound_host` as a wildcard — a
+>   credential-theft primitive. Now a plain equality including `None`.
+> - **`StateStore::load`** got the same one-line scrub as `assembled`.
 
-1. **Tolerant load, two tiers.** A file that fails at the *file* level (bad JSON, wrong
-   `version`, `repos` not an array, an unknown top-level key) is **renamed** to
-   `repos.json.corrupt-<epoch_ms>` — never deleted, never truncated — and the host starts with an
-   empty registry. A file that parses but contains a *bad entry* keeps its good entries; the bad
+**The load-bearing decisions in this task:**
+
+1. **Tolerant load, three tiers.** A file that fails at the *file* level with its bytes in hand
+   (not UTF-8, bad JSON, wrong `version`, `repos` not an array, an unknown top-level key) is
+   **renamed** to `repos.json.corrupt-<epoch_ms>` — never deleted, never truncated — and the host
+   starts with an empty, still-writable registry. A file we could **not read at all**, or one
+   whose quarantine rename failed, is the third tier: it is left exactly where it is and every
+   registry write is refused until it can be read or moved aside. Renaming a file we never read is
+   a bigger act than refusing to write one — one EACCES from a mis-chmod would otherwise retire a
+   registry full of definitions and stored PATs on the first `PUT` after boot, with no `.corrupt-`
+   copy to recover from. A file that parses but contains a *bad entry* keeps its good entries; the bad
    ones are skipped, reported, **and retained verbatim as `serde_json::Value` so that every later
    rewrite writes them back unchanged**. Fixing one typo must never cost the author the rest of
    their file. Either way the host starts normally: an optional feature must not brick the app.
 2. **Redaction is structural, not disciplinary.** `Secret` has no `Serialize`, so `RepoDef` cannot
    derive `Serialize` — the only path from a stored token to JSON is the hand-written
    `to_wire` (to disk) or `CredentialView` (to HTTP), and `CredentialView` has no
-   secret-shaped field to forget to skip. Step 21 is the canary that proves it.
+   secret-shaped field to forget to skip. Step 21 is the canary that proves it. The *text* this
+   module produces needs the same treatment for the same reason, and it does not get it from
+   `GitError`: every note and every `RegistryError` is `format!`ed over the contents of
+   `repos.json` and goes into a log file created under the ordinary umask. `Registry::assembled`
+   is the single funnel all of them pass through, so the scrub lives there rather than at eleven
+   return paths.
 3. **The temp file gets mode `0600` at creation, before a single byte is written.** Writing then
    chmod-ing leaves a window in which the token is world-readable. `create_new(true).mode(0o600)`
    closes it, and `sync_all()` before the `rename` means a power cut can leave the old file or
@@ -125,7 +149,9 @@ impl Registry {
     pub fn load(path: &std::path::Path, repos_dir: &std::path::Path, defaults: RegistryDefaults) -> Registry;
     pub fn path(&self) -> &std::path::Path;
     pub fn writable(&self) -> bool;
+    pub fn ensure_writable(&self) -> Result<(), GitError>;
     pub fn error(&self) -> Option<RegistryError>;
+    pub fn notes(&self) -> &[String];
     pub fn count(&self) -> usize;
     pub fn ids(&self) -> Vec<String>;
     pub fn list(&self) -> Vec<RepoDef>;
@@ -572,8 +598,9 @@ error[E0433]: failed to resolve: use of undeclared type `GitErrorCode`
 
 - [ ] **Step 8: Implement id validation**
 
-Add `use crate::git::error::{GitError, GitErrorCode};` to the imports at the top of
-`src/git/registry.rs`, then append after the `AuthorSpec` definition:
+Add `use crate::git::error::{scrub, GitError, GitErrorCode};` to the imports at the top of
+`src/git/registry.rs` — `scrub` is used by `Registry::assembled` and `scrub_registry_error` in
+step 33 — then append after the `AuthorSpec` definition:
 
 ```rust
 /// `^[a-z0-9][a-z0-9._-]{0,63}$`, minus traversal and Windows device names.
@@ -1840,6 +1867,18 @@ error[E0422]: cannot find struct, variant or union type `RejectedEntry` in this 
 
 - [ ] **Step 33: Implement `Registry::load` and the reporting types**
 
+> **Amended by the post-execution audit (F3, F4).** Four blocks below changed. `load`'s read was
+> `std::fs::read_to_string`, whose one `io::Error` cannot distinguish "the host could not read
+> this file" from "these bytes are not UTF-8" — the first must be left alone and latch writes
+> shut, the second is a corruption to quarantine like any other. `assembled` returned `error` and
+> `notes` unscrubbed, so the `insecure_remote` refusal that warns about passwords in remote URLs
+> was printing one into `git.log` on every launch. `writable()` read only the config key, so the
+> first `PUT` after an unreadable load renamed a temp file over a `repos.json` full of other
+> definitions and stored PATs. And `quarantine`'s failed-rename arm left every caller's
+> "; quarantined" message standing while the file was still on disk. `blocks_writes`,
+> `write_block`, `ensure_writable` and `scrub_registry_error` are all new here; `ensure_writable`
+> is what steps 40 and 55 call instead of reading `defaults.registry_writes` themselves.
+
 Add to the imports at the top of the file:
 
 ```rust
@@ -1855,7 +1894,9 @@ Append at the end of the implementation section (before `#[cfg(test)] mod tests`
 /// normally either way — an optional feature must not brick the app.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct RegistryError {
-    /// `"registry_corrupt"` (file-level, quarantined) or `"registry_entries_rejected"`.
+    /// `"registry_corrupt"` (file-level) or `"registry_entries_rejected"`. A `registry_corrupt`
+    /// with `quarantined_to: None` is the third tier — bytes we never got — and latches writes
+    /// shut; see `blocks_writes`.
     pub code: &'static str,
     pub message: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1906,16 +1947,25 @@ impl Registry {
         #[cfg(unix)]
         tighten_mode(path, &mut notes);
 
-        let raw = match std::fs::read_to_string(path) {
-            Ok(t) => t,
+        // Bytes, not `read_to_string`: the string form collapses "the file could not be read" and
+        // "the file is not UTF-8" into one `io::Error`, and those two need opposite answers.
+        let bytes = match std::fs::read(path) {
+            Ok(b) => b,
             // The normal first-run state, not a problem.
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                 return Registry::assembled(path, repos_dir, defaults, empty_file(), None, notes)
             }
             Err(e) => {
+                // Deliberately NOT quarantined. Renaming a file we could not read is a bigger act
+                // than refusing to write one: one EACCES from a mis-chmod would retire the whole
+                // registry, credentials included. Leave it; `blocks_writes` latches writes shut.
                 let error = RegistryError {
                     code: "registry_corrupt",
-                    message: format!("repos.json cannot be read ({e})"),
+                    message: format!(
+                        "{} cannot be read ({e}); it was left exactly as it is, and registry \
+                         writes are refused until it can be read or moved aside",
+                        path.display()
+                    ),
                     quarantined_to: None,
                     rejected: Vec::new(),
                 };
@@ -1927,6 +1977,20 @@ impl Registry {
                     Some(error),
                     notes,
                 );
+            }
+        };
+        // Bytes we *have* and cannot use are a corruption like any other, so the author gets them
+        // back under a `.corrupt-` name and the registry stays writable.
+        let raw = match String::from_utf8(bytes) {
+            Ok(t) => t,
+            Err(e) => {
+                return quarantine(
+                    path,
+                    repos_dir,
+                    defaults,
+                    notes,
+                    format!("repos.json is not UTF-8 text ({e}); quarantined"),
+                )
             }
         };
 
@@ -2065,6 +2129,11 @@ impl Registry {
         Registry::assembled(path, repos_dir, defaults, file, error, notes)
     }
 
+    /// The one funnel every `load` return path and `quarantine` pass through, which is why the
+    /// scrub lives here: every note and every `RegistryError` above is `format!`ed over the
+    /// contents of `repos.json`, and they go straight into a log file created under the ordinary
+    /// umask and into `GET /api/git`. Scrubbing at the funnel is what stops a twelfth return path
+    /// from re-opening the leak.
     fn assembled(
         path: &Path,
         repos_dir: &Path,
@@ -2078,8 +2147,11 @@ impl Registry {
             repos_dir: repos_dir.to_path_buf(),
             defaults,
             file: RwLock::new(file),
-            error,
-            notes,
+            error: error.map(scrub_registry_error),
+            // `&[]`: nothing here has resolved a credential, so `strip_userinfo` is the whole of
+            // the available defence — and it is the pass that matters, because a stored token
+            // reaches a note only by being quoted back inside a remote.
+            notes: notes.into_iter().map(|n| scrub(&n, &[])).collect(),
         }
     }
 
@@ -2102,8 +2174,43 @@ impl Registry {
         &self.repos_dir
     }
 
+    /// `Some(why)` when a `repos.json` we could not account for is still sitting at `path`.
+    /// Derived from `error` rather than stored, so no construction path can set one without the
+    /// other — a `writes_blocked: bool` written at one site is free to drift from the error it
+    /// came from, and `error` is immutable after `assembled`.
+    fn write_block(&self) -> Option<&RegistryError> {
+        self.error.as_ref().filter(|e| blocks_writes(e))
+    }
+
     pub fn writable(&self) -> bool {
-        self.defaults.registry_writes
+        self.defaults.registry_writes && self.write_block().is_none()
+    }
+
+    /// The gate every write goes through, and the only place either refusal is worded. `put` and
+    /// `remove` call this instead of reading `defaults.registry_writes` directly, so a registry
+    /// that latched shut at load cannot be written by a caller that reached `Registry` without
+    /// going through `GitService`.
+    ///
+    /// The latch is reported first: `registry_writes = false` is a choice the author already
+    /// knows about, while an unaccounted-for `repos.json` is a fault only this message will name.
+    /// Both are the same wire code deliberately — to a client they mean the same thing ("this
+    /// host will not persist registry edits, and retrying will not help"), and `GET /api/git`
+    /// already tells them apart without a second code: `registry_writable: false` **with** a
+    /// `registry_error` is the fault, without one it is the config key.
+    pub fn ensure_writable(&self) -> Result<(), GitError> {
+        if let Some(why) = self.write_block() {
+            return Err(GitError::new(
+                GitErrorCode::RegistryReadOnly,
+                format!(
+                    "repos.json cannot be written while its contents are unaccounted for: {}",
+                    why.message
+                ),
+            ));
+        }
+        if !self.defaults.registry_writes {
+            return Err(GitError::registry_read_only());
+        }
+        Ok(())
     }
 
     pub fn error(&self) -> Option<RegistryError> {
@@ -2157,6 +2264,19 @@ fn empty_file() -> RegistryFile {
     }
 }
 
+/// The one rule that decides whether the registry may write itself back: is there still a
+/// `repos.json` on disk whose contents we could not account for?
+///
+/// `save` publishes by `rename`, so the first `PUT` after such a load replaces that file
+/// wholesale — every other definition and every stored PAT in it, with no `.corrupt-` copy to
+/// recover from. A quarantined file is accounted for: the bytes moved aside.
+/// `registry_entries_rejected` is accounted for too: those entries were read, and `rejected_raw`
+/// writes them back verbatim. What is left is a `registry_corrupt` with nowhere to point —
+/// either the read failed, or the quarantine rename did.
+fn blocks_writes(error: &RegistryError) -> bool {
+    error.code == "registry_corrupt" && error.quarantined_to.is_none()
+}
+
 /// Rename, never delete and never truncate: a hand-written file deserves better than "we
 /// deleted it", and the author needs the bytes back to find their typo.
 fn quarantine(
@@ -2174,11 +2294,21 @@ fn quarantine(
         target = path.with_extension(format!("json.corrupt-{stamp}-{n}"));
         n += 1;
     }
-    let quarantined_to = match std::fs::rename(path, &target) {
-        Ok(()) => Some(target.display().to_string()),
+    let (quarantined_to, message) = match std::fs::rename(path, &target) {
+        Ok(()) => (Some(target.display().to_string()), message),
         Err(e) => {
             notes.push(format!("cannot quarantine {}: {e}", path.display()));
-            None
+            // Every caller's message ends "; quarantined", which is now untrue — and the operator
+            // has to know the file is still theirs to move, because until it is moved
+            // `ensure_writable` refuses every PUT and DELETE.
+            (
+                None,
+                format!(
+                    "{message} — but the rename failed ({e}); {} is still there and registry \
+                     writes are refused until it is moved aside",
+                    path.display()
+                ),
+            )
         }
     };
     let error = RegistryError {
@@ -2210,6 +2340,25 @@ fn tighten_mode(path: &Path, notes: &mut Vec<String>) {
         )),
         Err(e) => notes.push(format!("cannot tighten {}: {e}", path.display())),
     }
+}
+
+/// `RegistryError` crosses two surfaces that outlive the request — `git.log` and the
+/// `registry_error` field of `GET /api/git` and `/api/status` — and both of its text fields are
+/// quoted out of `repos.json`. `message` carries serde's complaint, and `serde_json::from_value`
+/// echoes the offending value verbatim (`invalid type: string "https://user:pat@host/x.git",
+/// expected u64`); `rejected[].id` is the raw `id` field of an entry too broken to have been
+/// validated yet.
+///
+/// Scrubbing `id` cannot cost a caller an identifying value: `valid_id` admits neither `:` nor
+/// `/`, so the only ids this rewrites are ones that were rejected anyway, and `rejected[].index`
+/// is the precise locator regardless. `quarantined_to` is a path this host built rather than file
+/// content, and is deliberately left intact.
+fn scrub_registry_error(mut error: RegistryError) -> RegistryError {
+    error.message = scrub(&error.message, &[]);
+    for entry in &mut error.rejected {
+        entry.id = entry.id.take().map(|id| scrub(&id, &[]));
+    }
+    error
 }
 
 /// Maps a validation failure onto the stable `rejected[].reason` vocabulary. `invalid_branch_name`
@@ -2438,9 +2587,7 @@ Add inside `impl Registry`, after `auto_sync_secs`:
     /// Create or replace one entry, then persist. A `PUT` is a whole-definition write: fields
     /// absent from `def` take their serde defaults, they are not merged with what was stored.
     pub fn put(&self, def: RepoDef) -> Result<PutOutcome, GitError> {
-        if !self.defaults.registry_writes {
-            return Err(GitError::registry_read_only());
-        }
+        self.ensure_writable()?;
         validate_id(&def.id)?;
 
         let mut def = def;
@@ -2635,6 +2782,19 @@ test result: FAILED. 40 passed; 2 failed; 0 ignored
 
 - [ ] **Step 43: Carry a stored credential forward, but only while it stays bound**
 
+> **Amended by the post-execution audit (F2).** This step originally wrote the predicate as a
+> three-arm `match (&bound, &remote_host_now)` whose `(None, _) => true` arm — commented "Never
+> bound (hand-written); `normalise_def` binds it below" — treated an absent `bound_host` as
+> permission to bind to **any** host. That is a credential-theft primitive: a loopback PUT
+> repointing a repo at an attacker's remote kept the stored PAT, and `normalise_def` three lines
+> below then rebound it to the attacker's host. The warning text was also built with
+> `unwrap_or("(nothing)")` / `unwrap_or("(no remote)")`, which rendered as "was bound to (nothing)"
+> and "this remote is (no remote)". Both are corrected below;
+> `registry::tests::put_drops_an_unbound_credential_when_the_remote_gains_a_host` asserts the drop
+> and asserts the message does **not** contain `"(nothing)"`, and
+> `::put_keeps_an_unbound_credential_while_the_remote_still_has_no_host` is the guard against the
+> tempting over-correction `bound.is_some() && bound == remote_host_now`.
+
 Insert into `Registry::put`, between `let existing = …;` and `let now = now_ms();`:
 
 ```rust
@@ -2647,24 +2807,37 @@ Insert into `Registry::put`, between `let existing = …;` and `let now = now_ms
                 // remote points at. Repointing a repo at an attacker's host and re-PUTting is the
                 // cheapest way to steal a PAT out of this service; dropping the credential here
                 // is what makes that attack yield nothing.
-                let keep = stored.is_none()
-                    || match (&bound, &remote_host_now) {
-                        (Some(b), Some(h)) => b == h,
-                        // Never bound (hand-written); `normalise_def` binds it below.
-                        (None, _) => true,
-                        // The remote was removed, so there is no host to stay bound to.
-                        (Some(_), None) => false,
-                    };
+                //
+                // Deliberately the same equality `creds::resolve` transmits by, `None` included.
+                // `normalise_def` binds every credential it stores, so an unbound one can only
+                // have been written next to a remote with no host at all — `file://`, a local
+                // path, or no remote — and it is keepable only while that is still true. Carrying
+                // it onto a remote that does have a host would hand it to `normalise_def` three
+                // lines below, which binds it to that host: the same theft, with the rebinding
+                // done for the attacker.
+                //
+                // `kind: "none"` short-circuits because its `bound_host` is always `None`:
+                // without that it would now "drop" to an identical value and warn the user to
+                // rebind a credential that does not exist.
+                let keep = stored.is_none() || bound == remote_host_now;
                 if keep {
                     def.credential = Some(stored);
                 } else {
+                    // Spelled out on both sides because either can be absent, and "(nothing)"
+                    // mid-sentence read like a placeholder that had failed to expand.
+                    let was = match &bound {
+                        Some(b) => format!("was bound to {b}"),
+                        None => "was never bound to a host".to_string(),
+                    };
+                    let points_at = match &remote_host_now {
+                        Some(h) => format!("this remote is {h}"),
+                        None => "this remote has no host".to_string(),
+                    };
                     warnings.push(Warning {
                         code: "auth_unbound",
                         message: format!(
-                            "the stored credential was bound to {} but this remote is {}; it was \
-                             dropped — send a replacement credential with this PUT",
-                            bound.as_deref().unwrap_or("(nothing)"),
-                            remote_host_now.as_deref().unwrap_or("(no remote)")
+                            "the stored credential {was} but {points_at}; it was dropped — send a \
+                             replacement credential with this PUT"
                         ),
                     });
                 }
@@ -2746,9 +2919,7 @@ Add inside `impl Registry`, after `put`:
     /// touched here — deleting a user's files is `GitService::delete_repo`'s explicit
     /// `?purge=true` decision, not a side effect of editing the registry.
     pub fn remove(&self, id: &str) -> Result<RepoDef, GitError> {
-        if !self.defaults.registry_writes {
-            return Err(GitError::registry_read_only());
-        }
+        self.ensure_writable()?;
         let mut guard = self.write();
         let index = guard
             .repos
@@ -2975,7 +3146,12 @@ impl StateStore {
         StateStore {
             path: path.to_path_buf(),
             file: Mutex::new(file),
-            load_error,
+            // The same reason `Registry::assembled` scrubs: this string quotes serde's complaint
+            // about a file a human may have hand-edited, serde echoes the offending value
+            // verbatim, and its only reader is a `git.log` line in a file created under the
+            // ordinary umask. A cache documented as never containing a secret must also never
+            // republish one it was handed. Needs `use crate::git::error::scrub;`.
+            load_error: load_error.map(|e| scrub(&e, &[])),
         }
     }
 

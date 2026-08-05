@@ -1103,6 +1103,16 @@ error[E0599]: no method named `put_repo` found for struct `Arc<GitService>` in t
 
 - [ ] **Step 18: Implement `recover_index_locks` and `put_repo`/`delete_repo`**
 
+> **Amended by the post-execution audit (F3, F8).** Both mutators originally opened with
+> `if !self.registry.writable() { … }` and `if let Some(job) = self.jobs.busy(id) { … }` — a
+> readability check that could not word the second refusal, and a **sample** where a lock was
+> needed. `JobStore::busy` releases the mutex before it returns, so an auto-sync tick admitted in
+> the gap between the sample and the purge left libgit2 writing into the directory
+> `remove_dir_all` was walking; and on the `path_refused` early return, `state.forget` and
+> `jobs.forget_repo` sat *below* the purge and never ran, leaving a `last_sync` row and job
+> records for an id that was no longer registered. `hold_repo` (task 5, step 63) is the fix, and
+> the two forgets move up to sit directly under `registry.remove`.
+
 Add to the import block: `use crate::git::registry::{PutOutcome, RepoDef, RepoView};` and
 `use crate::git::ops;`. Replace the `recover_index_locks` placeholder and add the registry
 mutators inside `impl GitService`:
@@ -1152,14 +1162,18 @@ mutators inside `impl GitService`:
 
     pub fn put_repo(self: &Arc<Self>, id: &str, body: RepoDef) -> Result<PutOutcome, GitError> {
         crate::git::registry::validate_id(id)?;
-        if !self.registry.writable() {
-            return Err(GitError::registry_read_only().with_repo(id));
-        }
-        // A job snapshotted its `RepoDef` at admission, so a replace mid-job would
-        // silently not apply to the operation the caller can see running.
-        if let Some(job) = self.jobs.busy(id) {
-            return Err(GitError::repo_busy(id, job.op.as_str()));
-        }
+        // Writability before the hold, so a read-only host answers 403 rather than
+        // taking a lock it is about to refuse to use. `ensure_writable` and not
+        // `writable()`, because only the former can word the second refusal — a
+        // `repos.json` the host could neither read nor quarantine (task 4).
+        self.registry
+            .ensure_writable()
+            .map_err(|e| e.with_repo(id))?;
+        // Held rather than sampled, exactly as in `delete_repo`: a job snapshotted its
+        // `RepoDef` at admission, and a job admitted in the gap between a `busy()` read
+        // and the write below would run the whole way through against a definition the
+        // caller has already been told was replaced.
+        let _hold = self.jobs.hold_repo(id)?;
         let outcome = self.registry.put(body)?;
         self.spawn_auto_timer(id);
         Ok(outcome)
@@ -1298,12 +1312,17 @@ and, inside `impl GitService`, immediately after `put_repo`:
 ```rust
     pub fn delete_repo(&self, id: &str, purge: bool) -> Result<DeleteOutcome, GitError> {
         crate::git::registry::validate_id(id)?;
-        if !self.registry.writable() {
-            return Err(GitError::registry_read_only().with_repo(id));
-        }
-        if let Some(job) = self.jobs.busy(id) {
-            return Err(GitError::repo_busy(id, job.op.as_str()));
-        }
+        self.registry
+            .ensure_writable()
+            .map_err(|e| e.with_repo(id))?;
+        // Held for the whole call, not sampled: `start_job` snapshots the definition and
+        // resolves credentials *before* it admits, so an auto-sync tick can land in the
+        // gap between a `busy()` read and the purge below and leave libgit2 writing into
+        // the directory `remove_dir_all` is walking. The hold occupies the same map entry
+        // `admit` takes, so the two are decided by one acquisition of the job store's
+        // mutex, and `Drop` releases it on every path out of here — the refused purge
+        // included. `_hold` and not `_`: the latter drops it on the spot.
+        let _hold = self.jobs.hold_repo(id)?;
         let tree = self.tree_path(id);
         // Containment is checked before anything is removed: a refusal must leave both
         // the registry entry and the tree exactly as they were.
@@ -1314,6 +1333,13 @@ and, inside `impl GitService`, immediately after `put_repo`:
         // a registered repo with no tree, which no retry can repair; this order leaves
         // at worst an orphaned directory, which a re-`PUT` reuses.
         self.registry.remove(id)?;
+        // Both belong to the definition, not to the tree: once the entry is gone the id
+        // is unregistered whatever the purge does, and a `last_sync` row or a job record
+        // left behind by a refusal below would be inherited by the next `PUT` of the same
+        // id. `forget_repo` touches only terminal records, never `busy`, so it cannot
+        // clear the hold it is running inside.
+        self.state.forget(id);
+        self.jobs.forget_repo(id);
         let purged = if purge {
             match ops::purge_tree(&self.repos_root_canon, &tree) {
                 Ok(()) => true,
@@ -1324,8 +1350,6 @@ and, inside `impl GitService`, immediately after `put_repo`:
         } else {
             false
         };
-        self.state.forget(id);
-        self.jobs.forget_repo(id);
         Ok(DeleteOutcome {
             deleted: true,
             purged,
@@ -2188,12 +2212,12 @@ Append to `mod tests` in `src/git/mod.rs`:
 
 ```rust
     #[tokio::test]
-    async fn network_verbs_need_a_remote_and_reset_needs_confirmation() {
+    async fn remote_verbs_need_a_remote_and_reset_needs_confirmation() {
         let ops = FakeOps::ok();
         let fx = service("[git]\n", ops.clone()).await;
         fx.svc.put_repo("notes", repo_def("notes", None)).unwrap();
 
-        for op in [JobOp::Clone, JobOp::Pull, JobOp::Push, JobOp::Sync] {
+        for op in [JobOp::Clone, JobOp::Pull, JobOp::Push] {
             let err = fx
                 .svc
                 .start_job("notes", op, OpRequest::manual())
@@ -2201,8 +2225,18 @@ Append to `mod tests` in `src/git/mod.rs`:
             assert_eq!(err.code(), GitErrorCode::RemoteMissing, "{op:?}");
             assert_eq!(err.repo_id.as_deref(), Some("notes"));
         }
-        // Local-only verbs are unaffected by a missing remote.
-        assert!(fx.svc.start_job("notes", JobOp::Init, OpRequest::manual()).is_ok());
+        // `sync` is deliberately NOT in that loop: §9.4 says a `remote: null` repo's
+        // sync inits and commits, so refusing it here would make that promise
+        // unreachable. This assertion is the guard against the whole list being pasted
+        // back, and it doubles as the local-only-verbs-are-unaffected case — one job at
+        // a time per repo, so admitting an `Init` first would only make this one 409.
+        assert!(
+            matches!(
+                fx.svc.start_job("notes", JobOp::Sync, OpRequest::manual()),
+                Ok(StartOutcome::Started(_))
+            ),
+            "§9.4: a local-only sync is admitted, not refused"
+        );
 
         let mut req = OpRequest::manual();
         req.reset = Some(crate::git::ops::ResetRequest {
@@ -2217,8 +2251,8 @@ Append to `mod tests` in `src/git/mod.rs`:
         assert_eq!(err.code(), GitErrorCode::ConfirmRequired);
 
         // A refused request must never have reached the executor, and must never have
-        // left a job record behind for a caller to poll.
-        assert_eq!(ops.calls().len(), 1, "only the Init job ran");
+        // left a job record behind for a caller to poll. One call: the admitted `sync`.
+        assert_eq!(ops.calls().len(), 1, "only the Sync job ran");
     }
 
     #[tokio::test]
@@ -2239,31 +2273,44 @@ Append to `mod tests` in `src/git/mod.rs`:
 
 - [ ] **Step 42: Run the tests and watch them fail**
 
-Run: `cargo test --bin chrome-host-app git::tests::network_verbs`
+Run: `cargo test --bin chrome-host-app git::tests::remote_verbs`
 
 Expected: FAIL — the guards do not exist, so `start_job` admits the job and returns `Ok`.
 
 ```
 running 1 test
-test git::tests::network_verbs_need_a_remote_and_reset_needs_confirmation ... FAILED
+test git::tests::remote_verbs_need_a_remote_and_reset_needs_confirmation ... FAILED
 
 failures:
 
----- git::tests::network_verbs_need_a_remote_and_reset_needs_confirmation stdout ----
+---- git::tests::remote_verbs_need_a_remote_and_reset_needs_confirmation stdout ----
 thread 'git::tests::…' panicked at src/git/mod.rs:NN:14:
 no remote
 ```
 
 - [ ] **Step 43: Implement the guards**
 
+> **Amended by the post-execution audit (F5a).** This step's `matches!` originally listed
+> `JobOp::Sync` alongside `Clone`/`Pull`/`Push`, which contradicted two documents Task 8 had
+> already been implemented against: spec §5.6's admission table (`remote_missing` is
+> "`clone`/`pull`/`push` on a repo with `remote: null`") and README §9.4 ("`null` means a
+> local-only repo: `sync` inits and commits and reports `outcome: "committed"`"). The effect was
+> that a `remote: null` repo could never sync at all — the local-only arm inside `ops::sync` was
+> dead code for as long as this guard stood, and task 11's `settings_sync_events` fixture had to
+> point at a fake remote to work around it. Step 41's test above asserted the defect, so it is
+> corrected too and renamed `remote_verbs_…`.
+
 Insert into `start_job`, immediately after `let def = self.registry.snapshot(repo_id)?;`:
 
 ```rust
         // Refused before admission, so a request that cannot possibly succeed never
-        // creates a job record for the caller to poll.
-        if def.remote.is_none()
-            && matches!(op, JobOp::Clone | JobOp::Pull | JobOp::Push | JobOp::Sync)
-        {
+        // creates a job record for the caller to poll. `sync` is deliberately not in
+        // this list: §9.4's `remote: null` is a local-only repo whose sync stages and
+        // commits (`ops::sync`'s early return), so the verb still has an arm to run.
+        // The rule is that admission refuses a verb only when EVERY mode of it is
+        // impossible — which is why `reset` is not here either: `to: "upstream"` needs
+        // an upstream and fails in the worker, `to: "head"` needs nothing.
+        if def.remote.is_none() && matches!(op, JobOp::Clone | JobOp::Pull | JobOp::Push) {
             return Err(GitError::remote_missing().with_repo(repo_id));
         }
         if op == JobOp::Reset && !req.reset.as_ref().is_some_and(|r| r.confirm) {
@@ -2284,7 +2331,7 @@ Expected: PASS.
 ```
 running 21 tests
 test git::tests::a_job_for_an_unknown_or_invalid_repo_is_refused_before_admission ... ok
-test git::tests::network_verbs_need_a_remote_and_reset_needs_confirmation ... ok
+test git::tests::remote_verbs_need_a_remote_and_reset_needs_confirmation ... ok
 ...
 test result: ok. 21 passed; 0 failed; 0 ignored; 0 measured; N filtered out
 ```
