@@ -566,9 +566,23 @@ impl Inner {
     fn drop_job(&mut self, id: &JobId) {
         self.terminal.retain(|q| q != id);
         if let Some(slot) = self.jobs.remove(id) {
-            // Rule 5: the id becomes reusable the moment its record goes.
+            // Rule 5: the id becomes reusable the moment its record goes — but only
+            // while the index still names *this* job. `admit` re-points the key at a
+            // fresh job when a failed op is retried under the same `request_id`, and the
+            // superseded record stays here until retention takes it, so evicting it must
+            // not delete the successor's entry: that would answer the next matching
+            // retry with the 409 the replay-before-busy rule promises is impossible.
+            // Same ownership test `RepoLease::drop` applies to `busy`, for the same
+            // reason — the two are one rule about two indexes, not a coincidence.
+            //
+            // Sound only because `jobs` is keyed by `JobId` and `slot.id == *id`; a
+            // future change that files a slot under some other key must compare against
+            // `Some(&slot.id)` instead.
             if let Some(rid) = slot.request_id.clone() {
-                self.by_request.remove(&(slot.repo_id.clone(), rid));
+                let key = (slot.repo_id.clone(), rid);
+                if self.by_request.get(&key) == Some(id) {
+                    self.by_request.remove(&key);
+                }
             }
         }
     }
@@ -958,6 +972,19 @@ mod tests {
             panic!("expected Started for {repo}");
         };
         slot.succeed(&serde_json::json!({"outcome": "up_to_date"}));
+        drop(lease);
+        slot.id.clone()
+    }
+
+    /// The same for a job that *fails*: the failed record is the one the retry contract
+    /// is written for, and the one retention later evicts out from under its successor.
+    fn fail_now(store: &Arc<JobStore>, repo: &str, request_id: Option<&str>) -> JobId {
+        let Admission::Started(slot, lease) =
+            store.admit(repo, JobOp::Sync, request_id).expect("admit")
+        else {
+            panic!("expected Started for {repo}");
+        };
+        slot.fail(&GitError::internal("boom"));
         drop(lease);
         slot.id.clone()
     }
@@ -1584,5 +1611,76 @@ mod tests {
 
         gate.release(1);
         worker.join().expect("worker");
+    }
+
+    #[test]
+    fn evicting_a_superseded_record_keeps_the_live_successors_request_id() {
+        let clock = TestClock::new(1_700_000_000_000);
+        let store = store(&clock);
+        let failed = fail_now(&store, "notes", Some("r1"));
+
+        let Admission::Started(fresh, lease) = store
+            .admit("notes", JobOp::Sync, Some("r1"))
+            .expect("admit")
+        else {
+            panic!("retrying a failed op under the same request_id must work");
+        };
+        assert_ne!(fresh.id, failed);
+
+        // Ages the superseded record past its TTL. `admit`'s own `evict` is what drops
+        // it — never `drop_job` by hand — so this is the production path, and the
+        // injected clock means no test in this file sleeps to reach it.
+        clock.advance(JOB_TTL_SECS * 1_000);
+        let Admission::Replay(same) = store
+            .admit("notes", JobOp::Sync, Some("r1"))
+            .expect("admit")
+        else {
+            panic!("the running successor must replay, never 409");
+        };
+        assert_eq!(same.id, fresh.id);
+        assert!(store.get(&failed).is_none(), "the expired record is gone");
+
+        fresh.succeed(&serde_json::json!({"outcome": "up_to_date"}));
+        drop(lease);
+        let Admission::Replay(same) = store
+            .admit("notes", JobOp::Sync, Some("r1"))
+            .expect("admit")
+        else {
+            panic!("a succeeded job replays; a second sync is the duplicate this prevents");
+        };
+        assert_eq!(same.id, fresh.id);
+    }
+
+    #[test]
+    fn forget_repo_leaves_a_live_successors_request_id_alone() {
+        let clock = TestClock::new(1_700_000_000_000);
+        let store = store(&clock);
+        let failed = fail_now(&store, "notes", Some("r1"));
+
+        let Admission::Started(fresh, lease) = store
+            .admit("notes", JobOp::Sync, Some("r1"))
+            .expect("admit")
+        else {
+            panic!("retrying a failed op under the same request_id must work");
+        };
+
+        // The other `drop_job` call site. Reachable in production through the narrow
+        // window in `GitService::delete_repo` between the hold and `forget_repo`, which
+        // is the same window `forget_repo`'s own live-job carve-out exists for.
+        store.forget_repo("notes");
+        assert!(store.get(&failed).is_none(), "the failed record is gone");
+        assert!(
+            store.get(&fresh.id).is_some(),
+            "the live job keeps its record"
+        );
+
+        let Admission::Replay(same) = store
+            .admit("notes", JobOp::Sync, Some("r1"))
+            .expect("admit")
+        else {
+            panic!("a live job keeps its request_id too, so the retry still replays");
+        };
+        assert_eq!(same.id, fresh.id);
+        drop(lease);
     }
 }
