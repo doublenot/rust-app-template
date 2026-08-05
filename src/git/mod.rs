@@ -571,14 +571,16 @@ impl GitService {
 
     pub fn put_repo(self: &Arc<Self>, id: &str, body: RepoDef) -> Result<PutOutcome, GitError> {
         crate::git::registry::validate_id(id)?;
-        if !self.registry.writable() {
-            return Err(GitError::registry_read_only().with_repo(id));
-        }
-        // A job snapshotted its `RepoDef` at admission, so a replace mid-job would
-        // silently not apply to the operation the caller can see running.
-        if let Some(job) = self.jobs.busy(id) {
-            return Err(GitError::repo_busy(id, job.op.as_str()));
-        }
+        // Writability before the hold, so a read-only host answers 403 rather than
+        // taking a lock it is about to refuse to use.
+        self.registry
+            .ensure_writable()
+            .map_err(|e| e.with_repo(id))?;
+        // Held rather than sampled, exactly as in `delete_repo`: a job snapshotted its
+        // `RepoDef` at admission, and a job admitted in the gap between a `busy()` read
+        // and the write below would run the whole way through against a definition the
+        // caller has already been told was replaced.
+        let _hold = self.jobs.hold_repo(id)?;
         let outcome = self.registry.put(body)?;
         self.spawn_auto_timer(id);
         Ok(outcome)
@@ -586,12 +588,17 @@ impl GitService {
 
     pub fn delete_repo(&self, id: &str, purge: bool) -> Result<DeleteOutcome, GitError> {
         crate::git::registry::validate_id(id)?;
-        if !self.registry.writable() {
-            return Err(GitError::registry_read_only().with_repo(id));
-        }
-        if let Some(job) = self.jobs.busy(id) {
-            return Err(GitError::repo_busy(id, job.op.as_str()));
-        }
+        self.registry
+            .ensure_writable()
+            .map_err(|e| e.with_repo(id))?;
+        // Held for the whole call, not sampled: `start_job` snapshots the definition and
+        // resolves credentials *before* it admits, so an auto-sync tick can land in the
+        // gap between a `busy()` read and the purge below and leave libgit2 writing into
+        // the directory `remove_dir_all` is walking. The hold occupies the same map entry
+        // `admit` takes, so the two are decided by one acquisition of the job store's
+        // mutex, and `Drop` releases it on every path out of here — the refused purge
+        // included. `_hold` and not `_`: the latter drops it on the spot.
+        let _hold = self.jobs.hold_repo(id)?;
         let tree = self.tree_path(id);
         // Containment is checked before anything is removed: a refusal must leave both
         // the registry entry and the tree exactly as they were.
@@ -602,6 +609,13 @@ impl GitService {
         // a registered repo with no tree, which no retry can repair; this order leaves
         // at worst an orphaned directory, which a re-`PUT` reuses.
         self.registry.remove(id)?;
+        // Both belong to the definition, not to the tree: once the entry is gone the id
+        // is unregistered whatever the purge does, and a `last_sync` row or a job record
+        // left behind by a refusal below would be inherited by the next `PUT` of the same
+        // id. `forget_repo` touches only terminal records, never `busy`, so it cannot
+        // clear the hold it is running inside.
+        self.state.forget(id);
+        self.jobs.forget_repo(id);
         let purged = if purge {
             match ops::purge_tree(&self.repos_root_canon, &tree) {
                 Ok(()) => true,
@@ -612,8 +626,6 @@ impl GitService {
         } else {
             false
         };
-        self.state.forget(id);
-        self.jobs.forget_repo(id);
         Ok(DeleteOutcome {
             deleted: true,
             purged,
@@ -1619,6 +1631,128 @@ mod tests {
         assert!(out.purged);
         assert!(!tree.exists());
         assert_eq!(out.path, tree.display().to_string());
+    }
+
+    #[tokio::test]
+    async fn delete_and_put_take_the_repo_rather_than_sampling_it() {
+        let fx = service("[git]\n", FakeOps::ok()).await;
+        fx.svc.put_repo("notes", repo_def("notes", None)).unwrap();
+        let tree = fx.svc.tree_path("notes");
+        std::fs::create_dir_all(&tree).unwrap();
+        std::fs::write(tree.join("inbox.md"), b"hi").unwrap();
+
+        // A stand-in for the window the sampled check left open: `start_job` snapshots
+        // the definition and resolves credentials before it admits, so a timer tick
+        // already past those steps can be admitted at any instant after a `busy()` read
+        // returns. A hold is what a `busy()` sample cannot see — there is no *job*.
+        let hold = fx.svc.jobs().hold_repo("notes").expect("idle repo");
+
+        let err = fx.svc.delete_repo("notes", true).expect_err("held");
+        assert_eq!(err.code(), GitErrorCode::RepoLocked);
+        assert_eq!(err.http_status().as_u16(), 409);
+        assert!(
+            tree.join("inbox.md").exists(),
+            "a purge must never run over a tree somebody else holds"
+        );
+        assert_eq!(fx.svc.repo_count(), 1);
+        let err = fx
+            .svc
+            .put_repo("notes", repo_def("notes", None))
+            .expect_err("held");
+        assert_eq!(err.code(), GitErrorCode::RepoLocked);
+        let err = refused(
+            fx.svc
+                .start_job("notes", JobOp::Commit, OpRequest::manual()),
+            "a held repo admits no job",
+        );
+        assert_eq!(err.code(), GitErrorCode::RepoLocked);
+
+        drop(hold);
+        let out = fx.svc.delete_repo("notes", true).expect("released");
+        assert!(out.deleted && out.purged);
+        assert!(!tree.exists());
+    }
+
+    /// A guard, not a reproduction: the sampled check answered `repo_busy` here too.
+    /// What it pins is that routing DELETE through `hold_repo` keeps the *job* case
+    /// answering `repo_busy` and naming the op, rather than collapsing it into
+    /// `repo_locked` — which is what keeps `error.job` populated for the one code
+    /// `api.rs` documents a client as branching on.
+    #[tokio::test]
+    async fn delete_of_a_repo_with_a_job_in_flight_is_repo_busy() {
+        let fx = service("[git]\n", FakeOps::ok()).await;
+        fx.svc.put_repo("notes", repo_def("notes", None)).unwrap();
+        let tree = fx.svc.tree_path("notes");
+        std::fs::create_dir_all(&tree).unwrap();
+        std::fs::write(tree.join("inbox.md"), b"hi").unwrap();
+
+        let Admission::Started(slot, lease) = fx
+            .svc
+            .jobs()
+            .admit("notes", JobOp::Commit, None)
+            .expect("admit")
+        else {
+            panic!("expected a freshly started job");
+        };
+
+        let err = fx.svc.delete_repo("notes", true).expect_err("busy");
+        assert_eq!(err.code(), GitErrorCode::RepoBusy);
+        assert!(err.message.contains("commit"), "{}", err.message);
+        assert!(tree.join("inbox.md").exists());
+        assert_eq!(fx.svc.repo_count(), 1);
+
+        slot.succeed(&serde_json::json!({"outcome": "up_to_date"}));
+        drop(lease);
+        assert!(fx.svc.delete_repo("notes", true).expect("free").purged);
+    }
+
+    /// The other half of the finding: a DELETE that gets as far as removing the
+    /// definition and *then* refuses the purge used to return before it forgot
+    /// anything, leaving a `last_sync` row and terminal job records filed under an id
+    /// the registry no longer knows — and the next `PUT` of that id inherited them.
+    #[tokio::test]
+    async fn a_refused_purge_still_forgets_the_state_and_the_job_records() {
+        let fx = service("[git]\n", FakeOps::ok()).await;
+        fx.svc.put_repo("notes", repo_def("notes", None)).unwrap();
+        let started = fx
+            .svc
+            .start_job("notes", JobOp::Commit, OpRequest::manual())
+            .expect("commit");
+        settle(&fx.svc, "notes", started.slot()).await;
+        assert!(fx.svc.state.last_sync("notes").is_some(), "a row to leak");
+
+        // `repos/notes` is a symlink to a sibling *inside* the root, so `contained_in`
+        // resolves it and passes while `purge_tree` is what refuses — the only DELETE
+        // path that returns after the definition is already gone.
+        let root = fx.paths.repos_dir.clone();
+        std::fs::create_dir_all(root.join("other")).unwrap();
+        let link = root.join("notes");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(root.join("other"), &link).unwrap();
+        #[cfg(windows)]
+        std::os::windows::fs::symlink_dir(root.join("other"), &link).unwrap();
+
+        let err = fx
+            .svc
+            .delete_repo("notes", true)
+            .expect_err("refused purge");
+        assert_eq!(err.code(), GitErrorCode::PathRefused);
+        assert_eq!(fx.svc.repo_count(), 0, "the definition still went");
+        assert!(root.join("other").exists(), "nothing was removed");
+        assert!(
+            fx.svc.state.last_sync("notes").is_none(),
+            "an unregistered id must not keep a last_sync row for the next PUT"
+        );
+        assert!(
+            fx.svc
+                .jobs()
+                .list(&crate::git::jobs::JobFilter {
+                    repo_id: Some("notes".to_string()),
+                    ..Default::default()
+                })
+                .is_empty(),
+            "nor its job records"
+        );
     }
 
     #[tokio::test]
