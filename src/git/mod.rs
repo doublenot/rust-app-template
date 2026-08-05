@@ -444,8 +444,10 @@ impl GitService {
         self.cfg.status_api
     }
 
-    /// One source of truth: `Registry::load` also turns this off when `repos.json`
-    /// itself is unwritable, and callers must see that, not just the config key.
+    /// One source of truth: `Registry` also turns this off when a `repos.json` it could
+    /// neither read nor quarantine is still on disk, and callers must see that, not just
+    /// the config key. (It never turned it off for an unwritable *file*, which is what
+    /// this said before task 12's audit — `load` has no such path and never had one.)
     pub fn registry_writes(&self) -> bool {
         self.registry.writable()
     }
@@ -1355,9 +1357,23 @@ mod tests {
     }
 
     async fn service(git: &str, ops: Arc<dyn GitOps>) -> Svc {
+        service_planted(git, ops, |_| {}).await
+    }
+
+    /// The same, with one window opened: `plant` runs after `paths.ensure()` and before
+    /// `GitService::with_ops`, which is the only moment a test can decide what the
+    /// on-disk registry looks like at startup. `Registry::load` runs once, inside
+    /// `with_ops`, and repos.json is deliberately not hot-reloaded — so writing the file
+    /// after `service()` returns would be testing nothing at all.
+    async fn service_planted(
+        git: &str,
+        ops: Arc<dyn GitOps>,
+        plant: impl FnOnce(&crate::config::RuntimePaths),
+    ) -> Svc {
         let dir = tempfile::tempdir().unwrap();
         let paths = crate::config::RuntimePaths::under(dir.path(), "com.example.test");
         paths.ensure().unwrap();
+        plant(&paths);
         let (tx, events) = tokio::sync::mpsc::unbounded_channel();
         let status = Arc::new(tokio::sync::RwLock::new(AppStatus::Ready {
             target_url: "http://x/".to_string(),
@@ -1580,6 +1596,32 @@ mod tests {
         assert!(line.contains("repos=0"), "{line}");
     }
 
+    /// §9.7 promises `git.log` has URL userinfo stripped before anything is written, and
+    /// `supervisor::open_log` creates that file 0644. The entry whose `insecure_remote`
+    /// refusal warns that "a password in the remote URL would be copied into log lines"
+    /// was the one doing the copying, on every launch, before a single job ran.
+    #[tokio::test]
+    async fn a_rejected_entrys_password_never_reaches_git_log() {
+        const PASSWORD: &str = "hunter2SUPERSECRET";
+        let fx = service_planted("[git]\n", FakeOps::ok(), |paths| {
+            std::fs::write(
+                &paths.registry_file,
+                format!(
+                    r#"{{"version":1,"repos":[{{"id":"x","remote":"https://user:{PASSWORD}@github.com/acme/x.git"}}]}}"#
+                ),
+            )
+            .unwrap();
+        })
+        .await;
+
+        let log = fx.git_log();
+        assert!(!log.contains(PASSWORD), "{log}");
+        // Silence would be a cheaper fix and a worse one: the operator still has to be
+        // able to find the entry that was refused and the host it points at.
+        assert!(log.contains("insecure_remote"), "{log}");
+        assert!(log.contains("github.com"), "{log}");
+    }
+
     #[tokio::test]
     async fn start_is_idempotent_and_a_second_run_appends() {
         let fx = service("[git]\n", FakeOps::ok()).await;
@@ -1773,6 +1815,40 @@ mod tests {
         let err = fx.svc.delete_repo("notes", false).expect_err("read-only");
         assert_eq!(err.code(), GitErrorCode::RegistryReadOnly);
         assert!(!fx.svc.registry_writes());
+        assert!(
+            fx.svc.service_info().registry_error.is_none(),
+            "the config key is a choice, not a fault"
+        );
+    }
+
+    /// The same 403 for the other reason, and the distinguisher that makes a second wire
+    /// code unnecessary: `registry_writable: false` **with** a `registry_error` is a
+    /// fault only this message names, **without** one is the config key above.
+    #[tokio::test]
+    async fn both_mutators_are_refused_when_repos_json_could_not_be_read() {
+        // A directory where the file should be: the one read failure every OS and every
+        // uid agrees on, where a `chmod 000` is a no-op under root.
+        let fx = service_planted("[git]\n", FakeOps::ok(), |paths| {
+            std::fs::create_dir(&paths.registry_file).unwrap();
+        })
+        .await;
+        assert!(!fx.svc.registry_writes());
+        let info = fx.svc.service_info();
+        assert!(!info.registry_writable);
+        assert!(info.registry_error.is_some(), "a fault, not a choice");
+
+        let err = fx
+            .svc
+            .put_repo("notes", repo_def("notes", None))
+            .expect_err("unreadable");
+        assert_eq!(err.code(), GitErrorCode::RegistryReadOnly);
+        assert_eq!(err.repo_id.as_deref(), Some("notes"));
+        let err = fx.svc.delete_repo("notes", false).expect_err("unreadable");
+        assert_eq!(err.code(), GitErrorCode::RegistryReadOnly);
+        assert_eq!(err.repo_id.as_deref(), Some("notes"));
+
+        let log = fx.git_log();
+        assert!(log.contains("registry registry_corrupt"), "{log}");
     }
 
     #[tokio::test]
