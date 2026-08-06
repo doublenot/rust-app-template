@@ -76,6 +76,43 @@ pub fn init_libgit2_timeouts(network_timeout_secs: u64) -> Result<(), GitError> 
     Ok(())
 }
 
+/// Every `*.lock` anywhere under `root`, at any depth.
+///
+/// Any depth because a branch name may contain `/`, so `refs/heads/feature/x.lock` is
+/// an ordinary name rather than an odd one. `read_dir` rather than a crate: this walks
+/// a directory the host owns, and the only property that needs care is that it must
+/// not walk *out* of it — `DirEntry::file_type` does not traverse, so a symlinked
+/// directory is never descended into, while a symlinked lock file is still collected
+/// (unlinking one removes the link, never what it points at, and libgit2's
+/// `O_CREAT|O_EXCL` is blocked by it either way).
+///
+/// The depth bound is not a limit on real branch names — it is a stop, in case a link
+/// somehow does produce a cycle.
+fn locks_under(root: &Path) -> Vec<PathBuf> {
+    fn walk(dir: &Path, depth: usize, out: &mut Vec<PathBuf>) {
+        if depth == 0 {
+            return;
+        }
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let Ok(kind) = entry.file_type() else {
+                continue;
+            };
+            let path = entry.path();
+            if kind.is_dir() {
+                walk(&path, depth - 1, out);
+            } else if path.extension().is_some_and(|e| e == "lock") {
+                out.push(path);
+            }
+        }
+    }
+    let mut out = Vec::new();
+    walk(root, 16, &mut out);
+    out
+}
+
 /// Resolve `candidate` and refuse it unless it lands strictly inside `root_canon`.
 ///
 /// Both sides are canonical, which is the only form in which the question is
@@ -532,9 +569,16 @@ impl GitService {
         ));
     }
 
-    /// `std::process::exit(0)` runs no destructors, so an abandoned job can leave one
-    /// durable residue: `.git/index.lock`. Clearing it is safe because the host holds
-    /// `app.lock` and owns `<data-dir>/repos/`.
+    /// `std::process::exit(0)` runs no destructors, so an abandoned job can leave
+    /// durable residue: `.git/index.lock`, and — since `merge::lock_branch` — a
+    /// `refs/**/*.lock` too. Clearing them is safe because the host holds `app.lock`
+    /// and owns `<data-dir>/repos/`.
+    ///
+    /// A stale ref lock is not merely an inconvenience. It is the fault that
+    /// `merge::lock_branch` exists to survive, and the reason it has to survive it is
+    /// that nothing used to clear it: the repository stayed unsyncable until a human
+    /// found the file. Sweeping it at startup is the other half of that fix — one
+    /// makes the failure harmless, this makes it go away.
     ///
     /// Deliberately **no** `reset --hard` and **no** `cleanup_state()`: our merge never
     /// enters `RepositoryState::Merge`, so a merge state in one of these trees was
@@ -543,10 +587,6 @@ impl GitService {
     /// a tree alone, and every mutating verb then refuses it rather than committing over
     /// it.
     fn recover_index_locks(&self) {
-        // Captured at construction, not here: see `started_at`. The guard only has to
-        // distinguish a lock left by a previous run of ours from one a `git` process
-        // created after this host came up.
-        let started = self.started_at;
         for id in self.registry.ids() {
             let tree = self.tree_path(&id);
             // A symlink planted at `repos/<id>` would point the unlink at a repository
@@ -554,23 +594,39 @@ impl GitService {
             let Ok(real) = contained_in(&self.repos_root_canon, &tree) else {
                 continue;
             };
-            let lock = real.join(".git").join("index.lock");
-            let Ok(meta) = std::fs::metadata(&lock) else {
-                continue;
-            };
-            match meta.modified() {
-                Ok(mtime) if mtime < started => match std::fs::remove_file(&lock) {
-                    Ok(()) => {
-                        self.log_startup(&format!("repo={id} removed stale {}", lock.display()))
-                    }
-                    Err(e) => self
-                        .log_startup(&format!("repo={id} cannot remove {}: {e}", lock.display())),
-                },
-                _ => self.log_startup(&format!(
-                    "repo={id} {} is newer than this process; left in place",
-                    lock.display()
-                )),
+            let git = real.join(".git");
+            self.clear_stale_lock(&id, &git.join("index.lock"));
+            // `HEAD.lock` and `packed-refs.lock` are the other two libgit2 takes on a
+            // ref write; the loose lock lives beside the ref itself, at any depth,
+            // because a branch name may contain `/`.
+            self.clear_stale_lock(&id, &git.join("HEAD.lock"));
+            self.clear_stale_lock(&id, &git.join("packed-refs.lock"));
+            for lock in locks_under(&git.join("refs")) {
+                self.clear_stale_lock(&id, &lock);
             }
+        }
+    }
+
+    /// Remove one lock file, but only if this process cannot have been the one that
+    /// took it.
+    fn clear_stale_lock(&self, id: &str, lock: &Path) {
+        // `started_at` is captured at construction, not here: the guard only has to
+        // distinguish a lock left by a previous run of ours from one a `git` process
+        // created after this host came up.
+        let Ok(meta) = std::fs::symlink_metadata(lock) else {
+            return;
+        };
+        match meta.modified() {
+            Ok(mtime) if mtime < self.started_at => match std::fs::remove_file(lock) {
+                Ok(()) => self.log_startup(&format!("repo={id} removed stale {}", lock.display())),
+                Err(e) => {
+                    self.log_startup(&format!("repo={id} cannot remove {}: {e}", lock.display()))
+                }
+            },
+            _ => self.log_startup(&format!(
+                "repo={id} {} is newer than this process; left in place",
+                lock.display()
+            )),
         }
     }
 
@@ -1438,8 +1494,13 @@ mod tests {
     }
 
     fn plant_index_lock(tree: &Path, age: Duration) -> PathBuf {
-        let lock = tree.join(".git").join("index.lock");
-        std::fs::create_dir_all(tree.join(".git")).unwrap();
+        plant_lock(tree, "index.lock", age)
+    }
+
+    /// `rel` is relative to `.git`, so a ref lock is planted at its real depth.
+    fn plant_lock(tree: &Path, rel: &str, age: Duration) -> PathBuf {
+        let lock = tree.join(".git").join(rel);
+        std::fs::create_dir_all(lock.parent().unwrap()).unwrap();
         std::fs::write(&lock, b"").unwrap();
         let when = std::time::SystemTime::now() - age;
         let f = std::fs::File::options().write(true).open(&lock).unwrap();
@@ -1670,6 +1731,40 @@ mod tests {
         let log = fx.git_log();
         assert!(log.contains("repo=stale"), "{log}");
         assert!(log.contains("left in place"), "{log}");
+    }
+
+    #[tokio::test]
+    async fn startup_clears_stale_ref_locks_at_whatever_depth_they_sit() {
+        // `.git/index.lock` was never the only durable residue of a killed host, and
+        // the one it missed is the one that costs most: a stale ref lock is the fault
+        // `merge::lock_branch` is built to survive, and until this swept it the
+        // repository stayed unsyncable until a human went looking for the file.
+        // `refs/heads/feature/x.lock` is here because a branch name may contain `/`,
+        // so the sweep cannot be a fixed list of paths.
+        let fx = service("[git]\n", FakeOps::ok()).await;
+        fx.svc.put_repo("notes", repo_def("notes", None)).unwrap();
+        let tree = fx.svc.tree_path("notes");
+        let old = Duration::from_secs(600);
+        let stale = [
+            plant_lock(&tree, "refs/heads/main.lock", old),
+            plant_lock(&tree, "refs/heads/feature/x.lock", old),
+            plant_lock(&tree, "HEAD.lock", old),
+            plant_lock(&tree, "packed-refs.lock", old),
+        ];
+        let live = plant_lock(&tree, "refs/heads/busy.lock", Duration::ZERO);
+        // Not a lock, and not this function's business either way.
+        let ref_file = plant_lock(&tree, "refs/heads/main", old);
+
+        fx.svc.start();
+
+        for lock in &stale {
+            assert!(!lock.exists(), "{} survived startup", lock.display());
+        }
+        assert!(
+            live.exists(),
+            "a lock newer than this process belongs to whoever is holding it"
+        );
+        assert!(ref_file.exists(), "the sweep removed a reference");
     }
 
     #[tokio::test]
