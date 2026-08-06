@@ -55,6 +55,24 @@ use std::time::{Duration, Instant};
 /// wants to wait longer for a slow server wants `[git].network_timeout_secs`.
 pub const CONNECT_TIMEOUT_MS: i32 = 10_000;
 
+/// Serialises the two process-global timeout options against each other.
+///
+/// In a shipped build `GitService::start` is the only writer and runs once, so this
+/// costs one uncontended lock for the life of the process. It exists for the test
+/// binary, where the claim "one caller, once, on the main thread" is simply false:
+/// seven tests reach `start()` on tokio worker threads while an eighth installs a
+/// distinctive value and reads it straight back. Without a lock spanning that
+/// write-and-read pair, the eighth reads whichever value won — the same shape of
+/// process-global race as the `init.defaultBranch` one in `merge::testkit`, and the
+/// same fix: one gate, and everybody goes through it.
+static TIMEOUTS: Mutex<()> = Mutex::new(());
+
+/// A poisoned lock here guards no invariant — the protected value is libgit2's, not
+/// ours, and a panicking writer leaves it exactly as consistent as it found it.
+fn timeouts_guard() -> std::sync::MutexGuard<'static, ()> {
+    TIMEOUTS.lock().unwrap_or_else(|p| p.into_inner())
+}
+
 /// Install the process-global libgit2 network timeouts. Call once, from
 /// `GitService::start`, before any repository is opened.
 ///
@@ -62,11 +80,24 @@ pub const CONNECT_TIMEOUT_MS: i32 = 10_000;
 /// job watchdog lives inside the transfer callbacks, which never fire before the
 /// transport has data. Both libgit2 options default to 0, meaning "the OS default".
 pub fn init_libgit2_timeouts(network_timeout_secs: u64) -> Result<(), GitError> {
+    let _guard = timeouts_guard();
+    init_libgit2_timeouts_locked(network_timeout_secs)
+}
+
+/// The write itself, minus the gate.
+///
+/// Split out because `std::sync::Mutex` is not reentrant: the test that reads the
+/// pair back has to hold `TIMEOUTS` across both the write and the read, so it cannot
+/// go through the wrapper above. The caller must already hold `timeouts_guard()`.
+fn init_libgit2_timeouts_locked(network_timeout_secs: u64) -> Result<(), GitError> {
     let total = i32::try_from(network_timeout_secs.saturating_mul(1000)).unwrap_or(i32::MAX);
     // SAFETY: both setters mutate libgit2 process-global state and are documented as
-    // needing external synchronisation. The single caller runs once, on the main thread,
-    // during startup and before any repository has been opened, so no other thread can
-    // be inside libgit2 at this point.
+    // needing external synchronisation. `TIMEOUTS`, held by the caller, is that
+    // synchronisation — it is what makes the two options one atomic pair to anybody
+    // else going through here. In a shipped build the stronger property also holds:
+    // the single caller runs once, on the main thread, during startup and before any
+    // repository has been opened, so no other thread can be inside libgit2 at this
+    // point.
     unsafe {
         git2::opts::set_server_connect_timeout_in_milliseconds(CONNECT_TIMEOUT_MS)
             .map_err(|e| GitError::internal(format!("libgit2 connect timeout: {e}")))?;
@@ -1352,9 +1383,14 @@ mod tests {
     /// "whatever the OS decides", which on Linux is around two hours.
     #[test]
     fn network_timeouts_are_installed_from_the_configured_value() {
-        super::init_libgit2_timeouts(45).expect("libgit2 accepts both timeouts");
-        // SAFETY: reads libgit2 process-global state. Nothing else in this test binary
-        // writes it, and `init_libgit2_timeouts` has already returned.
+        // Under the same gate as the write, and for the reason `TIMEOUTS` documents:
+        // seven other tests in this binary reach `GitService::start`, which installs
+        // whatever *their* config says. Read outside the gate, this asserts on
+        // whichever of them ran last.
+        let _guard = super::timeouts_guard();
+        super::init_libgit2_timeouts_locked(45).expect("libgit2 accepts both timeouts");
+        // SAFETY: reads libgit2 process-global state, holding the lock every writer
+        // takes, so the pair cannot move underneath these two assertions.
         unsafe {
             assert_eq!(
                 git2::opts::get_server_connect_timeout_in_milliseconds().expect("connect"),
@@ -2620,12 +2656,6 @@ mod tests {
             .unwrap();
 
         fx.svc.run_quit_syncs(Duration::from_secs(5));
-        println!(
-            "PROBE log:
-{}",
-            fx.git_log()
-        );
-        println!("PROBE calls: {:?}", ops.calls());
 
         assert_eq!(ops.calls(), vec![(JobOp::Sync, "leaving".to_string())]);
         // Every later admission answers `shutting_down` (503): the window is closing

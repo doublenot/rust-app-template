@@ -1797,16 +1797,32 @@ mod tests {
     fn a_maintenance_hold_and_a_job_exclude_each_other() {
         let clock = TestClock::new(1_700_000_000_000);
         let store = store(&clock);
+        // Seeded before the hold, because the property below is about a request the
+        // client made *earlier* and is now retrying: `admit`'s contract is that "my
+        // request timed out, is it safe to retry?" is answerable, so a 409 must always
+        // mean somebody else holds the repo — never "you already asked for this".
+        let done = finish_now(&store, "notes", Some("r1"));
         let hold = store.hold_repo("notes").expect("an idle repo can be held");
 
         let Err(err) = store.admit("notes", JobOp::Sync, None) else {
             panic!("a held repo admits nothing");
         };
         assert_eq!(err.code().as_str(), "repo_locked");
-        // An *unknown* `request_id` falls through to the hold check like any other
-        // admission. A *matching* one still replays, because a replay hands back an
-        // existing record and touches neither the tree nor the registry entry.
-        let Err(err) = store.admit("notes", JobOp::Sync, Some("r1")) else {
+        // A *matching* `request_id` still replays past the hold, because a replay hands
+        // back an existing record and touches neither the tree nor the registry entry.
+        // Without this the contract was only a comment: moving the hold check above the
+        // replay lookup in `admit` left the whole suite green.
+        let Admission::Replay(same) = store
+            .admit("notes", JobOp::Sync, Some("r1"))
+            .expect("a matching request_id is never a 409")
+        else {
+            panic!("a matching request_id must replay past a maintenance hold");
+        };
+        assert_eq!(same.id, done);
+        // An *unknown* one has nothing to replay and falls through to the hold check
+        // like any other admission. A different id from the line above on purpose: the
+        // two cases are only distinct while one of them matches something.
+        let Err(err) = store.admit("notes", JobOp::Sync, Some("r2")) else {
             panic!("an unknown request_id is not a way past the hold");
         };
         assert_eq!(err.code().as_str(), "repo_locked");
@@ -1819,10 +1835,17 @@ mod tests {
         assert_eq!(err.code().as_str(), "repo_locked");
 
         // A hold is not a job: there is nothing to poll, nothing to embed in a 409, and
-        // nothing for `status.busy_job` to point at.
+        // nothing for `status.busy_job` to point at. Stated against the seeded record
+        // rather than against an empty store, which is the stronger form anyway — an
+        // empty list cannot tell "the hold added nothing" from "listing is broken".
         assert!(store.busy("notes").is_none());
-        assert!(store.list(&JobFilter::default()).is_empty());
         assert!(store.live_jobs().is_empty());
+        let listed: Vec<JobId> = store
+            .list(&JobFilter::default())
+            .into_iter()
+            .map(|slot| slot.id.clone())
+            .collect();
+        assert_eq!(listed, vec![done], "the hold left a record of its own");
 
         let Admission::Started(_, other) = store.admit("other", JobOp::Sync, None).expect("admit")
         else {
