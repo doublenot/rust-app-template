@@ -1117,19 +1117,28 @@ Add to the import block: `use crate::git::registry::{PutOutcome, RepoDef, RepoVi
 `use crate::git::ops;`. Replace the `recover_index_locks` placeholder and add the registry
 mutators inside `impl GitService`:
 
+> **Amended by the post-execution audit (second round).** `.git/index.lock` was never the
+> only durable residue of `std::process::exit(0)`, just the one that had been noticed. A
+> stale ref lock is the more expensive one: it is exactly the fault `merge::lock_branch`
+> (task 8) has to survive, and the reason it has to survive it is that nothing here removed
+> it, so the repository stayed unsyncable until a human went looking for a file they had no
+> reason to know about. `locks_under` walks `.git/refs` at *any* depth, because a branch
+> name may contain `/`. Pinned by
+> `git::tests::startup_clears_stale_ref_locks_at_whatever_depth_they_sit`.
+>
+> (`started_at` is also now captured at construction rather than here — see the field's own
+> doc — so the guard cannot be defeated by a slow startup path.)
+
 ```rust
-    /// `std::process::exit(0)` runs no destructors, so an abandoned job can leave one
-    /// durable residue: `.git/index.lock`. Clearing it is safe because the host holds
-    /// `app.lock` and owns `<data-dir>/repos/`.
+    /// `std::process::exit(0)` runs no destructors, so an abandoned job can leave
+    /// durable residue: `.git/index.lock`, and — since `merge::lock_branch` — a
+    /// `refs/**/*.lock` too. Clearing them is safe because the host holds `app.lock`
+    /// and owns `<data-dir>/repos/`.
     ///
     /// Deliberately **no** `reset --hard` and **no** `cleanup_state()`: our merge never
     /// enters `RepositoryState::Merge`, so a merge state in one of these trees was
     /// created by a human and discarding their staged resolution would be unrecoverable.
     fn recover_index_locks(&self) {
-        // `start()` runs during host startup, so "now" is process start to within the
-        // startup path. The guard only has to distinguish a lock left by a previous run
-        // from one a `git` process created moments ago.
-        let started = std::time::SystemTime::now();
         for id in self.registry.ids() {
             let tree = self.tree_path(&id);
             // A symlink planted at `repos/<id>` would point the unlink at a repository
@@ -1137,26 +1146,39 @@ mutators inside `impl GitService`:
             let Ok(real) = contained_in(&self.repos_root_canon, &tree) else {
                 continue;
             };
-            let lock = real.join(".git").join("index.lock");
-            let Ok(meta) = std::fs::metadata(&lock) else {
-                continue;
-            };
-            match meta.modified() {
-                Ok(mtime) if mtime < started => match std::fs::remove_file(&lock) {
-                    Ok(()) => self.log_startup(&format!(
-                        "repo={id} removed stale {}",
-                        lock.display()
-                    )),
-                    Err(e) => self.log_startup(&format!(
-                        "repo={id} cannot remove {}: {e}",
-                        lock.display()
-                    )),
-                },
-                _ => self.log_startup(&format!(
-                    "repo={id} {} is newer than this process; left in place",
-                    lock.display()
-                )),
+            let git = real.join(".git");
+            self.clear_stale_lock(&id, &git.join("index.lock"));
+            // `HEAD.lock` and `packed-refs.lock` are the other two libgit2 takes on a
+            // ref write; the loose lock lives beside the ref itself, at any depth,
+            // because a branch name may contain `/`.
+            self.clear_stale_lock(&id, &git.join("HEAD.lock"));
+            self.clear_stale_lock(&id, &git.join("packed-refs.lock"));
+            for lock in locks_under(&git.join("refs")) {
+                self.clear_stale_lock(&id, &lock);
             }
+        }
+    }
+
+    /// Remove one lock file, but only if this process cannot have been the one that
+    /// took it.
+    fn clear_stale_lock(&self, id: &str, lock: &Path) {
+        // `started_at` is captured at construction, not here: the guard only has to
+        // distinguish a lock left by a previous run of ours from one a `git` process
+        // created after this host came up.
+        let Ok(meta) = std::fs::symlink_metadata(lock) else {
+            return;
+        };
+        match meta.modified() {
+            Ok(mtime) if mtime < self.started_at => match std::fs::remove_file(lock) {
+                Ok(()) => self.log_startup(&format!("repo={id} removed stale {}", lock.display())),
+                Err(e) => {
+                    self.log_startup(&format!("repo={id} cannot remove {}: {e}", lock.display()))
+                }
+            },
+            _ => self.log_startup(&format!(
+                "repo={id} {} is newer than this process; left in place",
+                lock.display()
+            )),
         }
     }
 

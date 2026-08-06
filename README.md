@@ -599,7 +599,7 @@ working tree is always `<data-dir>/repos/<id>/`; the id charset cannot express
 
 | field | default | meaning |
 |---|---|---|
-| `remote` | `null` | `https://`, `ssh://`, `git://`, `file://`, `git@host:path`, or an absolute local path. `http://` is rejected as `insecure_remote` unless `[git].allow_http`; a URL carrying a password in its userinfo is always rejected. `null` means a local-only repo: `sync` inits and commits and reports `outcome: "committed"`, while `clone`/`pull`/`push` fail `remote_missing`. |
+| `remote` | `null` | `https://`, `ssh://`, `git://`, `file://`, `git@host:path`, or an absolute local path. `http://` is rejected as `insecure_remote` unless `[git].allow_http`; a URL carrying a password in its userinfo is always rejected, and on `http(s)` a *username* is rejected too — that is where a token is normally carried, and it would end up in this repo's `.git/config` in clear text. Put it on the repo as `credential` instead. `ssh://git@host` and `git@host:path` are unaffected. `null` means a local-only repo: `sync` inits and commits and reports `outcome: "committed"`, while `clone`/`pull`/`push` fail `remote_missing`. |
 | `remote_name` | `"origin"` | `[A-Za-z0-9._-]{1,64}`. |
 | `branch` | `[git].default_branch` | The one branch this repo tracks. A mutating op on a different checked-out branch fails `branch_mismatch` rather than guessing. |
 | `credential` | `null` | `{"kind":"none"}`, `{"kind":"token","username"?,"token"}`, or `{"kind":"ssh_key","username"?,"private_key_path"\|"private_key","public_key_path"?,"public_key"?,"passphrase"?}`. `username` defaults to `x-access-token` for tokens and `git` for SSH. Exactly one of `private_key_path` / `private_key`. |

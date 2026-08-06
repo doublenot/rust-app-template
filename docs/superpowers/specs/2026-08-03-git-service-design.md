@@ -624,7 +624,7 @@ Two surfaces, **one vocabulary**: a synchronously-detectable problem becomes an 
 | `unauthorized` | 401 | missing/wrong `x-host-token` |
 | `invalid_repo_id` | 422 | id fails §4.3 |
 | `invalid_request` | 422 | body/DTO validation; `error.field` names it |
-| `insecure_remote` | 422 | `http://` with `allow_http = false`, unsupported scheme, or a URL with a userinfo password |
+| `insecure_remote` | 422 | `http://` with `allow_http = false`, unsupported scheme, a URL with a userinfo password (any scheme), or a URL with a userinfo **username** on `http(s)` — added by the post-execution audit, because that is where a PAT is carried and `ops::init` writes the url into a 0664 `.git/config`. `ssh://git@host` and `git@host:path` are unaffected |
 | `settings_sync_unavailable` | 422 | `sync_settings: true` with no settings schema |
 | `remote_missing` | 422 | `clone`/`pull`/`push` on a repo with `remote: null` |
 | `confirm_required` | 422 | `reset` without `confirm: true` |
@@ -1501,13 +1501,25 @@ A learned fingerprint travels back with the job outcome and is persisted by `Git
 |---|---|
 | GET responses | `Secret` has no `Serialize`; `RepoView`/`CredentialView` have no secret-shaped fields. Two structural barriers, zero conventions to remember. |
 | URLs | A `remote` with a userinfo password is rejected at define time (422 `insecure_remote`) — libgit2 quotes URLs into its error strings, which land in job records, `git.log`, and dialogs. |
+
+> **Amended by the post-execution audit (second round).** That row covered only the *password*
+> position. A PAT is routinely carried in the **username** position (`https://ghp_x@host/…`) with
+> no colon anywhere, and `error::strip_userinfo` had always scrubbed a bare `user@` for exactly
+> that reason — the scrubber treated the shape as secret-bearing and the validator did not. The
+> consequence outlives the request: `ops::init` and `reconcile_remote` write the url verbatim into
+> `<data-dir>/repos/<id>/.git/config`, created 0664 under a 0775 `repos/`, beside a `repos.json`
+> deliberately created 0600. Any non-empty userinfo on `http`/`https` is now refused, pointing the
+> operator at `credential: {kind: "token"}`. `ssh://git@host` and the scp form `git@host:path` are
+> untouched: SSH authenticates by key and `git` there is a transport identity. `insecure_remote`
+> also scrubs its own message at construction now, so the refusal no longer quotes the token back
+> in the 422 body.
 | Error messages | `scrub(msg, secrets)` runs on **every message built from `repos.json` or from libgit2** before it reaches a job record, `git-state.json`, `git.log`, or a dialog: strip `scheme://user:pw@` → `scheme://`, then literal-replace every exposed secret longer than 6 chars with `***`. |
 | `Debug` | `Secret`'s `Debug` prints `Secret(***)`; `RepoDef`'s is derived on top of it. |
 | Process env / argv | libgit2 is a **library**. No `git` subprocess ever runs, so no credential appears in argv or a child's environment. |
 | Credential helpers | Never invoked; `~/.git-credentials` and `osxkeychain`/`manager-core` are never read. |
 | On disk | `repos.json` at `0600` on unix, written via a `0600` temp file + rename. |
 
-> **Amended by the post-execution audit (F4).** That row read "runs on every `GitError`", which is *why* the leak existed: `Registry::load` reports through plain `String` notes and a `RegistryError`, neither of which is a `GitError`, so nothing on that path was scrubbed. Every one of them is `format!`ed over the contents of `repos.json`, and the `insecure_remote` refusal — whose whole message warns that a password in a remote URL would be copied into log lines — was copying one into `git.log` on every launch, forever. The scrub now sits at `Registry::assembled`, the single funnel all eleven `load` return paths and `quarantine` pass through, and at `StateStore::load`; `Registry::notes()` and `error()` return scrubbed text as a guarantee of the type rather than a duty of the caller. `rejected[].id` is scrubbed too, which is a visible change of shape for a URL-shaped id (`https://u:pw@h/x` → `https://h/x`) — bounded, because `valid_id` admits neither `:` nor `/`, so only ids that were rejected anyway are ever rewritten and `rejected[].index` stays the exact locator. Pinned by `registry::tests::no_load_note_or_registry_error_republishes_a_password_from_repos_json` and `git::tests::a_rejected_entrys_password_never_reaches_git_log`. **Still open, accepted:** a secret typed into a wrongly-typed field comes back inside serde's own echo (`"auto_sync_secs": "ghp_…"` → `invalid type: string "ghp_…", expected u64`); nothing at load time knows that string is a secret.
+> **Amended by the post-execution audit (F4).** That row read "runs on every `GitError`", which is *why* the leak existed: `Registry::load` reports through plain `String` notes and a `RegistryError`, neither of which is a `GitError`, so nothing on that path was scrubbed. Every one of them is `format!`ed over the contents of `repos.json`, and the `insecure_remote` refusal — whose whole message warns that a password in a remote URL would be copied into log lines — was copying one into `git.log` on every launch, forever. The scrub now sits at `Registry::assembled`, the single funnel all eleven `load` return paths and `quarantine` pass through, and at `StateStore::load`; `Registry::notes()` and `error()` return scrubbed text as a guarantee of the type rather than a duty of the caller. `rejected[].id` is scrubbed too, which is a visible change of shape for a URL-shaped id (`https://u:pw@h/x` → `https://h/x`) — bounded, because `valid_id` admits neither `:` nor `/`, so only ids that were rejected anyway are ever rewritten and `rejected[].index` stays the exact locator. Pinned by `registry::tests::no_load_note_or_registry_error_republishes_a_password_from_repos_json` and `git::tests::a_rejected_entrys_password_never_reaches_git_log`. **Closed by the audit's second round:** a secret typed into a wrongly-typed field used to come back inside serde's own echo (`"auto_sync_secs": "ghp_…"` → `invalid type: string "ghp_…", expected u64`), and the likelier hand-edit is `credential` itself, since anyone reaching for that key is holding a token. `error::scrub_serde` redacts double-quoted runs longer than 20 characters and is used where the input is a serde message rather than a libgit2 one — `Registry::load`'s per-entry rejection and `StateStore::load`. serde names fields and variants in backticks and quotes *values*, so which entry, which line and column, and what was expected all survive. `scrub` itself is unchanged: a libgit2 message's quoted strings are paths and URLs a reader needs. Pinned by `registry::tests::a_hand_written_credential_never_reaches_the_startup_log`.
 
 An auditor greps for `\.expose()` and must find exactly four call sites, all inside the `cb.credentials` closure.
 

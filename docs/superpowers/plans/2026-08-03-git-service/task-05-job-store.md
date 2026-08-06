@@ -2637,10 +2637,20 @@ through to the hold check like any other admission.
 
 Five tests, at the end of `mod tests`:
 
-- `a_maintenance_hold_and_a_job_exclude_each_other` — hold an idle repo; `admit` (with and
-  without an unknown `request_id`) errs `repo_locked`; a second `hold_repo` errs `repo_locked`;
-  `busy("notes").is_none()` and `list(&default)`/`live_jobs()` are empty, because a hold is not a
-  job; `admit("other")` is `Started`; drop; `admit("notes")` is `Started` again.
+- `a_maintenance_hold_and_a_job_exclude_each_other` — `finish_now(…, Some("r1"))` seeds a
+  replayable record *before* the hold; hold an idle repo; `admit` with `None` and with an
+  unknown `request_id` (`"r2"`) both err `repo_locked`, while `admit` with the **matching**
+  `"r1"` still returns `Replay` — the property that makes "my request timed out, is it safe to
+  retry?" answerable; a second `hold_repo` errs `repo_locked`; `busy("notes").is_none()` and
+  `live_jobs()` is empty and `list(&default)` holds exactly the seeded record, because a hold is
+  not a job; `admit("other")` is `Started`; drop; `admit("notes")` is `Started` again.
+
+  > **Amended by the post-execution audit (second round).** This used to state the
+  > replay-past-a-hold rule in a comment and assert only the *unknown* `request_id` case,
+  > which is behaviourally identical to the `None` case beside it — so the discriminating
+  > assertion was missing and a mutation putting the `BusyBy::Maintenance` check above
+  > `admit`'s replay lookup left the whole suite green while turning a client's legitimate
+  > retry during a concurrent PUT into a 409.
 - `repo_locked_is_a_retryable_409_that_names_the_repo` — code `RepoLocked`,
   `repo_id == Some("notes")`, `http_status() == 409`, `retryable() == true`.
 - `a_hold_is_refused_while_a_job_owns_the_repo` — `hold_repo` errs `repo_busy` naming the op;

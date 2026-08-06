@@ -1226,7 +1226,16 @@ impl std::error::Error for GitError;
 
 pub fn classify(e: &git2::Error, abort: AbortReason) -> GitErrorCode;
 pub fn scrub(message: &str, secrets: &[&str]) -> String;
+pub fn scrub_serde(message: &str) -> String;
 ```
+`scrub_serde` was added by the post-execution audit's second round. It is `scrub` plus one pass
+that redacts double-quoted runs longer than 20 characters, and it is used exactly where the input
+is a **serde** message rather than a libgit2 one — `Registry::load`'s per-entry rejection and
+`StateStore::load`. serde echoes the offending *value* verbatim, so `{"credential": "<token>"}`
+came back as `invalid type: string "<token>", …` and went into a 0644 `git.log` on every launch.
+`scrub` itself is deliberately unchanged: a libgit2 message's quoted strings are paths and URLs a
+reader needs. `GitError::insecure_remote` also scrubs at construction now, because it is the one
+constructor whose subject is already known to carry a credential.
 **[CONTRACT DECISION] — there are no `auth_missing`, `auth_unbound`, `canceled` or `timeout`
 constructors.** They have zero call sites across tasks 4–12 and would survive only on
 `#![allow(dead_code)]`. `AuthMissing`/`AuthUnbound` are produced by task 6's
@@ -1568,7 +1577,11 @@ impl GitService {
 ```
 `read_status`/`read_branches` are `async`: `spawn_blocking` bounded by `STATUS_READ_TIMEOUT_MS`,
 `status_timeout` on expiry, **no per-repo lock taken**.
-Private: `after_job`, `spawn_watchdog`, `spawn_auto_timer`, `recover_index_locks`, `log_job`.
+Private: `after_job`, `spawn_watchdog`, `spawn_auto_timer`, `recover_index_locks`,
+`clear_stale_lock`, `log_job`. `recover_index_locks` keeps its name and now sweeps
+`.git/index.lock`, `.git/HEAD.lock`, `.git/packed-refs.lock` and every `*.lock` under
+`.git/refs` at any depth — added by the post-execution audit, because a stale ref lock is
+what `merge::lock_branch` survives and nothing used to remove it.
 
 ### 5.11 `git/api.rs` — task 9
 ```rust

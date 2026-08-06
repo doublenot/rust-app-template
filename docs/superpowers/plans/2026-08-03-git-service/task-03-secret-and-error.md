@@ -118,6 +118,7 @@ written. Do not re-wrap it — rustfmt will split it straight back.
   impl axum::response::IntoResponse for GitError;   // envelope shape, + Retry-After on 409
   pub fn classify(e: &git2::Error, abort: AbortReason) -> GitErrorCode;
   pub fn scrub(message: &str, secrets: &[&str]) -> String;
+  pub fn scrub_serde(message: &str) -> String;             // added by the audit, 2nd round
 
   // src/git/util.rs                                         — consumed by tasks 4-9
   pub type NowFn = std::sync::Arc<dyn Fn() -> u64 + Send + Sync>;
@@ -1059,6 +1060,62 @@ pub fn scrub(message: &str, secrets: &[&str]) -> String {
     out
 }
 
+/// `scrub`, plus the one thing a *serde* message does that a libgit2 message does not:
+/// echo the offending value back verbatim.
+///
+/// `{"credential": "<token>"}` is the shape that matters, because a hand-edit reaching
+/// for that key is by definition holding a secret. serde answers with `invalid type:
+/// string "<token>", expected internally tagged enum CredentialSpec`, `Registry::load`
+/// pushes that onto `notes`, and `GitService::log_startup` writes it into a `git.log`
+/// created 0644 — on every launch, for as long as the entry stays. Widening `scrub`
+/// itself would be wrong; a libgit2 message's quoted strings are paths and URLs the
+/// operator needs to read.
+///
+/// Only double-quoted runs are redacted, and only long ones. serde names *fields* and
+/// *variants* in backticks and quotes *values* in double quotes, so this reaches the
+/// payload and leaves the diagnosis: `invalid type: string "***", expected u64` still
+/// carries which entry, which line and column, and what was wanted.
+pub fn scrub_serde(message: &str) -> String {
+    const LONGEST_INNOCENT: usize = 20;
+    let scrubbed = scrub(message, &[]);
+    let mut out = String::with_capacity(scrubbed.len());
+    let mut rest = scrubbed.as_str();
+    while let Some(open) = rest.find('"') {
+        out.push_str(&rest[..=open]);
+        let body = &rest[open + 1..];
+        let mut escaped = false;
+        let close = body.char_indices().find(|&(_, c)| {
+            if escaped {
+                escaped = false;
+                return false;
+            }
+            match c {
+                '\\' => {
+                    escaped = true;
+                    false
+                }
+                '"' => true,
+                _ => false,
+            }
+        });
+        // An unbalanced quote is not a value at all; there is nothing to redact and no
+        // reason to mangle the tail looking for one.
+        let Some((close, _)) = close else {
+            out.push_str(body);
+            return out;
+        };
+        if close > LONGEST_INNOCENT {
+            out.push_str("***");
+        } else {
+            out.push_str(&body[..close]);
+        }
+        out.push('"');
+        rest = &body[close + 1..];
+    }
+    out.push_str(rest);
+    out
+}
+
 /// `scheme://user:pw@host/path` -> `scheme://host/path`, everywhere in the string.
 ///
 /// A PAT is routinely carried in the *username* position (`https://ghp_x@host/…`), so
@@ -1349,10 +1406,18 @@ impl GitError {
         )
     }
 
+    /// Scrubbed at construction, unlike every other constructor here.
+    ///
+    /// This is the one error whose subject is a string already known to carry a
+    /// credential — that is what it is refusing. `scrub` runs at the job, log and
+    /// dialog boundaries, which is late enough for a message that merely *might*
+    /// contain one and too late for this: a `put` that refuses a remote returns
+    /// straight to the caller, so without this the 403 body quotes the token back.
+    /// Host and path survive, which is all the operator needs to recognise the repo.
     pub fn insecure_remote(remote: &str, why: &str) -> GitError {
         GitError::new(
             GitErrorCode::InsecureRemote,
-            format!("remote {remote:?} was refused: {why}"),
+            scrub(&format!("remote {remote:?} was refused: {why}"), &[]),
         )
     }
 

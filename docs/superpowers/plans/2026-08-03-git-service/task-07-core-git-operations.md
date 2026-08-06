@@ -622,6 +622,25 @@ Append to `src/git/ops.rs`, below `pub fn run` and the eight verb stubs task 6 l
 still above the `#[cfg(test)]` line. Every "append" in this task means that same spot; the five
 verbs are the exception and are replaced where they already sit.
 
+> **Amended by the post-execution audit (second round).** `open_tree` used to be
+> `open_tree_any_state` + `require_clean_state`, in that order, so the reconciliation ran
+> *before* the gate — and a verb refused with `dirty_tree` had already rewritten
+> `.git/config`'s remote url on the one tree the refusal promises not to touch. Measured:
+> seed `origin = https://old.example/a.git`, plant `.git/MERGE_HEAD`, run a Commit whose
+> definition names another host; the 409 comes back and the url is the attacker's. The open
+> and the reconciliation are split so the gate can sit between them. `reset` still
+> reconciles, because it is not refusing and a reset to `upstream` has to resolve against
+> the url the definition actually names. Pinned by
+> `ops::tests::a_refused_open_leaves_the_remote_url_untouched`.
+>
+> Separately: `init`'s `Exists` branch and `clone`'s idempotent branch reach an existing
+> tree through `Repository::open` rather than this function, so one repo answered
+> `200 initialized` / `200 up_to_date` to those two while answering `409 dirty_tree` to
+> every other verb — and `init` was not read-only about it, since that branch adds a
+> missing remote. Both now call `require_clean_state` directly (directly, so that being
+> asked whether a tree exists never becomes a way to rewrite its remote url). Pinned by
+> `ops::tests::every_verb_refuses_a_tree_a_human_left_mid_merge`.
+
 ```rust
 /// The most files any single `DirtySummary` bucket will list.
 ///
@@ -634,15 +653,28 @@ fn head_oid(repo: &git2::Repository) -> Option<String> {
     repo.head().ok().and_then(|h| h.target()).map(|o| o.to_string())
 }
 
-/// Open the working tree and reconcile its `origin` with the current definition.
+/// Open the working tree, refuse a state a human left behind, and only then
+/// reconcile its `origin` with the current definition.
 ///
-/// Refuses a repository left mid-merge, mid-rebase or mid-cherry-pick: see
-/// `require_clean_state`. Every verb that touches an existing tree comes through
-/// here, so the gate is one line and a verb added later gets it without being
-/// told. `reset` is the single exception and says so at its own call site.
+/// **The order is the contract.** `require_clean_state` declares the tree
+/// untouchable, so nothing that runs before it may write to that tree — and
+/// reconciling the remote is a `.git/config` write. Gating after it meant a verb
+/// refused with `dirty_tree` had already repointed the remote of the repository
+/// the refusal promises not to touch, which is the same defect the checkout was
+/// held to account for: byte-identical after a refusal, not merely "the working
+/// files survived".
+///
+/// Every verb that *mutates* an existing tree comes through here, so the gate is
+/// one line and a verb added later gets it without being told. Three call sites
+/// hold the same gate without holding this function, and each says why at its
+/// own site: `reset` opts out of it entirely (below), while `init` and `clone`
+/// call `require_clean_state` directly on their idempotent branches — those two
+/// report on a tree they did not create and must not adopt the definition's
+/// remote url as a side effect of being asked whether it exists.
 pub fn open_tree(ctx: &OpCtx) -> Result<git2::Repository, GitError> {
-    let repo = open_tree_any_state(ctx)?;
+    let repo = open_repo(ctx)?;
     require_clean_state(&repo, &ctx.def.id)?;
+    reconcile_remote(&repo, &ctx.def)?;
     Ok(repo)
 }
 
@@ -656,29 +688,48 @@ pub fn open_tree(ctx: &OpCtx) -> Result<git2::Repository, GitError> {
 /// this handle would do exactly the damage the gate exists to prevent — which is
 /// also why there is no second, defensive check further down: nothing else can
 /// ever be holding such a handle.
+///
+/// It still reconciles the remote, unlike a refusal: this one is not refusing.
+/// A `reset` to `upstream` reads the tracking branch the definition names, so
+/// skipping the reconciliation here would resolve it against a stale url.
 pub fn open_tree_any_state(ctx: &OpCtx) -> Result<git2::Repository, GitError> {
+    let repo = open_repo(ctx)?;
+    reconcile_remote(&repo, &ctx.def)?;
+    Ok(repo)
+}
+
+/// `Repository::open`, plus the one refusal that has to precede every gate:
+/// there is no tree here at all.
+fn open_repo(ctx: &OpCtx) -> Result<git2::Repository, GitError> {
     if !ctx.tree.exists() {
         return Err(GitError::no_worktree(&ctx.def.id));
     }
-    let repo = git2::Repository::open(&ctx.tree)?;
-    // Re-point the remote if the definition changed since the last operation: a PUT can
-    // move a repo to a new host while the tree on disk still points at the old one, and
-    // every later fetch/push would silently keep talking to the wrong server.
-    if let Some(url) = ctx.def.remote.as_deref() {
-        match repo.find_remote(&ctx.def.remote_name) {
-            // git2 0.21 returns `Result<&str, _>` from `Remote::url`, not `Option<&str>`
-            // (a non-UTF-8 url is an Err rather than a None), so the comparison has to
-            // go through `.ok()`.
-            Ok(remote) if remote.url().ok() != Some(url) => {
-                repo.remote_set_url(&ctx.def.remote_name, url)?;
-            }
-            Ok(_) => {}
-            Err(_) => {
-                repo.remote(&ctx.def.remote_name, url)?;
-            }
+    Ok(git2::Repository::open(&ctx.tree)?)
+}
+
+/// Re-point the remote if the definition changed since the last operation.
+///
+/// A PUT can move a repo to a new host while the tree on disk still points at the
+/// old one, and every later fetch/push would silently keep talking to the wrong
+/// server. Split out of `open_tree` so the gate can run between the two: this
+/// writes `.git/config`, and a refused verb must not.
+fn reconcile_remote(repo: &git2::Repository, def: &RepoDef) -> Result<(), GitError> {
+    let Some(url) = def.remote.as_deref() else {
+        return Ok(());
+    };
+    match repo.find_remote(&def.remote_name) {
+        // git2 0.21 returns `Result<&str, _>` from `Remote::url`, not `Option<&str>`
+        // (a non-UTF-8 url is an Err rather than a None), so the comparison has to
+        // go through `.ok()`.
+        Ok(remote) if remote.url().ok() != Some(url) => {
+            repo.remote_set_url(&def.remote_name, url)?;
+        }
+        Ok(_) => {}
+        Err(_) => {
+            repo.remote(&def.remote_name, url)?;
         }
     }
-    Ok(repo)
+    Ok(())
 }
 
 /// Refuse a repository that is half-way through an operation a human started.
@@ -861,7 +912,21 @@ pub fn init(ctx: &OpCtx) -> Result<OpOutcome, GitError> {
         Ok(repo) => repo,
         // `no_reinit` turns "already a repository" into Exists rather than a
         // destructive re-init; a retried POST /init lands here and is a success.
-        Err(e) if e.code() == git2::ErrorCode::Exists => git2::Repository::open(&ctx.tree)?,
+        Err(e) if e.code() == git2::ErrorCode::Exists => {
+            let repo = git2::Repository::open(&ctx.tree)?;
+            // The same refusal every mutating verb gives, on the same condition —
+            // this branch is the one that reached an *existing* tree. Answering
+            // `initialized` for a repository a human is half-way through a merge
+            // in, while sync/commit/pull/push all answer 409, makes "is this repo
+            // wedged?" depend on which button was pressed. And it is not a
+            // read-only answer either: the remote block below writes `.git/config`.
+            //
+            // Directly rather than through `open_tree`, which would also *repoint*
+            // an existing remote; init only ever fills in a missing one, and a
+            // retried POST must not quietly become a way to rewrite a url.
+            require_clean_state(&repo, &ctx.def.id)?;
+            repo
+        }
         Err(e) => return Err(e.into()),
     };
 
@@ -1198,6 +1263,12 @@ pub fn clone(ctx: &OpCtx) -> Result<OpOutcome, GitError> {
         // else and is refused rather than cloned over.
         return match git2::Repository::open(&ctx.tree) {
             Ok(repo) => {
+                // Same gate, same reason as `init`'s Exists branch: `up_to_date`
+                // is the one answer that tells a caller this repository is fine,
+                // and it must not be the one answer a wedged tree still gives.
+                // Directly rather than through `open_tree`, because this branch
+                // reports on a tree it did not create and does not reconcile it.
+                require_clean_state(&repo, &ctx.def.id)?;
                 let mut out = OpOutcome::new("up_to_date", &ctx.def.branch);
                 out.head_after = head_oid(&repo);
                 Ok(out)
@@ -2986,9 +3057,21 @@ Add this test **inside** the existing `#[cfg(test)] mod tests` block in `src/git
     /// "whatever the OS decides", which on Linux is around two hours.
     #[test]
     fn network_timeouts_are_installed_from_the_configured_value() {
-        super::init_libgit2_timeouts(45).expect("libgit2 accepts both timeouts");
-        // SAFETY: reads libgit2 process-global state. Nothing else in this test binary
-        // writes it, and `init_libgit2_timeouts` has already returned.
+        // AMENDED by the post-execution audit (second round): this used to call
+        // `init_libgit2_timeouts(45)` and read the pair back with a SAFETY note claiming
+        // "nothing else in this test binary writes it". Seven other tests reach
+        // `GitService::start`, which installs whatever *their* config says — the same
+        // shape of process-global race as the `init.defaultBranch` one in
+        // `merge::testkit`, and the same answer: one gate, every writer through it.
+        //
+        // Under the same gate as the write, and for the reason `TIMEOUTS` documents:
+        // seven other tests in this binary reach `GitService::start`, which installs
+        // whatever *their* config says. Read outside the gate, this asserts on
+        // whichever of them ran last.
+        let _guard = super::timeouts_guard();
+        super::init_libgit2_timeouts_locked(45).expect("libgit2 accepts both timeouts");
+        // SAFETY: reads libgit2 process-global state, holding the lock every writer
+        // takes, so the pair cannot move underneath these two assertions.
         unsafe {
             assert_eq!(
                 git2::opts::get_server_connect_timeout_in_milliseconds().expect("connect"),
@@ -3034,6 +3117,21 @@ Add to `src/git/mod.rs`, after the `pub mod` declarations and before the
 /// wants to wait longer for a slow server wants `[git].network_timeout_secs`.
 pub const CONNECT_TIMEOUT_MS: i32 = 10_000;
 
+/// Serialises the two process-global timeout options against each other.
+///
+/// In a shipped build `GitService::start` is the only writer and runs once, so this
+/// costs one uncontended lock for the life of the process. It exists for the test
+/// binary, where the claim "one caller, once, on the main thread" is simply false:
+/// seven tests reach `start()` on tokio worker threads while an eighth installs a
+/// distinctive value and reads it straight back.
+static TIMEOUTS: Mutex<()> = Mutex::new(());
+
+/// A poisoned lock here guards no invariant — the protected value is libgit2's, not
+/// ours, and a panicking writer leaves it exactly as consistent as it found it.
+fn timeouts_guard() -> std::sync::MutexGuard<'static, ()> {
+    TIMEOUTS.lock().unwrap_or_else(|p| p.into_inner())
+}
+
 /// Install the process-global libgit2 network timeouts. Call once, from
 /// `GitService::start`, before any repository is opened.
 ///
@@ -3041,11 +3139,24 @@ pub const CONNECT_TIMEOUT_MS: i32 = 10_000;
 /// job watchdog lives inside the transfer callbacks, which never fire before the
 /// transport has data. Both libgit2 options default to 0, meaning "the OS default".
 pub fn init_libgit2_timeouts(network_timeout_secs: u64) -> Result<(), crate::git::error::GitError> {
+    let _guard = timeouts_guard();
+    init_libgit2_timeouts_locked(network_timeout_secs)
+}
+
+/// The write itself, minus the gate.
+///
+/// Split out because `std::sync::Mutex` is not reentrant: the test that reads the
+/// pair back has to hold `TIMEOUTS` across both the write and the read, so it cannot
+/// go through the wrapper above. The caller must already hold `timeouts_guard()`.
+fn init_libgit2_timeouts_locked(
+    network_timeout_secs: u64,
+) -> Result<(), crate::git::error::GitError> {
     let total = i32::try_from(network_timeout_secs.saturating_mul(1000)).unwrap_or(i32::MAX);
     // SAFETY: both setters mutate libgit2 process-global state and are documented as
-    // needing external synchronisation. The single caller runs once, on the main thread,
-    // during startup and before any repository has been opened, so no other thread can
-    // be inside libgit2 at this point.
+    // needing external synchronisation. `TIMEOUTS`, held by the caller, is that
+    // synchronisation. In a shipped build the stronger property also holds: the single
+    // caller runs once, on the main thread, during startup and before any repository
+    // has been opened, so no other thread can be inside libgit2 at this point.
     unsafe {
         git2::opts::set_server_connect_timeout_in_milliseconds(CONNECT_TIMEOUT_MS).map_err(|e| {
             crate::git::error::GitError::internal(format!("libgit2 connect timeout: {e}"))

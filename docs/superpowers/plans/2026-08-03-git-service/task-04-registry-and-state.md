@@ -819,10 +819,37 @@ pub fn validate_remote(remote: &str, allow_http: bool) -> Result<(), GitError> {
             _ => Ok(()),
         }
     };
+    // The username position is a secret too, on http(s) and only there. A PAT is routinely
+    // carried as `https://ghp_x@host/...` with no colon in sight, which is why
+    // `error::strip_userinfo` scrubs a bare `user@` as well — the scrubber has always
+    // treated this shape as secret-bearing and the validator did not. Refusing it here is
+    // the filesystem half of what F4 closed for logs and API bodies: `ops::init` and
+    // `reconcile_remote` write this string verbatim into `<data-dir>/repos/<id>/.git/config`,
+    // created 0664 under a 0775 `repos/`, right beside a `repos.json` that `open_private`
+    // deliberately creates 0600.
+    //
+    // ssh and git are exempt because their username is a transport identity rather than a
+    // credential — `ssh://git@host/a.git` and the scp form `git@host:a.git` are the ordinary
+    // way to write those, and SSH authenticates by key. file:// has no userinfo to speak of.
+    let token_userinfo_refused = |authority: &str| -> Result<(), GitError> {
+        match authority.rsplit_once('@') {
+            Some((userinfo, _)) if !userinfo.is_empty() => Err(GitError::insecure_remote(
+                remote,
+                "a username in an http(s) remote URL is where a token is usually carried, and it \
+                 would be written into this repo's .git/config in clear text; put it on the repo \
+                 as credential {\"kind\":\"token\"} instead",
+            )),
+            _ => Ok(()),
+        }
+    };
 
     if let Some(i) = remote.find("://") {
         let scheme = remote[..i].to_ascii_lowercase();
-        password_refused(before(&remote[i + 3..], '/'))?;
+        let authority = before(&remote[i + 3..], '/');
+        password_refused(authority)?;
+        if matches!(scheme.as_str(), "http" | "https") {
+            token_userinfo_refused(authority)?;
+        }
         match scheme.as_str() {
             "https" | "ssh" | "git" | "file" => {}
             "http" if allow_http => {}
@@ -1929,6 +1956,19 @@ pub struct Registry {
     notes: Vec<String>,
 }
 
+> **Amended by the post-execution audit (second round).** Three changes in `validate_remote`
+> and `load`, all about a secret reaching a file that is not 0600:
+>
+> - `password_refused` fired only on a userinfo containing `:`, so `https://ghp_x@host/…` —
+>   the way a PAT is actually written — was accepted, and `ops::init` then copied it into a
+>   0664 `.git/config`. `token_userinfo_refused` refuses any non-empty userinfo on http(s);
+>   ssh and git are exempt because their username is a transport identity, not a credential.
+> - `tighten_mode` ran *before* the read, so the read-failure arm's "it was left exactly as
+>   it is" was false — and for a directory planted where the file belongs it stripped the
+>   search bit. It runs after the successful read now.
+> - serde echoes the value it choked on, so `{"credential": "<token>"}` put the token into
+>   `git.log` on every launch. The per-entry rejection goes through `error::scrub_serde`.
+
 impl Registry {
     /// Never fails. A file-level problem quarantines the file and yields an empty registry; an
     /// entry-level problem keeps the good entries and retains the bad ones verbatim.
@@ -1944,9 +1984,6 @@ impl Registry {
                 Err(e) => notes.push(format!("cannot remove stale {}: {e}", tmp.display())),
             }
         }
-        #[cfg(unix)]
-        tighten_mode(path, &mut notes);
-
         // Bytes, not `read_to_string`: the string form collapses "the file could not be read" and
         // "the file is not UTF-8" into one `io::Error`, and those two need opposite answers.
         let bytes = match std::fs::read(path) {
@@ -1979,6 +2016,15 @@ impl Registry {
                 );
             }
         };
+        // After the read, not before it. `tighten_mode` exists to protect a file whose
+        // contents are secret, and on the read-failure arm above there is nothing here we
+        // could read, so nothing to protect — while chmodding it 0600 anyway made that
+        // arm's promise ("it was left exactly as it is") false, and, for the
+        // directory-in-place case, took the search bit with it and locked the operator
+        // out of their own contents.
+        #[cfg(unix)]
+        tighten_mode(path, &mut notes);
+
         // Bytes we *have* and cannot use are a corruption like any other, so the author gets them
         // back under a `.corrupt-` name and the registry stays writable.
         let raw = match String::from_utf8(bytes) {
@@ -2073,7 +2119,12 @@ impl Registry {
             let mut def: RepoDef = match serde_json::from_value(entry.clone()) {
                 Ok(d) => d,
                 Err(e) => {
-                    notes.push(format!("repos[{index}] rejected: {e}"));
+                    // `scrub_serde`, not `scrub`: serde quotes the value it choked on, and
+                    // the value most likely to be hand-written into this file wrong is
+                    // `credential`. See its doc comment.
+                    notes.push(crate::git::error::scrub_serde(&format!(
+                        "repos[{index}] rejected: {e}"
+                    )));
                     rejected.push(RejectedEntry {
                         index,
                         id: id_hint,

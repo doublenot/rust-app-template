@@ -377,6 +377,11 @@ pub fn conflict_path_bytes(c: &git2::IndexConflict) -> Result<Vec<u8>, GitError>
 /// The one checkout on the merge path, shared by all three arms of `analyse`
 /// and by `merge_prefer_local`. None of them may `force()`.
 ///
+/// > **Amended by the post-execution audit (second round).** Three claims in this
+/// > comment were wrong about the vendored libgit2 1.9.6, and the `dry_run()` one was
+/// > wrong in the direction that makes a footgun look safe: a `dry_run()` checkout is
+/// > not side-effect-free and can delete files. Corrected below and measured.
+///
 /// Two independent switches are needed and the second is not implied by the
 /// first — libgit2's action table for a path the target ADDS which also exists
 /// in the working directory (`checkout.c`, `checkout_action_with_wd`) is:
@@ -391,10 +396,15 @@ pub fn conflict_path_bytes(c: &git2::IndexConflict) -> Result<Vec<u8>, GitError>
 /// mention at all — and safe mode *on its own* still clobbers a gitignored
 /// `secret.env` the remote happens to track.
 ///
-/// `recreate_missing(true)` is set on purpose: it fires only for a path with no
-/// working-directory entry, so it can destroy nothing, and without it a file the
-/// user deleted between `pull`'s dirty check and this call would turn a sync into
-/// a failure instead of simply being restored.
+/// `recreate_missing(true)` is set on purpose: without it a file the user deleted
+/// between `pull`'s dirty check and this call would turn a sync into a failure
+/// instead of simply being restored. It is read by exactly one action function,
+/// `checkout_action_no_wd` (checkout.c:305, 311) — a path with no
+/// working-directory entry — plus the empty-directory case that routes through it
+/// (`checkout_action_with_wd_dir_empty`, checkout.c:655), where it removes the
+/// empty directory and writes the blob. So it does reach a path that *has* a
+/// working-directory entry, but only one that holds nothing: no content can be
+/// lost through this flag.
 ///
 /// The refusal is atomic. `checkout_get_actions` counts every conflict and
 /// returns `GIT_ECONFLICT` before the remove and update passes run, so on `Err`
@@ -402,10 +412,15 @@ pub fn conflict_path_bytes(c: &git2::IndexConflict) -> Result<Vec<u8>, GitError>
 /// lets the callers check out *before* they move a ref and treat a refusal as a
 /// perfect no-op the next sync simply redoes.
 ///
-/// `checkout_tree`, never `checkout_head`: with no baseline supplied libgit2
-/// defaults it to the HEAD tree, so `checkout_head` has target == baseline, every
-/// delta is UNMODIFIED, and safe mode maps UNMODIFIED to "do nothing". A safe
-/// `checkout_head` is a silent no-op that reports success.
+/// `checkout_tree`, never `checkout_head`: with no baseline supplied **and an
+/// index on disk** (checkout.c:2483) libgit2 defaults the baseline to the HEAD
+/// tree, so `checkout_head` has target == baseline, every delta is UNMODIFIED,
+/// and safe mode maps UNMODIFIED to "do nothing". A safe `checkout_head` is a
+/// silent no-op that reports success. The guard is worth stating because the
+/// other branch behaves oppositely: with no index file the baseline stays NULL —
+/// an empty tree — and checkout.c:2453 force-adds RECREATE_MISSING, so the same
+/// call would write out the whole tree. Every repository this host touches has an
+/// index, so it is the no-op branch that applies here.
 fn checkout_or_refuse(
     repo: &git2::Repository,
     target: &git2::Object<'_>,
@@ -417,10 +432,15 @@ fn checkout_or_refuse(
     // is not something the child process can act on. The notify callback is the
     // only place the paths exist.
     //
-    // Not `dry_run()`, which looks like it was made for this and is not: git2 0.21
-    // spells it as GIT_CHECKOUT_NONE, and checkout.c returns `*action = NONE` at
-    // the top of every action function, above every notify call. A dry run reports
-    // zero conflicts, notifies nothing and returns Ok.
+    // Not `dry_run()`, which looks like it was made for this and is neither safe
+    // nor useful. git2 0.21 spells it as GIT_CHECKOUT_NONE (1 << 30), which is not
+    // libgit2's GIT_CHECKOUT_DRY_RUN (1 << 24), and the two are not interchangeable:
+    // NONE forces every *delta* action to NONE (checkout.c:297, 500, 572, 609), so no
+    // conflict is counted and no CONFLICT notification is ever raised; but NONE does
+    // not stop the apply passes — only DRY_RUN short-circuits them (checkout.c:2640),
+    // and `checkout_action_wd_only` (checkout.c:365-457) has no NONE early exit at
+    // all, so it notifies unconditionally and still queues removes. Measured:
+    // `dry_run()` with `remove_untracked(true)` returned Ok and deleted the file.
     let blocked: RefCell<Vec<String>> = RefCell::new(Vec::new());
     let mut co = git2::build::CheckoutBuilder::new();
     // `.safe()` FIRST, and never anywhere else in this chain: git2 0.21 spells
@@ -461,7 +481,46 @@ fn checkout_or_refuse(
         Err(e) => Err(ctx.classify_err(&e)),
     }
 }
+
+/// Hold the branch ref's lock across the checkout that precedes writing it.
+///
+/// `checkout_or_refuse`'s argument for going first is that a refusal is then a
+/// perfect no-op. That holds only if what comes *after* it cannot fail — and a ref
+/// write can. A stale `.git/refs/heads/<branch>.lock` from a killed `git` is the
+/// ordinary cause, and the result is not a failed sync but a corrupted one: the
+/// checkout leaves the working tree at the remote's content while HEAD stays on the
+/// old tip, `sync` stages and commits *before* it fetches, and so the next run
+/// commits the remote's tree as a local commit, diverges, and pushes a two-parent
+/// merge to the shared remote in place of a clean fast-forward. Measured.
+///
+/// Locking first moves that failure ahead of the checkout, where it is still a
+/// no-op — and `git_transaction_commit` then only renames a lock file it already
+/// holds, which is as close to infallible as a filesystem gets. Dropping the
+/// transaction on any earlier return releases the lock, so a refused checkout
+/// leaves nothing behind for the next run to trip over.
+///
+/// The one thing this cannot do is make `set_head` safe, which is why both callers
+/// run it *before* the checkout instead: attaching HEAD to a branch moves no
+/// content, so it costs nothing to do early.
+fn lock_branch<'r>(
+    repo: &'r git2::Repository,
+    refname: &str,
+    ctx: &OpCtx,
+) -> Result<git2::Transaction<'r>, GitError> {
+    let mut tx = repo.transaction().map_err(|e| ctx.classify_err(&e))?;
+    tx.lock_ref(refname).map_err(|e| ctx.classify_err(&e))?;
+    Ok(tx)
+}
 ```
+
+> **Amended by the post-execution audit (second round).** `lock_branch` did not exist, and F6's
+> checkout-before-ref-move opened a window it did not close: the checkout succeeded and the ref
+> write failed, leaving the working tree at the remote's content with HEAD on the old tip, which
+> the next sync committed and published as a spurious two-parent merge. Measured with a control
+> arm — as shipped `parents=2` with origin moved, pre-F6 order `parents=1`. All three arms take
+> the lock before the checkout now. Pinned by
+> `merge::tests::a_locked_branch_ref_refuses_before_the_checkout_rather_than_after_it`, and the
+> commonest trigger is swept at startup by `GitService::recover_index_locks` (task 9).
 
 > **Amended by the post-execution audit (F6).** `checkout_or_refuse` did not exist: all three
 > arms of `analyse` and `merge_prefer_local` each built their own `CheckoutBuilder`, called
@@ -518,8 +577,10 @@ existing `#[cfg(test)] mod tests` line:
 /// It is also **the crate's single gate onto libgit2 in tests**: every entry point
 /// below that names `git2` — plus `job_with`, whose `OpCtx` is handed straight to
 /// production code that does — opens with `hostile_global_config()`. The three that
-/// do neither (`origin_with_main`, `job`, `job_local`) delegate to one that does
-/// before touching anything, so the gate is already shut by the time they arrive.
+/// reach libgit2 without naming it (`origin_with_main`, `job`, `job_local`) delegate
+/// to one that does before touching anything, so the gate is already shut by the
+/// time they arrive. `write_file` and `read_file` are pure `std::fs` and never reach
+/// libgit2 at all, which is the only reason they are allowed to skip it.
 /// Read that function's SAFETY note before adding an entry point that skips it.
 #[cfg(test)]
 pub(crate) mod testkit {
@@ -1514,10 +1575,16 @@ pub fn analyse(repo: &git2::Repository, ctx: &OpCtx) -> Result<MergeOutcome, Git
         let their_commit = repo
             .find_commit(their_oid)
             .map_err(|e| ctx.classify_err(&e))?;
-        checkout_or_refuse(repo, their_commit.as_object(), ctx)?;
-        repo.reference(&refname, their_oid, true, "sync: adopt remote history")
-            .map_err(|e| ctx.classify_err(&e))?;
+        // Both before the checkout, and for the same reason: nothing that can fail
+        // may sit between a checkout and the ref write that publishes it. Attaching
+        // HEAD to a branch that does not exist yet leaves the repository exactly as
+        // unborn as it was, so hoisting it moves no content.
         repo.set_head(&refname).map_err(|e| ctx.classify_err(&e))?;
+        let mut tx = lock_branch(repo, &refname, ctx)?;
+        checkout_or_refuse(repo, their_commit.as_object(), ctx)?;
+        tx.set_target(&refname, their_oid, None, "sync: adopt remote history")
+            .map_err(|e| ctx.classify_err(&e))?;
+        tx.commit().map_err(|e| ctx.classify_err(&e))?;
         return Ok(MergeOutcome::AdoptedRemote { head: their_oid });
     }
 
@@ -1532,13 +1599,15 @@ pub fn analyse(repo: &git2::Repository, ctx: &OpCtx) -> Result<MergeOutcome, Git
         let their_commit = repo
             .find_commit(their_oid)
             .map_err(|e| ctx.classify_err(&e))?;
-        checkout_or_refuse(repo, their_commit.as_object(), ctx)?;
-        let mut r = repo
-            .find_reference(&refname)
-            .map_err(|e| ctx.classify_err(&e))?;
-        r.set_target(their_oid, "sync: fast-forward")
-            .map_err(|e| ctx.classify_err(&e))?;
+        // `require_branch` already put HEAD on this branch, so this is a re-attach
+        // that moves nothing; it is here rather than after the checkout only so
+        // that nothing which can fail is left on that side. See `lock_branch`.
         repo.set_head(&refname).map_err(|e| ctx.classify_err(&e))?;
+        let mut tx = lock_branch(repo, &refname, ctx)?;
+        checkout_or_refuse(repo, their_commit.as_object(), ctx)?;
+        tx.set_target(&refname, their_oid, None, "sync: fast-forward")
+            .map_err(|e| ctx.classify_err(&e))?;
+        tx.commit().map_err(|e| ctx.classify_err(&e))?;
         return Ok(MergeOutcome::FastForward { head: their_oid });
     }
 
@@ -2318,14 +2387,37 @@ pub fn merge_prefer_local(
     // the one step that moves a ref is what leaves a refused merge byte-identical
     // to where it started, so the next sync simply redoes it. The other order can
     // only ever fail after HEAD is already on a tree nobody wrote.
-    checkout_or_refuse(repo, tree.as_object(), ctx)?;
+    //
+    // `require_branch` has already established that HEAD is attached to this
+    // branch, so naming the ref directly is what `Some("HEAD")` would have resolved
+    // to anyway — and naming it is what lets the lock be taken here rather than
+    // inside the commit, after the checkout.
+    let refname = format!("refs/heads/{}", ctx.def.branch);
+    let mut tx = lock_branch(repo, &refname, ctx)?;
 
     // Parent 0 is ours and parent 1 is theirs, which is what makes
     // `git show <merge>^2:<path>` the recovery command the message promises.
-    // Some("HEAD") advances the branch ref and leaves HEAD attached.
+    //
+    // Written before the checkout, and with `None` so it updates nothing: an object
+    // write is a pure add to the odb, so a commit no ref points at is unreachable
+    // garbage and costs one `git gc`. Doing it afterwards would put a second
+    // fallible step back between the checkout and the ref move, which is the whole
+    // thing `lock_branch` exists to remove.
     let merge_commit = repo
-        .commit(Some("HEAD"), &sig, &sig, &msg, &tree, &[&ours, &theirs])
+        .commit(None, &sig, &sig, &msg, &tree, &[&ours, &theirs])
         .map_err(|e| ctx.classify_err(&e))?;
+
+    checkout_or_refuse(repo, tree.as_object(), ctx)?;
+
+    // The reflog line libgit2 would have written for `Some("HEAD")`:
+    // `git_reference__update_for_commit` formats "<operation>: <first line>".
+    let reflog = format!(
+        "commit: {}",
+        msg.lines().next().unwrap_or("merge").trim_end()
+    );
+    tx.set_target(&refname, merge_commit, None, &reflog)
+        .map_err(|e| ctx.classify_err(&e))?;
+    tx.commit().map_err(|e| ctx.classify_err(&e))?;
 
     // Defensive, and it can no longer reach a human's merge state: `open_tree`
     // refuses a non-Clean repository before any of this runs, and merge_commits
