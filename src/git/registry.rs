@@ -781,9 +781,6 @@ impl Registry {
                 Err(e) => notes.push(format!("cannot remove stale {}: {e}", tmp.display())),
             }
         }
-        #[cfg(unix)]
-        tighten_mode(path, &mut notes);
-
         // Bytes, not `read_to_string`: the string form collapses "the file could not be read" and
         // "the file is not UTF-8" into one `io::Error`, and those two need opposite answers.
         let bytes = match std::fs::read(path) {
@@ -816,6 +813,15 @@ impl Registry {
                 );
             }
         };
+        // After the read, not before it. `tighten_mode` exists to protect a file whose
+        // contents are secret, and on the read-failure arm above there is nothing here we
+        // could read, so nothing to protect — while chmodding it 0600 anyway made that
+        // arm's promise ("it was left exactly as it is") false, and, for the
+        // directory-in-place case, took the search bit with it and locked the operator
+        // out of their own contents.
+        #[cfg(unix)]
+        tighten_mode(path, &mut notes);
+
         // Bytes we *have* and cannot use are a corruption like any other, so the author gets them
         // back under a `.corrupt-` name and the registry stays writable.
         let raw = match String::from_utf8(bytes) {
@@ -2145,13 +2151,10 @@ mod tests {
         std::fs::create_dir(&path).expect("plant a directory");
         std::fs::write(path.join("marker"), "not ours to move").expect("marker");
         #[cfg(unix)]
-        {
+        let mode_before = {
             use std::os::unix::fs::PermissionsExt;
-            // `tighten_mode` would otherwise chmod this 0755 directory to 0600 and take the
-            // search bit with it, so the marker assertion below would fail on our own umask
-            // rather than on anything the fix does.
-            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).expect("chmod");
-        }
+            std::fs::metadata(&path).expect("stat").permissions().mode()
+        };
 
         let reg = load_at(dir.path());
         let err = reg.error().expect("registry_error");
@@ -2170,6 +2173,19 @@ mod tests {
 
         assert!(path.is_dir(), "nothing at `path` may be touched");
         assert!(path.join("marker").exists(), "and nothing under it either");
+        // "Exactly as it is" has to include the mode. `tighten_mode` used to run before
+        // the read, so this arm chmodded 0600 whatever it found — which for a directory
+        // strips the search bit and locks the operator out of the contents the message
+        // has just told them to move aside.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(&path).expect("stat").permissions().mode(),
+                mode_before,
+                "a file we could not read must keep its mode too"
+            );
+        }
         assert!(
             std::fs::read_dir(dir.path())
                 .expect("read_dir")
