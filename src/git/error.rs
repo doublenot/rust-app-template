@@ -284,6 +284,65 @@ pub fn scrub(message: &str, secrets: &[&str]) -> String {
     out
 }
 
+/// `scrub`, plus the one thing a *serde* message does that a libgit2 message does not:
+/// echo the offending value back verbatim.
+///
+/// `{"credential": "<token>"}` is the shape that matters, because a hand-edit reaching
+/// for that key is by definition holding a secret. serde answers with `invalid type:
+/// string "<token>", expected internally tagged enum CredentialSpec`, `Registry::load`
+/// pushes that onto `notes`, and `GitService::log_startup` writes it into a `git.log`
+/// created 0644 — on every launch, for as long as the entry stays. Any typed field does
+/// the same: `{"auto_sync_secs": "<token>"}` produces the same echo against `expected
+/// u64`. Widening `scrub` itself would be wrong; a libgit2 message's quoted strings are
+/// paths and URLs the operator needs to read.
+///
+/// Only double-quoted runs are redacted, and only long ones. serde names *fields* and
+/// *variants* in backticks and quotes *values* in double quotes, so this reaches the
+/// payload and leaves the diagnosis: `invalid type: string "***", expected u64` still
+/// carries which entry, which line and column, and what was wanted. The length floor is
+/// the same judgement `scrub` makes for the mirror-image reason — under it, a literal is
+/// far likelier to be an enum variant the author has to read than a credential.
+pub fn scrub_serde(message: &str) -> String {
+    const LONGEST_INNOCENT: usize = 20;
+    let scrubbed = scrub(message, &[]);
+    let mut out = String::with_capacity(scrubbed.len());
+    let mut rest = scrubbed.as_str();
+    while let Some(open) = rest.find('"') {
+        out.push_str(&rest[..=open]);
+        let body = &rest[open + 1..];
+        let mut escaped = false;
+        let close = body.char_indices().find(|&(_, c)| {
+            if escaped {
+                escaped = false;
+                return false;
+            }
+            match c {
+                '\\' => {
+                    escaped = true;
+                    false
+                }
+                '"' => true,
+                _ => false,
+            }
+        });
+        // An unbalanced quote is not a value at all; there is nothing to redact and no
+        // reason to mangle the tail looking for one.
+        let Some((close, _)) = close else {
+            out.push_str(body);
+            return out;
+        };
+        if close > LONGEST_INNOCENT {
+            out.push_str("***");
+        } else {
+            out.push_str(&body[..close]);
+        }
+        out.push('"');
+        rest = &body[close + 1..];
+    }
+    out.push_str(rest);
+    out
+}
+
 /// `scheme://user:pw@host/path` -> `scheme://host/path`, everywhere in the string.
 ///
 /// A PAT is routinely carried in the *username* position (`https://ghp_x@host/…`), so
@@ -1058,6 +1117,49 @@ mod tests {
         assert_eq!(
             scrub("cloning into abcdefg/repo", &["abcdefg"]),
             "cloning into ***/repo"
+        );
+    }
+
+    #[test]
+    fn scrub_serde_redacts_the_echoed_value_and_keeps_the_diagnosis() {
+        // The shape that matters: someone hand-edits `repos.json`, reaches for
+        // `credential` — which they are only doing because they are holding a token —
+        // and gets the type wrong. serde quotes the token back and `git.log` is 0644.
+        assert_eq!(
+            scrub_serde(
+                "repos[0] rejected: invalid type: string \"ghp_012345678901234567890123456789012345\", \
+                 expected internally tagged enum CredentialSpec"
+            ),
+            "repos[0] rejected: invalid type: string \"***\", \
+             expected internally tagged enum CredentialSpec"
+        );
+        // Everything a reader needs is still there: which entry, which line, what was
+        // wanted. Only the payload is gone.
+        assert_eq!(
+            scrub_serde("git-state.json is not valid (invalid type: string \"a-very-long-token-value-here\", expected u32 at line 1 column 31)"),
+            "git-state.json is not valid (invalid type: string \"***\", expected u32 at line 1 column 31)"
+        );
+        // Short literals are enum variants far more often than credentials, and the
+        // author has to be able to read them. Same judgement `scrub` makes, mirrored.
+        assert_eq!(
+            scrub_serde("unknown variant \"purple\", expected one of \"light\", \"dark\""),
+            "unknown variant \"purple\", expected one of \"light\", \"dark\""
+        );
+        // serde names fields and variants in backticks, so the diagnosis half of a
+        // message is never at risk however long it gets.
+        assert_eq!(
+            scrub_serde("missing field `ssh_host_key_policy_override` at line 1 column 20"),
+            "missing field `ssh_host_key_policy_override` at line 1 column 20"
+        );
+        // Still a superset of `scrub`.
+        assert_eq!(
+            scrub_serde("failed to fetch https://ghp_x@github.com/a/b.git"),
+            "failed to fetch https://github.com/a/b.git"
+        );
+        // An unbalanced quote is not a value; the tail is not mangled looking for one.
+        assert_eq!(
+            scrub_serde("he said \"and stopped"),
+            "he said \"and stopped"
         );
     }
 

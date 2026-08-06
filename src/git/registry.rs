@@ -910,7 +910,12 @@ impl Registry {
             let mut def: RepoDef = match serde_json::from_value(entry.clone()) {
                 Ok(d) => d,
                 Err(e) => {
-                    notes.push(format!("repos[{index}] rejected: {e}"));
+                    // `scrub_serde`, not `scrub`: serde quotes the value it choked on, and
+                    // the value most likely to be hand-written into this file wrong is
+                    // `credential`. See its doc comment.
+                    notes.push(crate::git::error::scrub_serde(&format!(
+                        "repos[{index}] rejected: {e}"
+                    )));
                     rejected.push(RejectedEntry {
                         index,
                         id: id_hint,
@@ -1946,6 +1951,53 @@ mod tests {
 
     fn load_at(dir: &std::path::Path) -> Registry {
         Registry::load(&dir.join("repos.json"), &dir.join("repos"), defaults())
+    }
+
+    #[test]
+    fn a_hand_written_credential_never_reaches_the_startup_log() {
+        // Someone edits `repos.json` by hand, reaches for `credential` — which they are
+        // only doing because they are holding a token — and writes a bare string where
+        // an object belongs. serde answers by quoting the token, `Registry::load` pushes
+        // that onto `notes`, and `GitService::log_startup` writes every note into a
+        // `git.log` created 0644, on every launch, for as long as the entry stays.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let token = "ghp_012345678901234567890123456789012345";
+        std::fs::write(
+            dir.path().join("repos.json"),
+            format!(
+                r#"{{"version":1,"repos":[
+                     {{"id":"notes","credential":"{token}"}},
+                     {{"id":"other","auto_sync_secs":"{token}"}}
+                   ]}}"#
+            ),
+        )
+        .expect("plant repos.json");
+
+        let reg = load_at(dir.path());
+
+        assert_eq!(reg.count(), 0, "neither entry is usable");
+        let notes = reg.notes().join("\n");
+        assert!(
+            !notes.contains(token),
+            "the token reached the notes: {notes}"
+        );
+        // The author still has to be able to fix it, so the diagnosis stays whole.
+        assert!(
+            notes.contains("repos[0]") && notes.contains("repos[1]"),
+            "{notes}"
+        );
+        assert!(notes.contains("CredentialSpec"), "{notes}");
+        assert!(notes.contains("expected u64"), "{notes}");
+        // And the raw entries survive for a later save: refusing to log a secret is not
+        // licence to delete the line it came from.
+        let err = reg.error().expect("a rejected entry is reported");
+        assert_eq!(err.rejected.len(), 2);
+        assert!(
+            !serde_json::to_string(&err)
+                .expect("serialize")
+                .contains(token),
+            "the token reached the API body instead"
+        );
     }
 
     #[test]

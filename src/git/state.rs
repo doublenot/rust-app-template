@@ -6,7 +6,7 @@
 //! 2 880 times a day. **Never contains a secret**, and a corrupt one is never fatal: it is a
 //! cache, so the only correct response to nonsense is to start empty.
 
-use crate::git::error::scrub;
+use crate::git::error::scrub_serde;
 use crate::git::registry::open_private;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -98,8 +98,10 @@ impl StateStore {
             // The same reason `Registry::assembled` scrubs: this string quotes serde's complaint
             // about a file a human may have hand-edited, serde echoes the offending value
             // verbatim, and its only reader is a `git.log` line in a file created 0644. A cache
-            // documented as never containing a secret must also never republish one it was handed.
-            load_error: load_error.map(|e| scrub(&e, &[])),
+            // documented as never containing a secret must also never republish one it was
+            // handed. `scrub_serde` rather than `scrub` because the echo *is* the value:
+            // `{"version": "<token>"}` comes back as `invalid type: string "<token>"`.
+            load_error: load_error.map(|e| scrub_serde(&e)),
         }
     }
 
