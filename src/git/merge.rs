@@ -171,6 +171,36 @@ fn checkout_or_refuse(
     }
 }
 
+/// Hold the branch ref's lock across the checkout that precedes writing it.
+///
+/// `checkout_or_refuse`'s argument for going first is that a refusal is then a
+/// perfect no-op. That holds only if what comes *after* it cannot fail — and a ref
+/// write can. A stale `.git/refs/heads/<branch>.lock` from a killed `git` is the
+/// ordinary cause, and the result is not a failed sync but a corrupted one: the
+/// checkout leaves the working tree at the remote's content while HEAD stays on the
+/// old tip, `sync` stages and commits *before* it fetches, and so the next run
+/// commits the remote's tree as a local commit, diverges, and pushes a two-parent
+/// merge to the shared remote in place of a clean fast-forward. Measured.
+///
+/// Locking first moves that failure ahead of the checkout, where it is still a
+/// no-op — and `git_transaction_commit` then only renames a lock file it already
+/// holds, which is as close to infallible as a filesystem gets. Dropping the
+/// transaction on any earlier return releases the lock, so a refused checkout
+/// leaves nothing behind for the next run to trip over.
+///
+/// The one thing this cannot do is make `set_head` safe, which is why both callers
+/// below run it *before* the checkout instead: attaching HEAD to a branch moves no
+/// content, so it costs nothing to do early.
+fn lock_branch<'r>(
+    repo: &'r git2::Repository,
+    refname: &str,
+    ctx: &OpCtx,
+) -> Result<git2::Transaction<'r>, GitError> {
+    let mut tx = repo.transaction().map_err(|e| ctx.classify_err(&e))?;
+    tx.lock_ref(refname).map_err(|e| ctx.classify_err(&e))?;
+    Ok(tx)
+}
+
 /// Merge `their_oid` into HEAD, keeping the local copy of any file the two
 /// sides genuinely collide on.
 ///
@@ -334,14 +364,37 @@ pub fn merge_prefer_local(
     // the one step that moves a ref is what leaves a refused merge byte-identical
     // to where it started, so the next sync simply redoes it. The other order can
     // only ever fail after HEAD is already on a tree nobody wrote.
-    checkout_or_refuse(repo, tree.as_object(), ctx)?;
+    //
+    // `require_branch` has already established that HEAD is attached to this
+    // branch, so naming the ref directly is what `Some("HEAD")` would have resolved
+    // to anyway — and naming it is what lets the lock be taken here rather than
+    // inside the commit, after the checkout.
+    let refname = format!("refs/heads/{}", ctx.def.branch);
+    let mut tx = lock_branch(repo, &refname, ctx)?;
 
     // Parent 0 is ours and parent 1 is theirs, which is what makes
     // `git show <merge>^2:<path>` the recovery command the message promises.
-    // Some("HEAD") advances the branch ref and leaves HEAD attached.
+    //
+    // Written before the checkout, and with `None` so it updates nothing: an object
+    // write is a pure add to the odb, so a commit no ref points at is unreachable
+    // garbage and costs one `git gc`. Doing it afterwards would put a second
+    // fallible step back between the checkout and the ref move, which is the whole
+    // thing `lock_branch` exists to remove.
     let merge_commit = repo
-        .commit(Some("HEAD"), &sig, &sig, &msg, &tree, &[&ours, &theirs])
+        .commit(None, &sig, &sig, &msg, &tree, &[&ours, &theirs])
         .map_err(|e| ctx.classify_err(&e))?;
+
+    checkout_or_refuse(repo, tree.as_object(), ctx)?;
+
+    // The reflog line libgit2 would have written for `Some("HEAD")`:
+    // `git_reference__update_for_commit` formats "<operation>: <first line>".
+    let reflog = format!(
+        "commit: {}",
+        msg.lines().next().unwrap_or("merge").trim_end()
+    );
+    tx.set_target(&refname, merge_commit, None, &reflog)
+        .map_err(|e| ctx.classify_err(&e))?;
+    tx.commit().map_err(|e| ctx.classify_err(&e))?;
 
     // Defensive: merge_commits sets no MERGE_HEAD, so there should be nothing to
     // clean. It can no longer reach a human's merge state either — `open_tree`
@@ -398,10 +451,17 @@ pub fn analyse(repo: &git2::Repository, ctx: &OpCtx) -> Result<MergeOutcome, Git
         let their_commit = repo
             .find_commit(their_oid)
             .map_err(|e| ctx.classify_err(&e))?;
-        checkout_or_refuse(repo, their_commit.as_object(), ctx)?;
-        repo.reference(&refname, their_oid, true, "sync: adopt remote history")
-            .map_err(|e| ctx.classify_err(&e))?;
+        // Both before the checkout, and for the same reason: nothing that can fail
+        // may sit between a checkout and the ref write that publishes it. Attaching
+        // HEAD to a branch that does not exist yet leaves the repository exactly as
+        // unborn as it was, so hoisting it moves no content — it only removes the
+        // last fallible step from the far side of the checkout.
         repo.set_head(&refname).map_err(|e| ctx.classify_err(&e))?;
+        let mut tx = lock_branch(repo, &refname, ctx)?;
+        checkout_or_refuse(repo, their_commit.as_object(), ctx)?;
+        tx.set_target(&refname, their_oid, None, "sync: adopt remote history")
+            .map_err(|e| ctx.classify_err(&e))?;
+        tx.commit().map_err(|e| ctx.classify_err(&e))?;
         return Ok(MergeOutcome::AdoptedRemote { head: their_oid });
     }
 
@@ -416,13 +476,15 @@ pub fn analyse(repo: &git2::Repository, ctx: &OpCtx) -> Result<MergeOutcome, Git
         let their_commit = repo
             .find_commit(their_oid)
             .map_err(|e| ctx.classify_err(&e))?;
-        checkout_or_refuse(repo, their_commit.as_object(), ctx)?;
-        let mut r = repo
-            .find_reference(&refname)
-            .map_err(|e| ctx.classify_err(&e))?;
-        r.set_target(their_oid, "sync: fast-forward")
-            .map_err(|e| ctx.classify_err(&e))?;
+        // `require_branch` already put HEAD on this branch, so this is a re-attach
+        // that moves nothing; it is here rather than after the checkout only so
+        // that nothing which can fail is left on that side. See `lock_branch`.
         repo.set_head(&refname).map_err(|e| ctx.classify_err(&e))?;
+        let mut tx = lock_branch(repo, &refname, ctx)?;
+        checkout_or_refuse(repo, their_commit.as_object(), ctx)?;
+        tx.set_target(&refname, their_oid, None, "sync: fast-forward")
+            .map_err(|e| ctx.classify_err(&e))?;
+        tx.commit().map_err(|e| ctx.classify_err(&e))?;
         return Ok(MergeOutcome::FastForward { head: their_oid });
     }
 
@@ -1098,6 +1160,64 @@ mod tests {
             "a fast-forward must not create a second parent"
         );
         assert_eq!(read_file(&a, "f.md"), "moved on\n");
+        assert_no_merge_state(&a);
+    }
+
+    #[test]
+    fn a_locked_branch_ref_refuses_before_the_checkout_rather_than_after_it() {
+        // A stale `.git/refs/heads/main.lock` is what a killed `git` leaves behind,
+        // and nothing here used to discover it until `checkout_or_refuse` had
+        // already put the remote's tree in the working directory. HEAD stayed on
+        // the old tip; `sync` stages and commits *before* it fetches; so the next
+        // run committed the remote's tree as a local commit, diverged, and pushed a
+        // two-parent merge to the shared remote where a clean fast-forward belonged.
+        // The push is left on (`job`, not `merge_only`) because that last step is
+        // the one that makes the damage everybody else's.
+        let o = origin_with_main();
+        let a = clone_at(&o, "a");
+        let before = head_of(&a);
+
+        let b = clone_at(&o, "b");
+        write_file(&b, "f.md", "moved on\n");
+        let theirs = commit_all(&b, "b moves ahead");
+        push_main(&b);
+
+        let lock = a.join(".git/refs/heads/main.lock");
+        std::fs::write(&lock, "").expect("plant the stale lock");
+
+        let fx = job(&o, &a, JobOp::Sync);
+        let err = ops::sync(&fx.ctx).expect_err("a branch ref that cannot be moved");
+        assert_eq!(err.code(), GitErrorCode::RepoLocked);
+
+        // The refusal is the whole property: a no-op, not a half-applied
+        // fast-forward waiting for the next sync to commit it.
+        assert_eq!(head_of(&a), before, "the refusal moved the branch");
+        assert_eq!(read_file(&a, "f.md"), SEEDED, "the refusal checked out");
+        assert!(
+            lock.exists(),
+            "a lock this job never took must not be cleared by it"
+        );
+        assert_no_merge_state(&a);
+
+        std::fs::remove_file(&lock).expect("clear the lock");
+        let fx = job(&o, &a, JobOp::Sync);
+        let out = ops::sync(&fx.ctx).expect("the retry is an ordinary fast-forward");
+
+        assert_eq!(out.outcome, "fast_forward");
+        assert_eq!(head_of(&a), theirs);
+        let repo = git2::Repository::open(&a).expect("open a");
+        assert_eq!(
+            repo.find_commit(head_of(&a))
+                .expect("commit")
+                .parent_count(),
+            1,
+            "the retry turned a fast-forward into a merge over the half-applied tree"
+        );
+        assert_eq!(
+            origin_main(&o),
+            theirs,
+            "and published it to the shared remote"
+        );
         assert_no_merge_state(&a);
     }
 
