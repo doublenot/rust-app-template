@@ -386,13 +386,17 @@ pub fn merge_prefer_local(
 
     checkout_or_refuse(repo, tree.as_object(), ctx)?;
 
-    // The reflog line libgit2 would have written for `Some("HEAD")`:
-    // `git_reference__update_for_commit` formats "<operation>: <first line>".
+    // Exactly what libgit2 would have written for `Some("HEAD")`:
+    // `git_reference__update_for_commit` formats "<operation>: <first line>" and
+    // attributes the entry to the *committer*, which is why `sig` is passed rather
+    // than left to `git_reference__log_signature`'s "unknown <unknown>" fallback.
+    // (`analyse`'s two arms pass `None` on purpose — they write no commit, and
+    // `Reference::set_target` did not name anybody either.)
     let reflog = format!(
         "commit: {}",
         msg.lines().next().unwrap_or("merge").trim_end()
     );
-    tx.set_target(&refname, merge_commit, None, &reflog)
+    tx.set_target(&refname, merge_commit, Some(&sig), &reflog)
         .map_err(|e| ctx.classify_err(&e))?;
     tx.commit().map_err(|e| ctx.classify_err(&e))?;
 
@@ -1161,6 +1165,62 @@ mod tests {
         );
         assert_eq!(read_file(&a, "f.md"), "moved on\n");
         assert_no_merge_state(&a);
+    }
+
+    #[test]
+    fn the_ref_writes_keep_the_reflog_libgit2_would_have_written() {
+        // Both ref moves go through a `git2::Transaction` now rather than
+        // `commit(Some("HEAD"))` and `Reference::set_target`, and a transaction takes
+        // the reflog message and signature as arguments instead of deriving them.
+        // Nothing else in this suite reads a reflog, so losing one — or attributing it
+        // to libgit2's "unknown <unknown>" fallback — would be invisible, and a reflog
+        // is exactly what a user reaches for after a sync surprises them.
+        let o = origin_with_main();
+        let a = clone_at(&o, "a");
+        let b = clone_at(&o, "b");
+        write_file(&b, "f.md", "moved on\n");
+        commit_all(&b, "b moves ahead");
+        push_main(&b);
+
+        let fx = job_with(Some(&o), &a, JobOp::Sync, merge_only());
+        assert_eq!(ops::sync(&fx.ctx).expect("sync").outcome, "fast_forward");
+
+        let repo = git2::Repository::open(&a).expect("open a");
+        let head = repo.reflog("refs/heads/main").expect("reflog");
+        assert_eq!(
+            head.get(0)
+                .expect("the fast-forward wrote no reflog entry")
+                .message(),
+            Ok(Some("sync: fast-forward"))
+        );
+
+        // The merge arm, which is the one that used to carry a signature: libgit2
+        // attributes a `commit(Some("HEAD"))` reflog entry to the *committer*.
+        let o2 = origin_with_main();
+        let c = clone_at(&o2, "c");
+        let d = clone_at(&o2, "d");
+        write_file(&d, "theirs.md", "theirs\n");
+        commit_all(&d, "d adds");
+        push_main(&d);
+        write_file(&c, "ours.md", "ours\n");
+        commit_all(&c, "c adds");
+
+        let fx = job_with(Some(&o2), &c, JobOp::Sync, merge_only());
+        assert_eq!(ops::sync(&fx.ctx).expect("sync").outcome, "merged");
+
+        let repo = git2::Repository::open(&c).expect("open c");
+        let log = repo.reflog("refs/heads/main").expect("reflog");
+        let entry = log.get(0).expect("the merge wrote no reflog entry");
+        assert_eq!(
+            entry.message(),
+            Ok(Some("commit: Merge origin/main into main")),
+            "the format libgit2 builds from `<operation>: <first line>`"
+        );
+        assert_eq!(
+            (entry.committer().name(), entry.committer().email()),
+            (Ok("Test App"), Ok("com.example.test@testhost")),
+            "the entry fell back to libgit2's anonymous signature"
+        );
     }
 
     #[test]
