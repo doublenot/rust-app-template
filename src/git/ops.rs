@@ -513,7 +513,21 @@ pub fn init(ctx: &OpCtx) -> Result<OpOutcome, GitError> {
         Ok(repo) => repo,
         // `no_reinit` turns "already a repository" into Exists rather than a
         // destructive re-init; a retried POST /init lands here and is a success.
-        Err(e) if e.code() == git2::ErrorCode::Exists => git2::Repository::open(&ctx.tree)?,
+        Err(e) if e.code() == git2::ErrorCode::Exists => {
+            let repo = git2::Repository::open(&ctx.tree)?;
+            // The same refusal every mutating verb gives, on the same condition —
+            // this branch is the one that reached an *existing* tree. Answering
+            // `initialized` for a repository a human is half-way through a merge
+            // in, while sync/commit/pull/push all answer 409, makes "is this repo
+            // wedged?" depend on which button was pressed. And it is not a
+            // read-only answer either: the remote block below writes `.git/config`.
+            //
+            // Directly rather than through `open_tree`, which would also *repoint*
+            // an existing remote; init only ever fills in a missing one, and a
+            // retried POST must not quietly become a way to rewrite a url.
+            require_clean_state(&repo, &ctx.def.id)?;
+            repo
+        }
         Err(e) => return Err(e.into()),
     };
 
@@ -541,6 +555,12 @@ pub fn clone(ctx: &OpCtx) -> Result<OpOutcome, GitError> {
         // else and is refused rather than cloned over.
         return match git2::Repository::open(&ctx.tree) {
             Ok(repo) => {
+                // Same gate, same reason as `init`'s Exists branch: `up_to_date`
+                // is the one answer that tells a caller this repository is fine,
+                // and it must not be the one answer a wedged tree still gives.
+                // Directly rather than through `open_tree`, because this branch
+                // reports on a tree it did not create and does not reconcile it.
+                require_clean_state(&repo, &ctx.def.id)?;
                 let mut out = OpOutcome::new("up_to_date", &ctx.def.branch);
                 out.head_after = head_oid(&repo);
                 Ok(out)
@@ -919,15 +939,28 @@ fn head_oid(repo: &git2::Repository) -> Option<String> {
         .map(|o| o.to_string())
 }
 
-/// Open the working tree and reconcile its `origin` with the current definition.
+/// Open the working tree, refuse a state a human left behind, and only then
+/// reconcile its `origin` with the current definition.
 ///
-/// Refuses a repository left mid-merge, mid-rebase or mid-cherry-pick: see
-/// `require_clean_state`. Every verb that touches an existing tree comes through
-/// here, so the gate is one line and a verb added later gets it without being
-/// told. `reset` is the single exception and says so at its own call site.
+/// **The order is the contract.** `require_clean_state` declares the tree
+/// untouchable, so nothing that runs before it may write to that tree — and
+/// reconciling the remote is a `.git/config` write. Gating after it meant a verb
+/// refused with `dirty_tree` had already repointed the remote of the repository
+/// the refusal promises not to touch, which is the same defect the checkout was
+/// held to account for: byte-identical after a refusal, not merely "the working
+/// files survived".
+///
+/// Every verb that *mutates* an existing tree comes through here, so the gate is
+/// one line and a verb added later gets it without being told. Three call sites
+/// hold the same gate without holding this function, and each says why at its
+/// own site: `reset` opts out of it entirely (below), while `init` and `clone`
+/// call `require_clean_state` directly on their idempotent branches — those two
+/// report on a tree they did not create and must not adopt the definition's
+/// remote url as a side effect of being asked whether it exists.
 pub fn open_tree(ctx: &OpCtx) -> Result<git2::Repository, GitError> {
-    let repo = open_tree_any_state(ctx)?;
+    let repo = open_repo(ctx)?;
     require_clean_state(&repo, &ctx.def.id)?;
+    reconcile_remote(&repo, &ctx.def)?;
     Ok(repo)
 }
 
@@ -941,29 +974,48 @@ pub fn open_tree(ctx: &OpCtx) -> Result<git2::Repository, GitError> {
 /// this handle would do exactly the damage the gate exists to prevent — which is
 /// also why there is no second, defensive check further down: nothing else can
 /// ever be holding such a handle.
+///
+/// It still reconciles the remote, unlike a refusal: this one is not refusing.
+/// A `reset` to `upstream` reads the tracking branch the definition names, so
+/// skipping the reconciliation here would resolve it against a stale url.
 pub fn open_tree_any_state(ctx: &OpCtx) -> Result<git2::Repository, GitError> {
+    let repo = open_repo(ctx)?;
+    reconcile_remote(&repo, &ctx.def)?;
+    Ok(repo)
+}
+
+/// `Repository::open`, plus the one refusal that has to precede every gate:
+/// there is no tree here at all.
+fn open_repo(ctx: &OpCtx) -> Result<git2::Repository, GitError> {
     if !ctx.tree.exists() {
         return Err(GitError::no_worktree(&ctx.def.id));
     }
-    let repo = git2::Repository::open(&ctx.tree)?;
-    // Re-point the remote if the definition changed since the last operation: a PUT can
-    // move a repo to a new host while the tree on disk still points at the old one, and
-    // every later fetch/push would silently keep talking to the wrong server.
-    if let Some(url) = ctx.def.remote.as_deref() {
-        match repo.find_remote(&ctx.def.remote_name) {
-            // git2 0.21 returns `Result<&str, _>` from `Remote::url`, not `Option<&str>`
-            // (a non-UTF-8 url is an Err rather than a None), so the comparison has to
-            // go through `.ok()`.
-            Ok(remote) if remote.url().ok() != Some(url) => {
-                repo.remote_set_url(&ctx.def.remote_name, url)?;
-            }
-            Ok(_) => {}
-            Err(_) => {
-                repo.remote(&ctx.def.remote_name, url)?;
-            }
+    Ok(git2::Repository::open(&ctx.tree)?)
+}
+
+/// Re-point the remote if the definition changed since the last operation.
+///
+/// A PUT can move a repo to a new host while the tree on disk still points at the
+/// old one, and every later fetch/push would silently keep talking to the wrong
+/// server. Split out of `open_tree` so the gate can run between the two: this
+/// writes `.git/config`, and a refused verb must not.
+fn reconcile_remote(repo: &git2::Repository, def: &RepoDef) -> Result<(), GitError> {
+    let Some(url) = def.remote.as_deref() else {
+        return Ok(());
+    };
+    match repo.find_remote(&def.remote_name) {
+        // git2 0.21 returns `Result<&str, _>` from `Remote::url`, not `Option<&str>`
+        // (a non-UTF-8 url is an Err rather than a None), so the comparison has to
+        // go through `.ok()`.
+        Ok(remote) if remote.url().ok() != Some(url) => {
+            repo.remote_set_url(&def.remote_name, url)?;
+        }
+        Ok(_) => {}
+        Err(_) => {
+            repo.remote(&def.remote_name, url)?;
         }
     }
-    Ok(repo)
+    Ok(())
 }
 
 /// Refuse a repository that is half-way through an operation a human started.
@@ -2470,6 +2522,100 @@ mod tests {
         assert!(
             open_tree_any_state(&op).is_ok(),
             "the escape hatch opens the same tree, which is the whole reason it exists"
+        );
+    }
+
+    #[test]
+    fn a_refused_open_leaves_the_remote_url_untouched() {
+        // The gate declares the tree untouchable, so nothing on the way to saying
+        // so may write to it. Reconciling the remote first meant a verb refused
+        // with `dirty_tree` had already repointed `.git/config` at whatever the
+        // current definition names — on the one tree the refusal promises not to
+        // touch. Same standard the checkout is held to: byte-identical after a
+        // refusal, not merely "the working files survived".
+        let fx = Fixture::new();
+        let repo = seeded_local(&fx, "notes");
+        let oid = head_oid(&repo).expect("the seed committed something");
+        repo.remote("origin", "https://old.example/a.git")
+            .expect("plant the old remote");
+        drop(repo);
+        std::fs::write(
+            fx.tree("notes").join(".git").join("MERGE_HEAD"),
+            format!("{oid}\n"),
+        )
+        .expect("plant MERGE_HEAD");
+
+        let config = fx.tree("notes").join(".git").join("config");
+        // As text, so a failure prints the two urls rather than 180 byte values.
+        let before = std::fs::read_to_string(&config).expect("read .git/config");
+
+        let op = fx.op(
+            repo_def(
+                "notes",
+                "main",
+                Some("https://attacker.example/b.git".to_string()),
+            ),
+            JobOp::Commit,
+            OpRequest::default(),
+        );
+        let err = run(JobOp::Commit, &op).expect_err("a wedged tree is refused");
+
+        assert_eq!(err.code(), GitErrorCode::DirtyTree);
+        assert_eq!(
+            std::fs::read_to_string(&config).expect("read .git/config"),
+            before,
+            "a refusal rewrote the remote url on the tree it refused to touch"
+        );
+    }
+
+    #[test]
+    fn every_verb_refuses_a_tree_a_human_left_mid_merge() {
+        // `init` and `clone` reach an existing tree through `Repository::open`
+        // rather than `open_tree`, so one repo answered 200 `initialized` /
+        // `up_to_date` to those two while answering 409 `dirty_tree` to every
+        // other verb — and `init` was not even read-only about it: its Exists
+        // branch adds a missing remote, which is a `.git/config` write on a tree
+        // a human is mid-merge in. One condition, one answer, every surface.
+        let fx = Fixture::new();
+        let repo = seeded_local(&fx, "notes");
+        let oid = head_oid(&repo).expect("the seed committed something");
+        drop(repo);
+        std::fs::write(
+            fx.tree("notes").join(".git").join("MERGE_HEAD"),
+            format!("{oid}\n"),
+        )
+        .expect("plant MERGE_HEAD");
+
+        let def = fx.remote_def("notes", "main");
+        for kind in [
+            JobOp::Init,
+            JobOp::Clone,
+            JobOp::Sync,
+            JobOp::Commit,
+            JobOp::Pull,
+            JobOp::Push,
+        ] {
+            let op = fx.op(def.clone(), kind, OpRequest::default());
+            let err = match run(kind, &op) {
+                Ok(out) => panic!("{kind:?} answered {:?} on a wedged tree", out.outcome),
+                Err(e) => e,
+            };
+            assert_eq!(err.code(), GitErrorCode::DirtyTree, "{kind:?}");
+            assert!(
+                err.message.contains("Merge") && err.message.contains("/reset"),
+                "{kind:?} must name the state and the way out: {}",
+                err.message
+            );
+        }
+
+        // The exception that makes the rule usable: the verb every one of those
+        // refusals points at repairs the tree instead of refusing it.
+        let op = fx.op(def, JobOp::Reset, reset_request("head", false, true));
+        let out = run(JobOp::Reset, &op).expect("reset is the documented way out");
+        assert_eq!(out.outcome, "reset");
+        assert_eq!(
+            open(&fx.tree("notes")).state(),
+            git2::RepositoryState::Clean
         );
     }
 
