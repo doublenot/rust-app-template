@@ -73,10 +73,15 @@ pub fn conflict_path_bytes(c: &git2::IndexConflict) -> Result<Vec<u8>, GitError>
 /// mention at all — and safe mode *on its own* still clobbers a gitignored
 /// `secret.env` the remote happens to track.
 ///
-/// `recreate_missing(true)` is set on purpose: it fires only for a path with no
-/// working-directory entry, so it can destroy nothing, and without it a file the
-/// user deleted between `pull`'s dirty check and this call would turn a sync into
-/// a failure instead of simply being restored.
+/// `recreate_missing(true)` is set on purpose: without it a file the user deleted
+/// between `pull`'s dirty check and this call would turn a sync into a failure
+/// instead of simply being restored. It is read by exactly one action function,
+/// `checkout_action_no_wd` (checkout.c:305, 311) — a path with no
+/// working-directory entry — plus the empty-directory case that routes through it
+/// (`checkout_action_with_wd_dir_empty`, checkout.c:655), where it removes the
+/// empty directory and writes the blob. So it does reach a path that *has* a
+/// working-directory entry, but only one that holds nothing: no content can be
+/// lost through this flag.
 ///
 /// The refusal is atomic. `checkout_get_actions` counts every conflict and
 /// returns `GIT_ECONFLICT` before the remove and update passes run, so on `Err`
@@ -84,10 +89,15 @@ pub fn conflict_path_bytes(c: &git2::IndexConflict) -> Result<Vec<u8>, GitError>
 /// lets the callers below check out *before* they move a ref and treat a refusal
 /// as a perfect no-op the next sync simply redoes.
 ///
-/// `checkout_tree`, never `checkout_head`: with no baseline supplied libgit2
-/// defaults it to the HEAD tree, so `checkout_head` has target == baseline, every
-/// delta is UNMODIFIED, and safe mode maps UNMODIFIED to "do nothing". A safe
-/// `checkout_head` is a silent no-op that reports success.
+/// `checkout_tree`, never `checkout_head`: with no baseline supplied **and an
+/// index on disk** (checkout.c:2483) libgit2 defaults the baseline to the HEAD
+/// tree, so `checkout_head` has target == baseline, every delta is UNMODIFIED,
+/// and safe mode maps UNMODIFIED to "do nothing". A safe `checkout_head` is a
+/// silent no-op that reports success. The guard is worth stating because the
+/// other branch behaves oppositely: with no index file the baseline stays NULL —
+/// an empty tree — and checkout.c:2453 force-adds RECREATE_MISSING, so the same
+/// call would write out the whole tree. Every repository this host touches has an
+/// index, so it is the no-op branch that applies here.
 fn checkout_or_refuse(
     repo: &git2::Repository,
     target: &git2::Object<'_>,
@@ -99,11 +109,24 @@ fn checkout_or_refuse(
     // is not something the child process can act on. The notify callback is the
     // only place the paths exist.
     //
-    // Not `dry_run()`, which looks like it was made for this and is not: git2 0.21
-    // spells it as GIT_CHECKOUT_NONE, and checkout.c returns `*action = NONE` at
-    // the top of every action function, above every notify call. A dry run reports
-    // zero conflicts, notifies nothing and returns Ok. A plain safe `checkout_tree`
-    // enumerates the collisions AND refuses AND still mutates nothing.
+    // Not `dry_run()`, which looks like it was made for this and is neither safe
+    // nor useful. git2 0.21 spells it as GIT_CHECKOUT_NONE (1 << 30), which is not
+    // libgit2's GIT_CHECKOUT_DRY_RUN (1 << 24), and the two are not interchangeable:
+    //
+    //   * NONE forces every *delta* action to NONE (checkout.c:297, 500, 572, 609),
+    //     so no conflict is ever counted and no CONFLICT notification is ever
+    //     raised — it reports zero conflicts and returns Ok on a tree it would have
+    //     refused.
+    //   * NONE does not stop the apply passes. Only DRY_RUN short-circuits them
+    //     (checkout.c:2640), and `checkout_action_wd_only` (checkout.c:365-457) is
+    //     not one of the four functions with the NONE early exit: it notifies
+    //     unconditionally and still queues removes. Measured — `dry_run()` plus
+    //     `remove_untracked(true)` returned Ok, fired the callback, and deleted the
+    //     untracked file.
+    //
+    // A plain safe `checkout_tree` enumerates the collisions AND refuses AND still
+    // mutates nothing, which is all three of the things `dry_run()` looked like it
+    // was offering.
     let blocked: RefCell<Vec<String>> = RefCell::new(Vec::new());
     let mut co = git2::build::CheckoutBuilder::new();
     // `.safe()` FIRST, and never anywhere else in this chain: git2 0.21 spells
@@ -420,8 +443,10 @@ pub fn analyse(repo: &git2::Repository, ctx: &OpCtx) -> Result<MergeOutcome, Git
 /// It is also **the crate's single gate onto libgit2 in tests**: every entry point
 /// below that names `git2` — plus `job_with`, whose `OpCtx` is handed straight to
 /// production code that does — opens with `hostile_global_config()`. The three that
-/// do neither (`origin_with_main`, `job`, `job_local`) delegate to one that does
-/// before touching anything, so the gate is already shut by the time they arrive.
+/// reach libgit2 without naming it (`origin_with_main`, `job`, `job_local`) delegate
+/// to one that does before touching anything, so the gate is already shut by the
+/// time they arrive. `write_file` and `read_file` are pure `std::fs` and never reach
+/// libgit2 at all, which is the only reason they are allowed to skip it.
 /// Read that function's SAFETY note before adding an entry point that skips it.
 #[cfg(test)]
 pub(crate) mod testkit {
@@ -822,11 +847,22 @@ mod tests {
     /// control repository is then initialised with **no** `initial_head`, which is the
     /// only way to observe what libgit2 would have chosen on its own. Read `main` here
     /// and the fixtures have gone vacuous: the suite stays green and proves nothing.
-    /// (On a developer whose own default is already `master` this can only fail if
-    /// `hostile_global_config` stopped writing; the property it guards holds either way.)
+    ///
+    /// The HEAD assertion alone is not enough to catch the gate going missing, because
+    /// libgit2's *built-in* default is already `master`: a `hostile_global_config` that
+    /// redirected the search paths and then wrote nothing into them passes it. So the
+    /// config read is asserted too — that value exists only because the gate put it
+    /// there, and it is the one thing here that cannot be true by accident.
     #[test]
     fn testkit_pins_a_default_branch_that_disagrees_with_main() {
         let o = origin();
+        assert_eq!(
+            git2::Config::open_default()
+                .and_then(|c| c.get_string("init.defaultBranch"))
+                .as_deref(),
+            Ok("master"),
+            "the gate's own config is what proves the search paths were redirected"
+        );
         let repo = git2::Repository::init(o.root.path().join("ambient")).expect("ambient init");
         let head = repo
             .find_reference("HEAD")
