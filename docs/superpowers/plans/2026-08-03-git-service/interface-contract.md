@@ -153,6 +153,14 @@ variant are both deleted.
 
 ### 3.11 `warnings[].code` values
 `auth_unbound` `auto_sync_clamped` `restart_deferred` `settings_rejected`
+`settings_symlink_replaced`
+
+`settings_symlink_replaced` was added by the post-execution audit. A remote can track
+`settings_path` as a mode-120000 blob, which libgit2 materializes as a real symlink and
+`std::fs::write` then follows; `ops::settings_tree_target` unlinks the link and writes a regular
+file in its place. The repair is silent to the *filesystem* but never to the *operator* — the job
+still succeeds, and this warning is the only way they learn the remote is aiming at their disk.
+A linked **directory** component is refused instead, with `path_refused` (403).
 
 ### 3.12 `registry_error.rejected[].reason` values
 `invalid_repo_id` `invalid_branch_name` `invalid_request` `insecure_remote`

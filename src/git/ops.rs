@@ -720,7 +720,7 @@ pub fn sync(ctx: &OpCtx) -> Result<OpOutcome, GitError> {
     // Before staging, so this host's settings ride out on the same commit as
     // everything else in the tree. `sync` is the only verb that does this: a
     // `pull` refuses a dirty tree, and copying in is what would make it dirty.
-    let settings_before = settings_copy_in(ctx)?;
+    let settings_before = settings_copy_in(ctx, &mut out)?;
 
     // Committing everything BEFORE the fetch is load-bearing, not convenient.
     // Afterwards every tracked file is at a committed state, which is what keeps
@@ -1676,8 +1676,82 @@ fn apply_merge(repo: &git2::Repository, ctx: &OpCtx, out: &mut OpOutcome) -> Res
 /// `settings_path` is registry-validated as relative, `/`-separated and free of
 /// `..`, and `Path::join` treats `/` as a separator on Windows too, so no
 /// per-platform splitting is needed here.
+///
+/// **Nothing may read or write this path without going through
+/// `settings_tree_target` first**, which is the function that makes the
+/// validated *string* mean anything about the *file* it names.
 fn settings_tree_path(ctx: &OpCtx) -> PathBuf {
     ctx.tree.join(&ctx.def.settings_path)
+}
+
+/// Resolve the tree copy's path, disarm what a remote can plant at it, and say so.
+///
+/// `validate_settings_path` constrains the string — relative, no `..`, no
+/// backslash — and says nothing whatever about what is on disk under it. A remote
+/// chooses the *file type*: track `settings.json` as a mode-120000 blob and
+/// libgit2 materializes a real symlink (`blob_content_to_link` → `p_symlink`,
+/// checkout.c:1596-1612, 1.9.6), after which `settings::save`'s `std::fs::write`
+/// follows it and every sync overwrites a file the remote named — a dotfile, a
+/// shell rc, or `<data-dir>/repos.json` with every stored PAT in it. Silently,
+/// and forever: the index and HEAD still hold mode 120000, so nothing is ever
+/// staged and the job reports `no_changes` while doing it.
+///
+/// A SAFE checkout does not close this. `checkout_action_with_wd`
+/// (checkout.c:530-551) sends a blob→link TYPECHANGE to CONFLICT only when the
+/// workdir copy is *modified*; when it matches the baseline — which
+/// `settings_copy_in` plus the commit that follows it guarantee — the arm is a
+/// plain `REMOVE_AND_UPDATE`. So the link can also land mid-job, between the
+/// copy-in and the apply-back, which is why the *read* goes through here too.
+///
+/// Two dispositions, because the two cases are not the same object:
+///
+/// - **The leaf is replaced.** `heal_tree_copy`'s doctrine is that the tree copy
+///   is the disposable one; unlinking keeps the repo syncing and the next commit
+///   publishes a regular blob, which heals every other clone of that remote.
+/// - **A directory component is refused** (403, and the repo stops syncing until
+///   a human looks). It is not the settings copy, the write that follows would
+///   not recreate it, and `settings::save` `create_dir_all`s the parent — so a
+///   nested `settings_path` escapes through a linked directory with the leaf
+///   never being a link at all.
+///
+/// Component by component rather than by canonicalizing: with every existing
+/// component under the tree proven not to be a link, and `..` already excluded
+/// upstream, the write cannot leave the tree — and unlike `contained_in` this
+/// also refuses a link that stays *inside* it, where `.git/config` lives.
+fn settings_tree_target(ctx: &OpCtx, out: &mut OpOutcome) -> Result<PathBuf, GitError> {
+    let mut walked = ctx.tree.clone();
+    let mut parts = ctx.def.settings_path.split('/').peekable();
+    while let Some(part) = parts.next() {
+        walked.push(part);
+        // A component that does not exist yet cannot be a link, and nothing under
+        // it can exist either: `create_dir_all` will build the rest inside the tree.
+        let Ok(meta) = std::fs::symlink_metadata(&walked) else {
+            break;
+        };
+        if !meta.file_type().is_symlink() {
+            continue;
+        }
+        if parts.peek().is_some() {
+            return Err(GitError::path_refused(&walked, "is a symlink").with_repo(&ctx.def.id));
+        }
+        // Both calls unlink the LINK and never touch the file it names;
+        // `remove_dir` is the one Windows needs for a directory symlink, where
+        // `remove_file` fails.
+        std::fs::remove_file(&walked)
+            .or_else(|_| std::fs::remove_dir(&walked))
+            .map_err(|e| GitError::io(format!("unlink {}: {e}", walked.display())))?;
+        // Repairing it silently would leave the operator with a repo that syncs
+        // fine and a remote that is still aiming at their filesystem.
+        out.warnings.push(Warning {
+            code: "settings_symlink_replaced",
+            message: format!(
+                "{} was a symlink in the work tree and was replaced with a regular file; \
+                 the remote is tracking it as one and this host will not write through it",
+                ctx.def.settings_path
+            ),
+        });
+    }
+    Ok(settings_tree_path(ctx))
 }
 
 /// A change detector, not a checksum.
@@ -1712,7 +1786,10 @@ fn write_settings(
 /// not mirror settings. Prefer-local applies to settings exactly as it does to
 /// every other file: this machine's `settings.json` is what gets published, and
 /// the merge decides the rest.
-pub fn settings_copy_in(ctx: &OpCtx) -> Result<Option<u64>, GitError> {
+///
+/// Takes `out` for one reason: `settings_tree_target` can disarm a hostile tree
+/// entry, and the job that did it has to say so.
+pub fn settings_copy_in(ctx: &OpCtx, out: &mut OpOutcome) -> Result<Option<u64>, GitError> {
     if !ctx.def.sync_settings {
         return Ok(None);
     }
@@ -1731,7 +1808,7 @@ pub fn settings_copy_in(ctx: &OpCtx) -> Result<Option<u64>, GitError> {
         write_settings(&sc.settings_file, &values)?;
     }
 
-    let target = settings_tree_path(ctx);
+    let target = settings_tree_target(ctx, out)?;
     write_settings(&target, &values)?;
     let bytes = std::fs::read(&target)
         .map_err(|e| GitError::io(format!("read {}: {e}", target.display())))?;
@@ -1755,12 +1832,16 @@ pub fn settings_apply_back(
         return Ok(());
     };
 
-    let target = settings_tree_path(ctx);
+    // Before the read, not only before a write: the bytes at this path are parsed,
+    // validated, adopted as this host's settings and quoted into a warning, so a
+    // link here chooses what this host runs with and what its logs print.
+    let target = settings_tree_target(ctx, out)?;
     let Ok(after) = std::fs::read(&target) else {
         // The copy above was committed before the fetch and the merge prefers
-        // local, so the file cannot normally vanish. If it somehow did, heal it
-        // rather than fail: the tree copy is the disposable one.
-        return heal_tree_copy(ctx, sc);
+        // local, so the file cannot normally vanish. It does vanish when the
+        // guard has just unlinked a planted symlink, and that lands here on
+        // purpose — the heal below is exactly the repair that case wants.
+        return heal_tree_copy(ctx, sc, out);
     };
     if hash_bytes(&after) == before {
         return Ok(());
@@ -1805,16 +1886,19 @@ pub fn settings_apply_back(
         code: "settings_rejected",
         message,
     });
-    heal_tree_copy(ctx, sc)
+    heal_tree_copy(ctx, sc, out)
 }
 
 /// Write the host's own valid settings back over the tree copy.
 ///
 /// The next sync stages and commits it, and that push is what heals the remote
 /// for everyone else.
-fn heal_tree_copy(ctx: &OpCtx, sc: &SettingsCtx) -> Result<(), GitError> {
+fn heal_tree_copy(ctx: &OpCtx, sc: &SettingsCtx, out: &mut OpOutcome) -> Result<(), GitError> {
     let values = settings::load(&sc.schema, &sc.settings_file);
-    write_settings(&settings_tree_path(ctx), &values)
+    // Through the guard, like every other write: one of the two ways to reach
+    // this function is a tree copy that turned into a symlink.
+    let target = settings_tree_target(ctx, out)?;
+    write_settings(&target, &values)
 }
 
 #[cfg(test)]
@@ -3806,6 +3890,12 @@ mod tests {
         }
     }
 
+    /// Somewhere for a direct `settings_copy_in` to report what it disarmed, in
+    /// the tests that assert on the files rather than on the job result.
+    fn ignored_outcome() -> OpOutcome {
+        OpOutcome::new("no_changes", "main")
+    }
+
     #[test]
     fn settings_copy_in_materializes_the_host_file_and_copies_it_in() {
         let fx = settings_fx();
@@ -3814,7 +3904,7 @@ mod tests {
             "the fixture must start with no host settings.json"
         );
 
-        let hash = settings_copy_in(&fx.job.ctx).expect("copy in");
+        let hash = settings_copy_in(&fx.job.ctx, &mut ignored_outcome()).expect("copy in");
 
         assert!(hash.is_some(), "a sync_settings repo must report a hash");
         assert!(
@@ -3836,7 +3926,10 @@ mod tests {
         let mut fx = settings_fx();
         fx.job.ctx.def.sync_settings = false;
 
-        assert_eq!(settings_copy_in(&fx.job.ctx).expect("copy in"), None);
+        assert_eq!(
+            settings_copy_in(&fx.job.ctx, &mut ignored_outcome()).expect("copy in"),
+            None
+        );
         assert!(
             !fx.tree.join("settings.json").exists(),
             "a repo that did not opt in must never gain a settings.json"
@@ -3852,17 +3945,20 @@ mod tests {
         let mut fx = settings_fx();
         fx.job.ctx.settings = None;
 
-        let e = settings_copy_in(&fx.job.ctx).expect_err("a schemaless mirror must not be silent");
+        let e = settings_copy_in(&fx.job.ctx, &mut ignored_outcome())
+            .expect_err("a schemaless mirror must not be silent");
         assert_eq!(e.code(), GitErrorCode::SettingsSyncUnavailable);
     }
 
     #[test]
     fn unchanged_tree_settings_are_not_reapplied() {
         let fx = settings_fx();
-        let before = settings_copy_in(&fx.job.ctx).expect("copy in");
+        // One outcome for the whole job, as `sync` has: the copy-in reports
+        // through it too.
+        let mut out = OpOutcome::new("up_to_date", "main");
+        let before = settings_copy_in(&fx.job.ctx, &mut out).expect("copy in");
         let host_bytes = std::fs::read(&fx.host_settings).expect("read the host copy");
 
-        let mut out = OpOutcome::new("up_to_date", "main");
         settings_apply_back(&fx.job.ctx, before, &mut out).expect("apply back");
 
         assert!(!out.settings_synced);
@@ -3881,11 +3977,11 @@ mod tests {
     #[test]
     fn valid_pulled_settings_are_saved_and_flag_a_restart() {
         let fx = settings_fx();
-        let before = settings_copy_in(&fx.job.ctx).expect("copy in");
+        let mut out = OpOutcome::new("merged", "main");
+        let before = settings_copy_in(&fx.job.ctx, &mut out).expect("copy in");
         std::fs::write(fx.tree.join("settings.json"), r#"{"theme":"dark"}"#)
             .expect("write the tree copy");
 
-        let mut out = OpOutcome::new("merged", "main");
         settings_apply_back(&fx.job.ctx, before, &mut out).expect("apply back");
 
         assert!(out.settings_synced);
@@ -3906,14 +4002,14 @@ mod tests {
         // Same values, different formatting. A restart tears down the user's
         // window and discards in-page state, so whitespace must never buy one.
         let fx = settings_fx();
-        let before = settings_copy_in(&fx.job.ctx).expect("copy in");
+        let mut out = OpOutcome::new("merged", "main");
+        let before = settings_copy_in(&fx.job.ctx, &mut out).expect("copy in");
         std::fs::write(
             fx.tree.join("settings.json"),
             r#"{"notify":true,"theme":"light"}"#,
         )
         .expect("write the tree copy");
 
-        let mut out = OpOutcome::new("merged", "main");
         settings_apply_back(&fx.job.ctx, before, &mut out).expect("apply back");
 
         assert!(out.settings_synced, "the file was still adopted");
@@ -3926,12 +4022,12 @@ mod tests {
     #[test]
     fn rejected_settings_leave_the_local_file_untouched_and_heal_the_tree() {
         let fx = settings_fx();
-        let before = settings_copy_in(&fx.job.ctx).expect("copy in");
+        let mut out = OpOutcome::new("merged", "main");
+        let before = settings_copy_in(&fx.job.ctx, &mut out).expect("copy in");
         let host_bytes = std::fs::read(&fx.host_settings).expect("read the host copy");
         std::fs::write(fx.tree.join("settings.json"), r#"{"theme":"purple"}"#)
             .expect("write the tree copy");
 
-        let mut out = OpOutcome::new("merged", "main");
         settings_apply_back(&fx.job.ctx, before, &mut out)
             .expect("a teammate's typo must not fail the job");
 
@@ -3965,15 +4061,103 @@ mod tests {
         // side - someone committed a file this host cannot use - and both must
         // leave the repo syncing.
         let fx = settings_fx();
-        let before = settings_copy_in(&fx.job.ctx).expect("copy in");
+        let mut out = OpOutcome::new("merged", "main");
+        let before = settings_copy_in(&fx.job.ctx, &mut out).expect("copy in");
         std::fs::write(fx.tree.join("settings.json"), "{not json").expect("write the tree copy");
 
-        let mut out = OpOutcome::new("merged", "main");
         settings_apply_back(&fx.job.ctx, before, &mut out).expect("broken JSON must not fail");
 
         assert!(out.settings_rejected.is_some());
         assert!(!out.settings_synced);
         assert_eq!(out.warnings[0].code, "settings_rejected");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn settings_apply_back_never_reads_through_a_planted_symlink() {
+        // The read side of the same hole as the write side: whatever sits at
+        // `settings_path` is parsed, validated, adopted as this host's settings
+        // and quoted into a warning. Following a link there means an arbitrary
+        // file's contents decide what this host runs with.
+        let fx = settings_fx();
+        let mut out = OpOutcome::new("merged", "main");
+        let before = settings_copy_in(&fx.job.ctx, &mut out).expect("copy in");
+        let host_bytes = std::fs::read(&fx.host_settings).expect("read the host copy");
+
+        let victim = fx
+            .tree
+            .parent()
+            .expect("the tree has a parent")
+            .join("victim.json");
+        std::fs::write(&victim, r#"{"theme":"dark"}"#).expect("write the victim");
+        let target = fx.tree.join("settings.json");
+        std::fs::remove_file(&target).expect("drop the real copy");
+        std::os::unix::fs::symlink(&victim, &target).expect("plant the link");
+
+        settings_apply_back(&fx.job.ctx, before, &mut out)
+            .expect("a planted link must not fail the job");
+
+        assert!(
+            !out.settings_synced,
+            "a file outside the tree must never be adopted as this host's settings"
+        );
+        assert_eq!(
+            crate::settings::load(&settings_schema(), &fx.host_settings)["theme"],
+            serde_json::json!("light"),
+            "the link's contents reached the host's settings.json"
+        );
+        assert_eq!(
+            std::fs::read(&victim).expect("read the victim"),
+            br#"{"theme":"dark"}"#,
+            "the heal wrote through the link"
+        );
+        assert!(
+            !std::fs::symlink_metadata(&target)
+                .expect("the tree copy exists")
+                .file_type()
+                .is_symlink(),
+            "the tree copy must be a real file again"
+        );
+        assert_eq!(
+            std::fs::read(&target).expect("read the tree copy"),
+            host_bytes,
+            "the tree copy must be healed so the next push fixes the remote"
+        );
+        assert_eq!(
+            out.warnings
+                .iter()
+                .filter(|w| w.code == "settings_symlink_replaced")
+                .count(),
+            1,
+            "one warning names the event, and the heal does not repeat it: {:?}",
+            out.warnings
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_settings_directory_is_refused_rather_than_followed() {
+        // `settings::save` calls `create_dir_all(parent)` before it writes, so a
+        // nested `settings_path` escapes through a linked *directory* component
+        // without the leaf ever being a link.
+        let mut fx = settings_fx();
+        fx.job.ctx.def.settings_path = "conf/settings.json".to_string();
+        let outside = fx
+            .tree
+            .parent()
+            .expect("the tree has a parent")
+            .join("outside");
+        std::fs::create_dir_all(&outside).expect("mkdir");
+        std::os::unix::fs::symlink(&outside, fx.tree.join("conf")).expect("plant the link");
+
+        let e = settings_copy_in(&fx.job.ctx, &mut ignored_outcome())
+            .expect_err("a linked directory component is refused");
+
+        assert_eq!(e.code(), GitErrorCode::PathRefused);
+        assert!(
+            !outside.join("settings.json").exists(),
+            "the write escaped the work tree"
+        );
     }
 
     #[test]
@@ -4119,6 +4303,147 @@ mod tests {
                 .get_path(std::path::Path::new("settings.json"))
                 .is_ok(),
             "the first sync must publish settings.json to the remote"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_remote_that_tracks_settings_as_a_symlink_cannot_reach_outside_the_tree() {
+        // The whole attack in one test. A remote tracks `settings.json` as a
+        // mode-120000 blob naming a file outside the work tree; libgit2's clone
+        // checkout materializes it as a real symlink; `settings::save` goes
+        // through `std::fs::write`, which follows one. Every sync then overwrote
+        // the named file and answered `no_changes` while doing it, because the
+        // index and HEAD still held mode 120000 so nothing was ever staged.
+        //
+        // Unix-only because the vector is: a Windows checkout without
+        // `core.symlinks` writes the target *path* into a regular file, which is
+        // inert, and there is nothing to reproduce.
+        let o = testkit::origin_with_main();
+        let victim = o.root.path().join("victim.txt");
+        std::fs::write(&victim, "PRECIOUS USER DATA\n").expect("write the victim");
+
+        let seed = o.root.path().join("seed");
+        // Relative, and so hostile from any clone path: `<root>/<tree>/..` is
+        // where a repos root keeps every other repo and the registry itself.
+        std::os::unix::fs::symlink("../victim.txt", seed.join("settings.json"))
+            .expect("plant the link");
+        testkit::commit_all(&seed, "track settings.json as a symlink");
+        testkit::push_main(&seed);
+
+        let a = testkit::clone_at(&o, "a");
+        let target = a.join("settings.json");
+        assert!(
+            std::fs::symlink_metadata(&target)
+                .expect("the clone materialized the entry")
+                .file_type()
+                .is_symlink(),
+            "the fixture proves nothing unless the checkout really made a link"
+        );
+
+        let host_settings = o.root.path().join("data/settings.json");
+        let fx = mirror_job(&o, &a, &host_settings);
+
+        let out = sync(&fx.ctx).expect("the repo must keep syncing");
+
+        assert_eq!(
+            std::fs::read_to_string(&victim).expect("read the victim"),
+            "PRECIOUS USER DATA\n",
+            "the settings mirror wrote through the link"
+        );
+        assert!(
+            !std::fs::symlink_metadata(&target)
+                .expect("the tree copy exists")
+                .file_type()
+                .is_symlink(),
+            "the link must be replaced, not written through"
+        );
+        assert_eq!(
+            std::fs::read(&target).expect("read the tree copy"),
+            std::fs::read(&host_settings).expect("read the host copy")
+        );
+        assert!(
+            out.warnings
+                .iter()
+                .any(|w| w.code == "settings_symlink_replaced"),
+            "a hostile entry in the remote must not be repaired silently: {:?}",
+            out.warnings
+        );
+
+        // The repair is published, so it stops being everyone else's problem too.
+        assert!(
+            out.committed,
+            "the typechange must be staged like any other"
+        );
+        let bare = git2::Repository::open_bare(&o.bare).expect("open the bare origin");
+        let mode = bare
+            .find_reference("refs/heads/main")
+            .expect("origin has main")
+            .peel_to_commit()
+            .expect("main has a commit")
+            .tree()
+            .expect("commit tree")
+            .get_path(std::path::Path::new("settings.json"))
+            .expect("settings.json is still tracked")
+            .filemode();
+        assert_eq!(
+            mode, 0o100644,
+            "the remote must be healed to a regular file, not left at 0o120000"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_symlink_the_merge_brings_in_is_disarmed_before_it_is_read() {
+        // The merge checkout is a way in, which is worth stating because it is
+        // easy to assume the SAFE strategy closes it. It does not:
+        // `checkout_action_with_wd` (checkout.c:530-551, 1.9.6) sends a
+        // blob->link TYPECHANGE to CONFLICT only when the workdir copy is
+        // modified; when it matches the baseline — which is exactly what
+        // `settings_copy_in` plus the commit above it guarantee — the arm is a
+        // plain `REMOVE_AND_UPDATE` and `blob_content_to_link` (checkout.c:1596)
+        // calls `p_symlink`. So the link lands mid-job, after the copy-in guard
+        // has already run, and the apply-back read is what meets it.
+        let (o, seed) = origin_with_settings();
+        let a = testkit::clone_at(&o, "a");
+        let victim = o.root.path().join("victim.txt");
+        std::fs::write(&victim, "PRECIOUS USER DATA\n").expect("write the victim");
+
+        std::fs::remove_file(seed.join("settings.json")).expect("drop the teammate's copy");
+        std::os::unix::fs::symlink("../victim.txt", seed.join("settings.json"))
+            .expect("plant the link");
+        testkit::commit_all(&seed, "retrack settings.json as a symlink");
+        testkit::push_main(&seed);
+
+        let host_settings = o.root.path().join("data/settings.json");
+        let fx = mirror_job(&o, &a, &host_settings);
+
+        let out = sync(&fx.ctx).expect("the repo must keep syncing");
+
+        assert_eq!(
+            std::fs::read_to_string(&victim).expect("read the victim"),
+            "PRECIOUS USER DATA\n",
+            "the heal wrote through the link the merge had just materialized"
+        );
+        assert!(
+            out.settings_rejected.is_none(),
+            "the victim's contents were read, parsed and quoted back: {:?}",
+            out.settings_rejected
+        );
+        assert_eq!(
+            crate::settings::load(&settings_schema(), &host_settings)["theme"],
+            serde_json::json!("light"),
+            "the local settings must survive the pull untouched"
+        );
+        let target = a.join("settings.json");
+        assert!(!std::fs::symlink_metadata(&target)
+            .expect("the tree copy exists")
+            .file_type()
+            .is_symlink());
+        assert_eq!(
+            std::fs::read(&target).expect("read the tree copy"),
+            std::fs::read(&host_settings).expect("read the host copy"),
+            "the tree copy must be healed so the next push fixes the remote"
         );
     }
 }
