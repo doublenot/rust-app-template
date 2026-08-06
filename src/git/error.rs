@@ -56,6 +56,13 @@ pub enum GitErrorCode {
     DirtyTree,
     MergePathTypeConflict,
     MergeUnresolvable,
+    /// The one code on either side of the divider. As an execution error it is
+    /// libgit2's `ErrorCode::Locked` — a lock file inside `.git` — and arrives through
+    /// `job.error`. Since the post-execution audit (F8) it is also an *admission*
+    /// error, returned synchronously by `JobStore::hold_repo` and so by `put_repo`,
+    /// `delete_repo` and `start_job` while a PUT or DELETE holds the repo. Same code,
+    /// same 409, same `retryable`; it is listed here rather than above because the
+    /// execution producer is the older and the commoner of the two.
     RepoLocked,
     // NOTE: no `SettingsInvalid`. Invalid settings pulled from a remote are
     // deliberately a *warning on a successful job* (`settings_rejected`), never an
