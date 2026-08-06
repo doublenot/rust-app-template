@@ -281,10 +281,37 @@ pub fn validate_remote(remote: &str, allow_http: bool) -> Result<(), GitError> {
             _ => Ok(()),
         }
     };
+    // The username position is a secret too, on http(s) and only there. A PAT is routinely
+    // carried as `https://ghp_x@host/...` with no colon in sight, which is why
+    // `error::strip_userinfo` scrubs a bare `user@` as well — the scrubber has always
+    // treated this shape as secret-bearing and the validator did not. Refusing it here is
+    // the filesystem half of what F4 closed for logs and API bodies: `ops::init` and
+    // `reconcile_remote` write this string verbatim into `<data-dir>/repos/<id>/.git/config`,
+    // created 0664 under a 0775 `repos/`, right beside a `repos.json` that `open_private`
+    // deliberately creates 0600.
+    //
+    // ssh and git are exempt because their username is a transport identity rather than a
+    // credential — `ssh://git@host/a.git` and the scp form `git@host:a.git` are the ordinary
+    // way to write those, and SSH authenticates by key. file:// has no userinfo to speak of.
+    let token_userinfo_refused = |authority: &str| -> Result<(), GitError> {
+        match authority.rsplit_once('@') {
+            Some((userinfo, _)) if !userinfo.is_empty() => Err(GitError::insecure_remote(
+                remote,
+                "a username in an http(s) remote URL is where a token is usually carried, and it \
+                 would be written into this repo's .git/config in clear text; put it on the repo \
+                 as credential {\"kind\":\"token\"} instead",
+            )),
+            _ => Ok(()),
+        }
+    };
 
     if let Some(i) = remote.find("://") {
         let scheme = remote[..i].to_ascii_lowercase();
-        password_refused(before(&remote[i + 3..], '/'))?;
+        let authority = before(&remote[i + 3..], '/');
+        password_refused(authority)?;
+        if matches!(scheme.as_str(), "http" | "https") {
+            token_userinfo_refused(authority)?;
+        }
         match scheme.as_str() {
             "https" | "ssh" | "git" | "file" => {}
             "http" if allow_http => {}
@@ -1554,6 +1581,14 @@ mod tests {
         let e = validate_remote("https://user:hunter2@github.com/x.git", false)
             .expect_err("password is refused");
         assert_eq!(e.code(), GitErrorCode::InsecureRemote);
+        assert!(
+            !e.to_string().contains("hunter2"),
+            "the refusal quoted the password back: {e}"
+        );
+        assert!(
+            e.to_string().contains("github.com/x.git"),
+            "the operator still has to recognise which remote: {e}"
+        );
         let e = validate_remote("git@github.com", false).expect_err("no path, not scp form");
         assert_eq!(e.code(), GitErrorCode::InvalidRequest);
         let e = validate_remote("wat://github.com/x.git", false).expect_err("unknown scheme");
@@ -1562,6 +1597,41 @@ mod tests {
         assert_eq!(e.code(), GitErrorCode::InvalidRequest);
         let e = validate_remote("", false).expect_err("empty");
         assert_eq!(e.code(), GitErrorCode::InvalidRequest);
+    }
+
+    #[test]
+    fn a_token_in_the_username_position_is_refused_on_http_and_allowed_on_ssh() {
+        // The colon guard alone let the commonest shape through: a PAT is carried as
+        // `https://ghp_x@host/…` with no colon in it, and `ops::init` then writes the
+        // string verbatim into a 0664 `.git/config` under a 0775 `repos/` — next to a
+        // `repos.json` this crate deliberately creates 0600. `error::strip_userinfo`
+        // has always scrubbed a bare `user@` for exactly this reason; the validator had
+        // not caught up.
+        for bad in [
+            "https://ghp_deadbeef@github.com/acme/x.git",
+            "http://token@intranet/x.git",
+            "https://oauth2@gitlab.example/acme/x.git",
+        ] {
+            let e = validate_remote(bad, true).expect_err("a token in the url");
+            assert_eq!(e.code(), GitErrorCode::InsecureRemote, "{bad:?}");
+            assert!(e.to_string().contains("credential"), "{e}");
+            assert!(
+                !e.to_string().contains("ghp_deadbeef") && !e.to_string().contains("token@"),
+                "the refusal quoted the secret back: {e}"
+            );
+        }
+
+        // ssh's username is a transport identity, not a credential — SSH authenticates
+        // by key, and these two are the ordinary way to write an ssh remote. Refusing
+        // them would break every repo on GitHub over ssh to close nothing.
+        for good in [
+            "ssh://git@github.com/acme/x.git",
+            "git@github.com:acme/x.git",
+            "git://git.example.org/x.git",
+            "https://github.com/acme/x.git",
+        ] {
+            assert!(validate_remote(good, false).is_ok(), "rejected {good:?}");
+        }
     }
 
     #[test]

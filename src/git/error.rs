@@ -427,10 +427,18 @@ impl GitError {
         )
     }
 
+    /// Scrubbed at construction, unlike every other constructor here.
+    ///
+    /// This is the one error whose subject is a string already known to carry a
+    /// credential — that is what it is refusing. `scrub` runs at the job, log and
+    /// dialog boundaries, which is late enough for a message that merely *might*
+    /// contain one and too late for this: a `put` that refuses a remote returns
+    /// straight to the caller, so without this the 403 body quotes the token back.
+    /// Host and path survive, which is all the operator needs to recognise the repo.
     pub fn insecure_remote(remote: &str, why: &str) -> GitError {
         GitError::new(
             GitErrorCode::InsecureRemote,
-            format!("remote {remote:?} was refused: {why}"),
+            scrub(&format!("remote {remote:?} was refused: {why}"), &[]),
         )
     }
 
