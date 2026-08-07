@@ -241,10 +241,7 @@ pub fn remote_host(remote: &str) -> Option<String> {
     };
     let host = if host.starts_with('[') {
         // Bracketed IPv6 literal; the port, if any, follows the ']'.
-        match host.find(']') {
-            Some(j) => &host[..=j],
-            None => return None,
-        }
+        &host[..=host.find(']')?]
     } else {
         before(host, ':')
     };
@@ -1552,6 +1549,8 @@ mod tests {
             ("git@github.com:acme/notes.git", Some("github.com")),
             ("github.com:acme/notes.git", Some("github.com")),
             ("https://[::1]:8443/x.git", Some("[::1]")),
+            // An unterminated bracket is not a host we can name, so it fails closed too.
+            ("https://[::1/x.git", None),
             // No network host: nothing to bind a credential to, so `None` fails closed.
             ("file:///srv/repos/x.git", None),
             ("/srv/repos/x.git", None),
