@@ -124,14 +124,18 @@ pub async fn wait_healthy(url: &str, timeout: Duration) -> Result<(), String> {
         .map_err(|e| e.to_string())?;
     let deadline = tokio::time::Instant::now() + timeout;
     loop {
-        if let Ok(resp) = client.get(url).send().await {
-            if resp.status().as_u16() < 400 {
-                return Ok(());
-            }
-        }
+        // Carried into the timeout message. Without it the operator of a child that will not
+        // come up learns only that it did not, and never whether the port refused, the TLS
+        // handshake failed, or the thing answered 500 every time. Only the attempt that ran
+        // up against the deadline is worth reporting, so it is scoped to the iteration.
+        let last = match client.get(url).send().await {
+            Ok(resp) if resp.status().as_u16() < 400 => return Ok(()),
+            Ok(resp) => format!("last answered {}", resp.status()),
+            Err(e) => format!("last error: {e}"),
+        };
         if tokio::time::Instant::now() >= deadline {
             return Err(format!(
-                "server did not become healthy at {url} within {}s",
+                "server did not become healthy at {url} within {}s ({last})",
                 timeout.as_secs()
             ));
         }
@@ -217,18 +221,52 @@ mod tests {
     async fn wait_healthy_succeeds_once_server_responds() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
+        let (seen, mut requests) = tokio::sync::mpsc::unbounded_channel();
         tokio::spawn(async move {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
             loop {
-                let (mut sock, _) = listener.accept().await.unwrap();
-                use tokio::io::AsyncWriteExt;
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    return;
+                };
+                // Drain the request before answering it. Closing a socket whose receive
+                // buffer still holds unread bytes is an *abortive* close on Windows -- the
+                // stack sends RST instead of FIN, and the reset outruns the response we just
+                // wrote, so every poll `wait_healthy` makes fails and the 5s budget expires.
+                // This is the whole of why the test failed on windows-latest and nowhere
+                // else; the real child servers this stands in for read their requests.
+                let mut req = Vec::new();
+                loop {
+                    let mut buf = [0u8; 1024];
+                    match sock.read(&mut buf).await {
+                        Ok(0) => break,
+                        Ok(n) => {
+                            req.extend_from_slice(&buf[..n]);
+                            if req.windows(4).any(|w| w == b"\r\n\r\n") {
+                                break;
+                            }
+                        }
+                        Err(_) => break,
+                    }
+                }
+                let _ = seen.send(String::from_utf8_lossy(&req).into_owned());
                 let _ = sock
                     .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 0\r\n\r\n")
                     .await;
+                // FIN, not RST: let the client read what we wrote.
+                let _ = sock.shutdown().await;
             }
         });
         wait_healthy(&format!("http://{addr}/"), Duration::from_secs(5))
             .await
             .unwrap();
+        // Pins the drain above rather than trusting it: the read loop has to have consumed a
+        // whole request for this to arrive, which is the behaviour whose absence made Windows
+        // reset the connection instead of answering it.
+        let req = requests
+            .recv()
+            .await
+            .expect("the health check sent a request");
+        assert!(req.starts_with("GET / HTTP/1.1\r\n"), "got: {req:?}");
     }
 
     #[tokio::test]
