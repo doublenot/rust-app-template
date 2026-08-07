@@ -21,10 +21,18 @@ macOS refuses to run linker-signed-only binaries on Apple Silicon — so the
 workflow ad-hoc signs the result with `codesign --force --sign -`.
 
 CI proves the *build* side of that: it runs `lipo -info` and `codesign --verify`
-in the job and both pass. What CI cannot prove is that the app **launches**. That
-claim is marked **unverified** in
-`docs/superpowers/specs/2026-08-07-release-pipeline-design.md` §5.4, and §2 of
-this document is what closes it.
+in the job and both pass. What CI cannot prove is that the app **launches**.
+
+That gap was not theoretical. **v0.1.0 through v0.1.2 shipped a broken bundle:**
+the workflow signed the binary but nothing signed `Hitch.app` itself, and since
+Gatekeeper validates the bundle rather than the executable inside it, a
+downloaded copy reported *"Hitch is damaged and should be moved to the Trash."*
+CI could not have caught it — `codesign --verify` ran against the binary, which
+was never the problem. It took someone installing the app.
+
+Fixed after v0.1.2 by having cargo-packager sign the bundle
+(`signing-identity = "-"`). The post-mortem is §5.8 of
+`docs/superpowers/specs/2026-08-07-release-pipeline-design.md`.
 
 ---
 
@@ -73,6 +81,12 @@ lipo -info "$APP/Contents/MacOS/hitch"
 
 codesign -dv "$APP" 2>&1 | grep -i '^Signature'
 # want: Signature=adhoc
+# On v0.1.2 and earlier this instead reported that the object is not signed at
+# all -- that was the "damaged" bug (§1).
+
+codesign --verify --deep --strict -v "$APP"
+# want: valid on disk / satisfies its Designated Requirement
+# This checks the BUNDLE. It is the check that was missing.
 
 spctl -a -vv "$APP"
 # want: rejected
@@ -85,9 +99,26 @@ unexpected had signed the app.
 
 ### 2.4 Launch
 
-Right-click **Hitch** → **Open**, then **Open** in the dialog that appears. A
-plain double-click will be refused the first time; after one successful
-right-click launch, macOS remembers and double-click works.
+This app is **not notarized**, so macOS will refuse the first launch. How you
+allow it depends on the OS version, and the older advice no longer works:
+
+**macOS 15 (Sequoia) and later.** Apple removed the Control-click → Open
+bypass. Double-click Hitch, let it be blocked, then go to **System Settings →
+Privacy & Security**, scroll to the message naming Hitch, click **Open Anyway**,
+and confirm with your password. Only the first launch needs this.
+
+**macOS 14 (Sonoma) and earlier.** Right-click **Hitch** → **Open**, then
+**Open** in the dialog.
+
+**Either version, from the terminal** — removes the quarantine flag macOS
+attaches to downloads, which is what triggers the check at all:
+
+```bash
+xattr -dr com.apple.quarantine "/Applications/Hitch.app"
+```
+
+Do that only for software you have reason to trust; it is the same override the
+GUI performs, without the dialog.
 
 Google Chrome must be installed — it is a runtime requirement on every platform,
 though never a build-time one.
@@ -101,10 +132,15 @@ nothing to point at yet.
 
 | what happens | meaning |
 |---|---|
-| Opens, placeholder page, tray icon | The shipped artifact works. §5.4's reasoning holds and can be promoted from *unverified*. |
-| "can't be opened", or it dies instantly with no window | The ad-hoc signature did not survive packaging. Reopen §5.4. |
-| "Hitch is damaged and should be moved to the Trash" | Worse than unnotarized — the bundle reads as unsigned. |
+| Blocked as an unidentified developer, then opens via §2.4 | Correct and expected. The app is signed but not notarized, which is what this template ships. |
+| Opens, placeholder page, tray icon | Working. |
+| **"Hitch is damaged and should be moved to the Trash"** | The bundle is unsigned. This is the v0.1.0–v0.1.2 bug (§1); on a later build it means the fix regressed. Check `codesign -dv` in §2.3 — it will say the object is not signed at all. |
+| "can't be opened", or it dies instantly with no window | The signature did not survive packaging. Spec §5.4 / §5.8. |
 | Window opens but no tray icon | Unrelated to signing; a tray problem worth its own investigation. |
+
+A block is not a failure. An unnotarized app is *supposed* to be refused on first
+launch — §2.4 is how you allow it. The failure mode to care about is "damaged",
+which means macOS could not validate the code at all.
 
 ### 2.6 Optional: prove both architecture slices really run
 
