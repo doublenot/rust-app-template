@@ -23,10 +23,18 @@ command-line flag changes it — it is the direct cost of not shipping a browser
 engine. Electron and Tauri avoid it by owning the window themselves, at the
 price of a bundled engine or a system webview.
 
-What you *can* brand: the tray icon and its tooltip (the host owns those), the
-page itself, and — on Linux and Windows, where Chrome takes an app window's icon
-from the page — the window icon, by serving a favicon from your app. On macOS
-the Dock is Chrome's regardless.
+What you *can* brand, and what the template already does with `icons/icon.png`:
+
+| surface | source | platforms |
+|---|---|---|
+| Tray icon and tooltip | `icons/icon.png`, `[app].name` | all |
+| Window / taskbar icon | the page's **favicon**, served at `/favicon.png` | Linux, Windows |
+| Taskbar grouping | `--class`, matched to the `.desktop` entry | Linux |
+| Installer name and icon | `[package.metadata.packager]` | all |
+| **Dock icon and menu bar** | **Google Chrome — not changeable** | macOS |
+
+The favicon only covers pages this host serves. Once you point `[app].url` at
+your own application, **its** favicon governs the window icon — so serve one.
 
 Worth deciding early: if your app must look like its own application in the Dock,
 this template is the wrong shape for it.

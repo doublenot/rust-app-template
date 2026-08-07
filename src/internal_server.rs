@@ -14,6 +14,9 @@ const LOADING_HTML: &str = include_str!("assets/loading.html");
 const PLACEHOLDER_HTML: &str = include_str!("assets/placeholder.html");
 const SETTINGS_HTML: &str = include_str!("assets/settings.html");
 const STYLE_CSS: &str = include_str!("assets/style.css");
+/// The same file the tray and the installers use, so one PNG brands every
+/// surface the app controls.
+const FAVICON_PNG: &[u8] = include_bytes!("../icons/icon.png");
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum HostEvent {
@@ -92,6 +95,8 @@ pub fn router(state: HostState) -> Router {
         .route("/placeholder", get(placeholder))
         .route("/settings", get(settings_page))
         .route("/style.css", get(style))
+        .route("/favicon.png", get(favicon))
+        .route("/favicon.ico", get(favicon))
         .route("/api/status", get(api_status))
         .route("/api/settings", post(api_settings))
         .route("/api/restart", post(api_restart));
@@ -149,6 +154,18 @@ async fn placeholder(State(s): State<HostState>) -> Html<String> {
 
 async fn style() -> impl IntoResponse {
     ([("content-type", "text/css")], STYLE_CSS)
+}
+
+/// Chrome takes an `--app` window's icon from the page favicon on Linux and
+/// Windows, so serving one is what puts this app's icon on the taskbar instead
+/// of Chrome's. macOS is unaffected -- the Dock shows the application that owns
+/// the window, which is Chrome, and no page can change that.
+///
+/// Bound at `.ico` as well because browsers request that path unprompted, so
+/// without it every page load logs a 404 for a file nobody asked for. PNG bytes
+/// under either name: Chrome sniffs the content and ignores the extension.
+async fn favicon() -> impl IntoResponse {
+    ([("content-type", "image/png")], FAVICON_PNG)
 }
 
 fn field_html(f: &crate::config::SettingsField, current: &Value) -> String {
@@ -345,6 +362,44 @@ options = ["light", "dark"]
             .await
             .unwrap();
         assert_eq!(css.status(), 200);
+    }
+
+    #[tokio::test]
+    async fn favicon_is_served_and_linked_so_the_window_gets_the_app_icon() {
+        let (_state, port, _rx) = spawn_state(true).await;
+
+        // Both paths: the link tag points at .png, and browsers ask for .ico on
+        // their own whether or not anything told them to.
+        for path in ["/favicon.png", "/favicon.ico"] {
+            let r = reqwest::get(format!("http://127.0.0.1:{port}{path}"))
+                .await
+                .unwrap();
+            assert_eq!(r.status(), 200, "{path}");
+            assert_eq!(
+                r.headers().get("content-type").unwrap(),
+                "image/png",
+                "{path}"
+            );
+            let body = r.bytes().await.unwrap();
+            // PNG magic. Asserting real image bytes, not just a 200 on a route
+            // that could be returning anything.
+            assert_eq!(&body[..8], b"\x89PNG\r\n\x1a\n", "{path} is not a PNG");
+        }
+
+        // Serving it is only half the job: without the link tag Chrome falls back
+        // to its own icon on the pages this app actually controls.
+        for path in ["/loading", "/placeholder", "/settings"] {
+            let html = reqwest::get(format!("http://127.0.0.1:{port}{path}"))
+                .await
+                .unwrap()
+                .text()
+                .await
+                .unwrap();
+            assert!(
+                html.contains(r#"<link rel="icon" type="image/png" href="/favicon.png">"#),
+                "{path} does not link the favicon"
+            );
+        }
     }
 
     #[tokio::test]

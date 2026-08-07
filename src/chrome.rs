@@ -68,13 +68,28 @@ pub fn find_chrome() -> Option<PathBuf> {
 pub fn launch_args(url: &str, profile_dir: &Path, width: u32, height: u32) -> Vec<OsString> {
     let mut user_data_dir = OsString::from("--user-data-dir=");
     user_data_dir.push(profile_dir.as_os_str());
-    vec![
+    let mut args = vec![
         format!("--app={url}").into(),
         user_data_dir,
         "--no-first-run".into(),
         "--no-default-browser-check".into(),
         format!("--window-size={width},{height}").into(),
-    ]
+    ];
+    // WM_CLASS is how a Linux desktop matches a window to its `.desktop` entry,
+    // and so to its icon and its taskbar grouping. cargo-packager names that file
+    // after the main binary (`hitch.desktop`), so the class has to be that exact
+    // string or the window keeps Chrome's icon and groups under Chrome.
+    //
+    // CARGO_PKG_NAME rather than a literal, because this is a template: a fork
+    // renames the crate and the desktop entry follows it. The two only diverge if
+    // someone points `binaries.path` at something other than the package name.
+    //
+    // Linux-only. `--class` is an X11/GTK concept; macOS and Windows ignore it,
+    // and the Dock problem it addresses has no fix on macOS at all.
+    if cfg!(target_os = "linux") {
+        args.push(format!("--class={}", env!("CARGO_PKG_NAME")).into());
+    }
+    args
 }
 
 /// stdout/stderr for a spawned Chrome: into the given log file when one is
@@ -165,6 +180,18 @@ mod tests {
         assert!(args.contains(&"--no-first-run".to_string()));
         assert!(args.contains(&"--no-default-browser-check".to_string()));
         assert!(args.contains(&"--window-size=1280,900".to_string()));
+        // The Linux window class has to equal the .desktop entry's basename or
+        // the window shows Chrome's icon. cargo-packager derives that name from
+        // the package, so this is the string that must match.
+        let class = format!("--class={}", env!("CARGO_PKG_NAME"));
+        if cfg!(target_os = "linux") {
+            assert!(args.contains(&class), "missing {class}: {args:?}");
+        } else {
+            assert!(
+                !args.iter().any(|a| a.starts_with("--class=")),
+                "--class is an X11 concept and should not be passed here: {args:?}"
+            );
+        }
     }
 
     /// The host launches a *tracked* Chrome for a secondary window when it
