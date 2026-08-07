@@ -2,25 +2,50 @@ name: Release
 on:
   push:
     tags: ["v*"]
+  # Dry run: builds every leg and uploads the installers as workflow artifacts
+  # without touching a release. Only visible in the Actions tab once this file is
+  # on the default branch.
+  workflow_dispatch:
 
+# Read by default; only `publish` is granted write. The build legs have no
+# business holding a token that can rewrite the repository.
 permissions:
-  contents: write
+  contents: read
+
+env:
+  PACKAGER_VERSION: "0.11.8"
 
 jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # Ten seconds here against ~30 runner-minutes wasted on a mismatch: without
+      # it a v1.0.0 tag on an 0.1.0 manifest builds and ships artifacts named
+      # 0.1.0, and nothing notices.
+      - name: Tag must match the crate version
+        run: |
+          if [ "$GITHUB_REF_TYPE" != tag ]; then
+            echo "dry run on $GITHUB_REF_NAME — skipping the version gate"; exit 0
+          fi
+          crate=$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[0].version')
+          [ "v$crate" = "$GITHUB_REF_NAME" ] || {
+            echo "::error::tag $GITHUB_REF_NAME != crate version $crate"; exit 1; }
+          echo "tag $GITHUB_REF_NAME matches crate version $crate"
+
   package:
+    needs: verify
     strategy:
       fail-fast: false
       matrix:
         include:
-          - os: ubuntu-latest
-            formats: deb,appimage
-          - os: macos-latest
-            formats: dmg
-          - os: windows-latest
-            formats: nsis
+          - { os: ubuntu-latest,  formats: deb,appimage }
+          - { os: macos-latest,   formats: dmg }
+          - { os: windows-latest, formats: nsis }
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
+
       # perl and pkg-config are for the vendored OpenSSL that libssh2-sys pulls
       # in on every unix target (git2 = vendored-libgit2 + ssh). make already
       # comes with build-essential on the GitHub runners. macos-latest and
@@ -32,23 +57,126 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y libgtk-3-dev libayatana-appindicator3-dev libxdo-dev \
                                   perl pkg-config
+
       - uses: dtolnay/rust-toolchain@stable
-      # Caches ~/.cargo *and* ./target, which is what matters here: the ~80 s
-      # this build costs is compiling libgit2/libssh2/OpenSSL into
-      # target/*/build/{libgit2-sys,libssh2-sys,openssl-sys}-*. A cache of
-      # ~/.cargo/registry alone would save none of it.
+      - name: Add the Intel target for the universal build
+        if: runner.os == 'macOS'
+        run: rustup target add x86_64-apple-darwin
       - uses: Swatinem/rust-cache@v2
-      - name: Install cargo-packager
-        run: cargo install cargo-packager --locked
-      - name: Build release binary
-        run: cargo build --release --locked
-      - name: Package
-        run: cargo packager --release --formats ${{ matrix.formats }} --verbose
-      - name: Upload to release
-        uses: softprops/action-gh-release@v2
+
+      # cargo-packager publishes no prebuilt binaries anywhere -- its GitHub
+      # releases carry zero assets -- so `cargo install` compiles it from source on
+      # every leg of every run. Cache the built binary instead. The pin is not only
+      # for the cache key: the artifact filenames staged below come from format
+      # strings inside this tool, and an unpinned upgrade could rename them.
+      - name: Cache cargo-packager
+        id: packager-cache
+        uses: actions/cache@v4
         with:
-          files: |
-            target/release/*.deb
-            target/release/*.AppImage
-            target/release/*.dmg
-            target/release/*-setup.exe
+          path: ~/.cargo/bin/cargo-packager*
+          key: cargo-packager-${{ env.PACKAGER_VERSION }}-${{ runner.os }}-${{ runner.arch }}
+      - name: Install cargo-packager
+        if: steps.packager-cache.outputs.cache-hit != 'true'
+        run: cargo install cargo-packager --version ${{ env.PACKAGER_VERSION }} --locked
+
+      - name: Build and package
+        if: runner.os != 'macOS'
+        shell: bash
+        run: |
+          cargo build --release --locked
+          cargo packager --release --formats ${{ matrix.formats }} --verbose
+
+      # macos-latest is arm64, so a plain build ships an Apple-Silicon-only .dmg
+      # and Intel Macs get nothing. Build both targets here and lipo them into one.
+      - name: Build, lipo, sign, and package (macOS universal)
+        if: runner.os == 'macOS'
+        run: |
+          bin=$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[0].default_run')
+          cargo build --release --locked --target aarch64-apple-darwin
+          cargo build --release --locked --target x86_64-apple-darwin
+          mkdir -p target/universal-apple-darwin/release
+          lipo -create -output "target/universal-apple-darwin/release/$bin" \
+            "target/aarch64-apple-darwin/release/$bin" \
+            "target/x86_64-apple-darwin/release/$bin"
+          # Mandatory, not cosmetic. lipo output carries only the minimal signature
+          # the Apple linker applies, and recent macOS SIGKILLs linker-signed-only
+          # binaries on Apple Silicon -- unsigned, this .dmg installs an app that
+          # dies on launch rather than one Gatekeeper merely warns about.
+          # cargo-packager never ad-hoc signs (it skips signing entirely without a
+          # configured identity) and `--formats dmg` builds the .app in the same
+          # pass, so there is no seam to sign the bundle in. It goes on the binary,
+          # before packaging copies it into Contents/MacOS/.
+          codesign --force --sign - "target/universal-apple-darwin/release/$bin"
+          # In the log, not in a comment: this leg cannot be reproduced off a runner.
+          lipo -info "target/universal-apple-darwin/release/$bin"
+          codesign --verify --verbose "target/universal-apple-darwin/release/$bin"
+          cargo packager --release --target universal-apple-darwin --formats dmg --verbose
+
+      # Staged flat rather than uploaded by glob, for two independent reasons.
+      # upload-artifact roots an artifact at the least common ancestor of its
+      # search paths, so listing target/release/*.deb beside
+      # target/universal-apple-darwin/release/*.dmg would root at target/ and keep
+      # the nesting -- publish's dist/ would then hold directories, not files.
+      # And an exact count catches a leg that emits one file where two were
+      # expected, which no if-no-files-found setting can.
+      #
+      # nullglob is required, not decorative: without it an unmatched glob expands
+      # to its own literal text, so `found` is non-empty and the macOS/Windows
+      # count of 1 passes while cp fails on a path that does not exist.
+      - name: Stage artifacts
+        shell: bash
+        run: |
+          shopt -s nullglob
+          case "${{ runner.os }}" in
+            Linux)   want=2; found=(target/release/*.deb target/release/*.AppImage) ;;
+            macOS)   want=1; found=(target/universal-apple-darwin/release/*.dmg) ;;
+            Windows) want=1; found=(target/release/*-setup.exe) ;;
+          esac
+          printf 'found: %s\n' "${found[@]}"
+          [ "${#found[@]}" -eq "$want" ] || {
+            echo "::error::expected $want artifact(s) on ${{ runner.os }}, got ${#found[@]}"
+            exit 1; }
+          mkdir -p dist
+          cp -- "${found[@]}" dist/
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: package-${{ matrix.os }}
+          if-no-files-found: error
+          path: dist/
+
+  publish:
+    needs: package
+    # Gated on ref_type rather than on the event. Dispatching against a *tag*
+    # publishes -- the supported way to re-cut a release whose upload failed --
+    # while the ordinary dispatch-against-a-branch dry run can never touch one.
+    if: github.ref_type == 'tag'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      # `needs: package` is what makes a partial release impossible: fail-fast is
+      # off so every leg's log survives, but one failure means this job never runs
+      # and no half-populated draft exists to mistake for a finished one.
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Checksums
+        run: |
+          # Computed in a subshell so the redirect lands outside dist/. Do not
+          # "simplify" this to find/xargs and do not assume dist/ is clean -- both
+          # make SHA256SUMS list itself. The plain glob form is safe only because
+          # pathname expansion completes before the redirect is performed, which
+          # stops being true the moment a SHA256SUMS is already there.
+          ( cd dist && sha256sum -- * ) > SHA256SUMS
+          mv SHA256SUMS dist/
+          cat dist/SHA256SUMS
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          draft: true
+          files: dist/*
+          fail_on_unmatched_files: true
+          generate_release_notes: true
