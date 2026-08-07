@@ -27,8 +27,8 @@ is a binary crate, so `pub` does *not* exempt an item from `dead_code`, and noth
 from `main` calls into `src/git/` until task 9 wires up `GitService`.
 
 **This crate has no `--lib` target** (`src/main.rs` is the only entry point, and
-`src/bin/gen_icons.rs` is a second binary), so unit tests run in the `chrome-host-app` bin
-target: `cargo test --bin chrome-host-app <filter>`.
+`src/bin/gen_icons.rs` is a second binary), so unit tests run in the `hitch` bin
+target: `cargo test --bin hitch <filter>`.
 
 ---
 
@@ -335,7 +335,7 @@ pub mod error;
 
 - [ ] **Step 2: Run the tests and watch them fail**
 
-Run: `cargo test --bin chrome-host-app git::creds`
+Run: `cargo test --bin hitch git::creds`
 
 Expected: FAIL — the module has no implementation, so it does not compile:
 
@@ -355,7 +355,7 @@ error[E0425]: cannot find function `resolve` in this scope
 error[E0433]: failed to resolve: use of undeclared type `ResolvedCred`
 error[E0433]: failed to resolve: use of undeclared type `Secret`
 error[E0433]: failed to resolve: use of undeclared type `PathBuf`
-error: could not compile `chrome-host-app` (bin "chrome-host-app" test) due to 14 previous errors
+error: could not compile `hitch` (bin "hitch" test) due to 14 previous errors
 ```
 
 - [ ] **Step 3: Implement `ResolvedCred`, `CredResolution` and `resolve`**
@@ -562,7 +562,7 @@ fn convert(spec: &CredentialSpec) -> Result<ResolvedCred, GitError> {
 
 - [ ] **Step 4: Run the tests and watch them pass**
 
-Run: `cargo test --bin chrome-host-app git::creds`
+Run: `cargo test --bin hitch git::creds`
 
 Expected: PASS — `test result: ok. 10 passed; 0 failed`.
 
@@ -698,7 +698,7 @@ at module level.
 
 - [ ] **Step 7: Run the tests and watch them fail**
 
-Run: `cargo test --bin chrome-host-app git::creds`
+Run: `cargo test --bin hitch git::creds`
 
 Expected: FAIL — compile error:
 
@@ -708,7 +708,7 @@ error[E0425]: cannot find function `fingerprint_sha256` in this scope
 error[E0433]: failed to resolve: use of undeclared type `HostKeyChecker`
 error[E0433]: failed to resolve: use of undeclared type `HostKeyHash`
 error[E0433]: failed to resolve: use of undeclared type `SshHostKeyPolicy`
-error: could not compile `chrome-host-app` (bin "chrome-host-app" test) due to 20 previous errors
+error: could not compile `hitch` (bin "hitch" test) due to 20 previous errors
 ```
 
 - [ ] **Step 8: Implement `fingerprint_sha256` and `HostKeyChecker`**
@@ -830,7 +830,7 @@ impl HostKeyChecker {
 
 - [ ] **Step 9: Run the tests and watch them pass**
 
-Run: `cargo test --bin chrome-host-app git::creds`
+Run: `cargo test --bin hitch git::creds`
 
 Expected: PASS — `test result: ok. 17 passed; 0 failed`.
 
@@ -947,7 +947,7 @@ tests to `mod tests` in `src/git/creds.rs`.
 
 - [ ] **Step 12: Run the tests and watch them fail**
 
-Run: `cargo test --bin chrome-host-app git::creds`
+Run: `cargo test --bin hitch git::creds`
 
 Expected: FAIL — compile error:
 
@@ -955,7 +955,7 @@ Expected: FAIL — compile error:
 error[E0425]: cannot find function `choose` in this scope
 error[E0433]: failed to resolve: use of undeclared type `CredChoice`
 error[E0425]: cannot find value `MAX_CRED_ATTEMPTS` in this scope
-error: could not compile `chrome-host-app` (bin "chrome-host-app" test) due to 9 previous errors
+error: could not compile `hitch` (bin "hitch" test) due to 9 previous errors
 ```
 
 - [ ] **Step 13: Implement `MAX_CRED_ATTEMPTS`, `CredChoice` and `choose`**
@@ -1047,7 +1047,7 @@ fn choose<'a>(cred: &'a ResolvedCred, allowed: git2::CredentialType) -> CredChoi
 
 - [ ] **Step 14: Run the tests and watch them pass**
 
-Run: `cargo test --bin chrome-host-app git::creds`
+Run: `cargo test --bin hitch git::creds`
 
 Expected: PASS — `test result: ok. 23 passed; 0 failed`.
 
@@ -1112,11 +1112,11 @@ mod tests {
 
     #[test]
     fn an_identity_never_leaves_the_hostname_empty_or_padded() {
-        let id = Identity::new("Chrome Host App", "com.example.chromehost");
-        assert_eq!(id.app_name, "Chrome Host App");
-        assert_eq!(id.identifier, "com.example.chromehost");
+        let id = Identity::new("Hitch", "com.example.hitch");
+        assert_eq!(id.app_name, "Hitch");
+        assert_eq!(id.identifier, "com.example.hitch");
         // The hostname is the right-hand side of the fallback author email, so an
-        // empty one produces `com.example.chromehost@` and git refuses the commit.
+        // empty one produces `com.example.hitch@` and git refuses the commit.
         assert!(!id.hostname.is_empty());
         assert_eq!(id.hostname.trim(), id.hostname);
     }
@@ -1158,7 +1158,7 @@ pub mod registry;
 
 - [ ] **Step 17: Run the tests and watch them fail**
 
-Run: `cargo test --bin chrome-host-app git::ops`
+Run: `cargo test --bin hitch git::ops`
 
 Expected: FAIL — compile error:
 
@@ -1171,7 +1171,7 @@ error[E0433]: failed to resolve: use of undeclared type `OpRequest`
 
 error[E0433]: failed to resolve: use of undeclared type `Identity`
 error[E0433]: failed to resolve: use of undeclared type `BranchRequest`
-error: could not compile `chrome-host-app` (bin "chrome-host-app" test) due to 11 previous errors
+error: could not compile `hitch` (bin "hitch" test) due to 11 previous errors
 ```
 
 - [ ] **Step 18: Implement the identity and request types**
@@ -1306,7 +1306,7 @@ impl OpRequest {
 
 - [ ] **Step 19: Run the tests and watch them pass**
 
-Run: `cargo test --bin chrome-host-app git::ops`
+Run: `cargo test --bin hitch git::ops`
 
 Expected: PASS — `test result: ok. 4 passed; 0 failed`.
 
@@ -1379,7 +1379,7 @@ between a `commit` and a `sync`. Add these tests to `mod tests` in `src/git/ops.
 
 - [ ] **Step 22: Run the tests and watch them fail**
 
-Run: `cargo test --bin chrome-host-app git::ops`
+Run: `cargo test --bin hitch git::ops`
 
 Expected: FAIL — compile error:
 
@@ -1387,7 +1387,7 @@ Expected: FAIL — compile error:
 error[E0433]: failed to resolve: use of undeclared type `OpOutcome`
 error[E0422]: cannot find struct, variant or union type `MergeReport` in this scope
 error[E0422]: cannot find struct, variant or union type `SettingsRejected` in this scope
-error: could not compile `chrome-host-app` (bin "chrome-host-app" test) due to 5 previous errors
+error: could not compile `hitch` (bin "hitch" test) due to 5 previous errors
 ```
 
 - [ ] **Step 23: Implement the outcome types**
@@ -1496,7 +1496,7 @@ impl OpOutcome {
 
 - [ ] **Step 24: Run the tests and watch them pass**
 
-Run: `cargo test --bin chrome-host-app git::ops`
+Run: `cargo test --bin hitch git::ops`
 
 Expected: PASS — `test result: ok. 6 passed; 0 failed`.
 
@@ -1621,7 +1621,7 @@ level. Importing any of them here as well would be a redundant import.
 
 - [ ] **Step 27: Run the tests and watch them fail**
 
-Run: `cargo test --bin chrome-host-app git::ops`
+Run: `cargo test --bin hitch git::ops`
 
 Expected: FAIL — compile error:
 
@@ -1635,7 +1635,7 @@ error[E0433]: failed to resolve: use of undeclared type `AbortReason`
 error[E0433]: failed to resolve: use of undeclared type `Phase`
 error[E0433]: failed to resolve: use of undeclared type `Instant`
 error[E0425]: cannot find function `percent_of` in this scope
-error: could not compile `chrome-host-app` (bin "chrome-host-app" test) due to 24 previous errors
+error: could not compile `hitch` (bin "hitch" test) due to 24 previous errors
 ```
 
 - [ ] **Step 28: Implement `OpScratch`, `OpCtx`, and the progress plumbing**
@@ -1750,7 +1750,7 @@ fn percent_of(received: usize, total: usize) -> u8 {
 
 - [ ] **Step 29: Run the tests and watch them pass**
 
-Run: `cargo test --bin chrome-host-app git::ops`
+Run: `cargo test --bin hitch git::ops`
 
 Expected: PASS — `test result: ok. 9 passed; 0 failed`.
 
@@ -1815,7 +1815,7 @@ Add to `mod tests` in `src/git/ops.rs`:
 
 - [ ] **Step 32: Run the test and watch it fail**
 
-Run: `cargo test --bin chrome-host-app git::ops::tests::the_commit_author`
+Run: `cargo test --bin hitch git::ops::tests::the_commit_author`
 
 Expected: FAIL — compile error:
 
@@ -1827,7 +1827,7 @@ error[E0599]: no method named `author_name` found for struct `OpCtx` in the curr
     |                           ^^^^^^^^^^^ method not found in `OpCtx`
 
 error[E0599]: no method named `author_email` found for struct `OpCtx` in the current scope
-error: could not compile `chrome-host-app` (bin "chrome-host-app" test) due to 2 previous errors
+error: could not compile `hitch` (bin "hitch" test) due to 2 previous errors
 ```
 
 - [ ] **Step 33: Implement `author_name` and `author_email`**
@@ -1870,7 +1870,7 @@ fn pick(value: Option<&String>) -> Option<String> {
 
 - [ ] **Step 34: Run the test and watch it pass**
 
-Run: `cargo test --bin chrome-host-app git::ops`
+Run: `cargo test --bin hitch git::ops`
 
 Expected: PASS — `test result: ok. 10 passed; 0 failed`.
 
@@ -2026,7 +2026,7 @@ alongside `learned`:
 
 - [ ] **Step 37: Run the tests and watch them fail**
 
-Run: `cargo test --bin chrome-host-app git::ops`
+Run: `cargo test --bin hitch git::ops`
 
 Expected: FAIL — compile error:
 
@@ -2040,7 +2040,7 @@ error[E0599]: no method named `learned_fingerprint` found for struct `OpCtx` in 
 error[E0599]: no method named `check_for_test_sha256` found for struct `HostKeyChecker` ...
 error[E0425]: cannot find function `describe_allowed` in this scope
 error[E0433]: failed to resolve: use of undeclared type `GitError`
-error: could not compile `chrome-host-app` (bin "chrome-host-app" test) due to 11 previous errors
+error: could not compile `hitch` (bin "hitch" test) due to 11 previous errors
 ```
 
 (`check_for_test_sha256` resolves only after the `#[cfg(test)]` seam from Step 36 is added to
@@ -2146,12 +2146,12 @@ fn describe_allowed(allowed: git2::CredentialType) -> String {
 
 - [ ] **Step 39: Run the tests and watch them pass**
 
-Run: `cargo test --bin chrome-host-app git::ops`
+Run: `cargo test --bin hitch git::ops`
 
 Expected: PASS — `test result: ok. 16 passed; 0 failed`.
 
 Then confirm the `#[cfg(test)]` seam did not disturb `creds.rs`:
-`cargo test --bin chrome-host-app git::creds` → `23 passed; 0 failed`.
+`cargo test --bin hitch git::creds` → `23 passed; 0 failed`.
 
 - [ ] **Step 40: Commit**
 
@@ -2199,14 +2199,14 @@ Add to `mod tests` in `src/git/ops.rs`:
 
 - [ ] **Step 42: Run the test and watch it fail**
 
-Run: `cargo test --bin chrome-host-app git::ops::tests::a_rejected_push`
+Run: `cargo test --bin hitch git::ops::tests::a_rejected_push`
 
 Expected: FAIL — compile error:
 
 ```
 error[E0599]: no method named `take_push_rejections` found for struct `OpCtx` in the current scope
 error[E0599]: no method named `record_push_status` found for struct `OpCtx` in the current scope
-error: could not compile `chrome-host-app` (bin "chrome-host-app" test) due to 2 previous errors
+error: could not compile `hitch` (bin "hitch" test) due to 2 previous errors
 ```
 
 - [ ] **Step 43: Implement the push-status methods**
@@ -2245,7 +2245,7 @@ Add these two methods inside the existing `impl OpCtx` block in `src/git/ops.rs`
 
 - [ ] **Step 44: Run the test and watch it pass**
 
-Run: `cargo test --bin chrome-host-app git::ops`
+Run: `cargo test --bin hitch git::ops`
 
 Expected: PASS — `test result: ok. 17 passed; 0 failed`.
 
@@ -2295,7 +2295,7 @@ Add to `mod tests` in `src/git/ops.rs`:
 
 - [ ] **Step 47: Run the test and watch it fail**
 
-Run: `cargo test --bin chrome-host-app git::ops::tests::run_dispatches`
+Run: `cargo test --bin hitch git::ops::tests::run_dispatches`
 
 Expected: FAIL — compile error:
 
@@ -2305,7 +2305,7 @@ error[E0425]: cannot find function `run` in this scope
     |
     |             let e = run(op, &fx.ctx).expect_err("no verb is implemented in this slice");
     |                     ^^^ not found in this scope
-error: could not compile `chrome-host-app` (bin "chrome-host-app" test) due to 1 previous error
+error: could not compile `hitch` (bin "hitch" test) due to 1 previous error
 ```
 
 - [ ] **Step 48: Implement `run` and the eight verb stubs**
@@ -2369,7 +2369,7 @@ pub fn reset(_ctx: &OpCtx) -> Result<OpOutcome, GitError> {
 
 - [ ] **Step 49: Run the test and watch it pass**
 
-Run: `cargo test --bin chrome-host-app git::ops`
+Run: `cargo test --bin hitch git::ops`
 
 Expected: PASS — `test result: ok. 18 passed; 0 failed`.
 
@@ -2531,7 +2531,7 @@ it reaches the tests through `use super::*`.
 
 - [ ] **Step 52: Run the tests and watch them fail**
 
-Run: `cargo test --bin chrome-host-app git::creds`
+Run: `cargo test --bin hitch git::creds`
 
 Expected: FAIL — compile error:
 
@@ -2542,7 +2542,7 @@ error[E0425]: cannot find function `credentials_for` in this scope
    |         match credentials_for(&fx.ctx, allowed) {
    |               ^^^^^^^^^^^^^^^ not found in this scope
 error[E0433]: failed to resolve: use of undeclared type `OpCtx`
-error: could not compile `chrome-host-app` (bin "chrome-host-app" test) due to 8 previous errors
+error: could not compile `hitch` (bin "hitch" test) due to 8 previous errors
 ```
 
 - [ ] **Step 53: Implement `credentials_for`**
@@ -2628,7 +2628,7 @@ fn credentials_for(
 
 - [ ] **Step 54: Run the tests and watch them pass**
 
-Run: `cargo test --bin chrome-host-app git::creds`
+Run: `cargo test --bin hitch git::creds`
 
 Expected: PASS — `test result: ok. 28 passed; 0 failed`.
 
@@ -2699,7 +2699,7 @@ Add to `mod tests` in `src/git/creds.rs`:
 
 - [ ] **Step 57: Run the tests and watch them fail**
 
-Run: `cargo test --bin chrome-host-app git::creds`
+Run: `cargo test --bin hitch git::creds`
 
 Expected: FAIL — `callbacks` does not exist yet:
 
@@ -2709,7 +2709,7 @@ error[E0425]: cannot find function `callbacks` in this scope
    |
    |         let _first = callbacks(&fx.ctx);
    |                      ^^^^^^^^^ not found in this scope
-error: could not compile `chrome-host-app` (bin "chrome-host-app" test) due to 2 previous errors
+error: could not compile `hitch` (bin "hitch" test) due to 2 previous errors
 ```
 
 - [ ] **Step 58: Implement `callbacks`**
@@ -2744,7 +2744,7 @@ pub fn callbacks<'a>(ctx: &'a OpCtx) -> git2::RemoteCallbacks<'a> {
 
 - [ ] **Step 59: Run the tests and watch them pass**
 
-Run: `cargo test --bin chrome-host-app git::creds`
+Run: `cargo test --bin hitch git::creds`
 
 Expected: PASS — `test result: ok. 30 passed; 0 failed`.
 
@@ -2780,8 +2780,8 @@ Expected:
   `src/git/mod.rs` are missing — they came from task 3 and every module below `git` depends on
   them.
 - `cargo test --locked` passes, `0 failed`, and the two modules this task created contribute 48
-  tests: `cargo test --bin chrome-host-app git::creds` reports 30 and
-  `cargo test --bin chrome-host-app git::ops` reports 18.
+  tests: `cargo test --bin hitch git::creds` reports 30 and
+  `cargo test --bin hitch git::ops` reports 18.
 
 Then confirm the two audits this task is responsible for, by hand:
 

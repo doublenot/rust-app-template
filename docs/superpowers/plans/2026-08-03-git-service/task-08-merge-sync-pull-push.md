@@ -61,8 +61,8 @@ invariant, a race, a verified libgit2 behaviour), never what; no `unwrap()` outs
 propagate down the module tree.
 
 **This crate has no `--lib` target** (`src/main.rs` is the only entry point and
-`src/bin/gen_icons.rs` is a second binary), so unit tests run in the `chrome-host-app` bin
-target: `cargo test --bin chrome-host-app <filter>`.
+`src/bin/gen_icons.rs` is a second binary), so unit tests run in the `hitch` bin
+target: `cargo test --bin hitch <filter>`.
 
 **Where the tests live.** The §10.3 merge matrix is merge *policy*, so it lives in
 `src/git/merge.rs`'s `mod tests` even though it is driven end-to-end through `ops::sync` — the
@@ -309,7 +309,7 @@ pub mod util;
 
 - [ ] **Step 2: Run the test and watch it fail**
 
-Run: `cargo test --bin chrome-host-app git::merge`
+Run: `cargo test --bin hitch git::merge`
 
 Expected: FAIL — compile error:
 
@@ -318,7 +318,7 @@ error[E0425]: cannot find function `conflict_path_bytes` in this scope
 error[E0422]: cannot find struct, variant or union type `MergeResult` in this scope
 error[E0433]: failed to resolve: use of undeclared type `MergeOutcome`
 error[E0433]: failed to resolve: use of undeclared type `GitErrorCode`
-error: could not compile `chrome-host-app` (bin "chrome-host-app" test) due to 12 previous errors
+error: could not compile `hitch` (bin "hitch" test) due to 12 previous errors
 ```
 
 - [ ] **Step 3: Implement the merge vocabulary and `conflict_path_bytes`**
@@ -543,7 +543,7 @@ only `GitError`/`GitErrorCode` now and add the other four in Step 23.
 
 - [ ] **Step 4: Run the test and watch it pass**
 
-Run: `cargo test --bin chrome-host-app git::merge`
+Run: `cargo test --bin hitch git::merge`
 
 Expected: PASS — `test result: ok. 2 passed; 0 failed`.
 
@@ -939,7 +939,7 @@ and these two tests:
 
 - [ ] **Step 7: Run the tests and watch them fail**
 
-Run: `cargo test --bin chrome-host-app git::ops::tests::fetch`
+Run: `cargo test --bin hitch git::ops::tests::fetch`
 
 Expected: FAIL — compile error:
 
@@ -949,7 +949,7 @@ error[E0425]: cannot find function `fetch` in this scope
     |
     |         let fetched = fetch(&repo, &fx.ctx).expect("fetch main");
     |                       ^^^^^ not found in this scope
-error: could not compile `chrome-host-app` (bin "chrome-host-app" test) due to 2 previous errors
+error: could not compile `hitch` (bin "hitch" test) due to 2 previous errors
 ```
 
 - [ ] **Step 8: Implement `ops::fetch`**
@@ -1007,7 +1007,7 @@ pub fn fetch(repo: &git2::Repository, ctx: &OpCtx) -> Result<Option<git2::Oid>, 
 
 - [ ] **Step 9: Run the tests and watch them pass**
 
-Run: `cargo test --bin chrome-host-app git::ops::tests::fetch`
+Run: `cargo test --bin hitch git::ops::tests::fetch`
 
 Expected: PASS — `test result: ok. 2 passed; 0 failed`.
 
@@ -1086,7 +1086,7 @@ Add to `mod tests` in `src/git/ops.rs`:
 
 - [ ] **Step 12: Run the tests and watch them fail**
 
-Run: `cargo test --bin chrome-host-app git::ops::tests::push`
+Run: `cargo test --bin hitch git::ops::tests::push`
 
 Expected: FAIL — two assertion failures, because `push` is still task 6's stub:
 
@@ -1221,7 +1221,7 @@ removed the other five, leaving `JobOp::Pull`, `JobOp::Push` and `JobOp::Sync`. 
 
 - [ ] **Step 14: Run the tests and watch them pass**
 
-Run: `cargo test --bin chrome-host-app git::ops`
+Run: `cargo test --bin hitch git::ops`
 
 Expected: PASS — the two new push tests pass and
 `run_dispatches_to_a_verb_of_the_same_name` still passes for the two remaining stubs.
@@ -1302,7 +1302,7 @@ Add to `mod tests` in `src/git/ops.rs`:
 
 - [ ] **Step 17: Run the tests and watch them fail**
 
-Run: `cargo test --bin chrome-host-app git::ops::tests::push git::ops::tests::a_forced`
+Run: `cargo test --bin hitch git::ops::tests::push git::ops::tests::a_forced`
 
 Expected: FAIL — two assertion failures:
 
@@ -1375,7 +1375,7 @@ with:
 
 - [ ] **Step 19: Run the tests and watch them pass**
 
-Run: `cargo test --bin chrome-host-app git::ops`
+Run: `cargo test --bin hitch git::ops`
 
 Expected: PASS — `test result: ok.` with the four push tests green.
 
@@ -1514,7 +1514,7 @@ warn about them, which the final verification step cleans up.)
 
 - [ ] **Step 22: Run the tests and watch them fail**
 
-Run: `cargo test --bin chrome-host-app git::merge`
+Run: `cargo test --bin hitch git::merge`
 
 Expected: FAIL — compile error:
 
@@ -1524,7 +1524,7 @@ error[E0425]: cannot find function `analyse` in this scope
     |
     |         match analyse(&repo, &fx.ctx).expect("an absent remote branch is not a failure") {
     |               ^^^^^^^ not found in this scope
-error: could not compile `chrome-host-app` (bin "chrome-host-app" test) due to 4 previous errors
+error: could not compile `hitch` (bin "hitch" test) due to 4 previous errors
 ```
 
 - [ ] **Step 23: Implement `analyse`**
@@ -1624,7 +1624,7 @@ isolation.
 
 - [ ] **Step 24: Run the tests and watch them pass**
 
-Run: `cargo test --bin chrome-host-app git::merge`
+Run: `cargo test --bin hitch git::merge`
 
 Expected: PASS — `test result: ok. 6 passed; 0 failed`.
 
@@ -1745,7 +1745,7 @@ Add to `mod tests` in `src/git/ops.rs`:
 
 - [ ] **Step 27: Run the tests and watch them fail**
 
-Run: `cargo test --bin chrome-host-app git::ops::tests::pull git::ops::tests::an_untracked`
+Run: `cargo test --bin hitch git::ops::tests::pull git::ops::tests::an_untracked`
 
 Expected: FAIL — five failures, all against task 6's stub:
 
@@ -1908,7 +1908,7 @@ reads:
 
 - [ ] **Step 29: Run the tests and watch them pass**
 
-Run: `cargo test --bin chrome-host-app git::ops`
+Run: `cargo test --bin hitch git::ops`
 
 Expected: PASS — the five pull tests are green.
 
@@ -2086,7 +2086,7 @@ what is under test, and a push would only add a second way for the test to fail.
 
 - [ ] **Step 32: Run the tests and watch them fail**
 
-Run: `cargo test --bin chrome-host-app git::ops::tests::sync git::merge::tests::up_to_date git::merge::tests::fast_forward`
+Run: `cargo test --bin hitch git::ops::tests::sync git::merge::tests::up_to_date git::merge::tests::fast_forward`
 
 Expected: FAIL — seven failures, all against task 6's stub:
 
@@ -2201,7 +2201,7 @@ said so.
 
 - [ ] **Step 34: Run the tests and watch them pass**
 
-Run: `cargo test --bin chrome-host-app git::`
+Run: `cargo test --bin hitch git::`
 
 Expected: PASS — every `git::ops` and `git::merge` test is green; the seven from Step 31 now
 pass and no test named `run_dispatches` remains.
@@ -2282,7 +2282,7 @@ Add to `mod tests` in `src/git/merge.rs`:
 
 - [ ] **Step 37: Run the test and watch it fail**
 
-Run: `cargo test --bin chrome-host-app git::merge::tests::non_overlapping`
+Run: `cargo test --bin hitch git::merge::tests::non_overlapping`
 
 Expected: FAIL — `analyse`'s normal arm is still the Step 23 stub:
 
@@ -2454,7 +2454,7 @@ with:
 
 - [ ] **Step 39: Run the test and watch it pass**
 
-Run: `cargo test --bin chrome-host-app git::merge`
+Run: `cargo test --bin hitch git::merge`
 
 Expected: PASS — `non_overlapping_edits_auto_merge` is green along with the seven earlier
 `git::merge` tests.
@@ -2695,7 +2695,7 @@ to a file the two sides really collided on. Add to `mod tests` in `src/git/merge
 
 - [ ] **Step 42: Run the tests and watch them fail**
 
-Run: `cargo test --bin chrome-host-app git::merge`
+Run: `cargo test --bin hitch git::merge`
 
 Expected: FAIL — five failures. `merge_prefer_local` currently refuses any conflicted index:
 
@@ -2774,7 +2774,7 @@ reads `conflicts_resolved: resolved,`, so no edit is needed there.
 
 - [ ] **Step 44: Run the tests and watch them pass**
 
-Run: `cargo test --bin chrome-host-app git::merge`
+Run: `cargo test --bin hitch git::merge`
 
 Expected: PASS — `test result: ok. 13 passed; 0 failed`.
 
@@ -2834,7 +2834,7 @@ Add to `mod tests` in `src/git/merge.rs`:
 
 - [ ] **Step 47: Run the test and watch it fail**
 
-Run: `cargo test --bin chrome-host-app git::merge::tests::dir_file`
+Run: `cargo test --bin hitch git::merge::tests::dir_file`
 
 Expected: FAIL — the merge *succeeds*, which is exactly the hole:
 
@@ -2881,7 +2881,7 @@ fires only when *both* kinds are known and they differ.
 
 - [ ] **Step 49: Run the test and watch it pass**
 
-Run: `cargo test --bin chrome-host-app git::merge`
+Run: `cargo test --bin hitch git::merge`
 
 Expected: PASS — `test result: ok. 14 passed; 0 failed`.
 
@@ -2936,7 +2936,7 @@ Add to `mod tests` in `src/git/merge.rs`:
 
 - [ ] **Step 52: Run the test and watch it fail**
 
-Run: `cargo test --bin chrome-host-app git::merge::tests::unrelated`
+Run: `cargo test --bin hitch git::merge::tests::unrelated`
 
 Expected: FAIL — `merge_commits` cannot find a base:
 
@@ -3011,7 +3011,7 @@ with:
 
 - [ ] **Step 54: Run the test and watch it pass**
 
-Run: `cargo test --bin chrome-host-app git::merge`
+Run: `cargo test --bin hitch git::merge`
 
 Expected: PASS — `test result: ok. 15 passed; 0 failed`.
 
@@ -3130,7 +3130,7 @@ These two lock in decisions that are invisible in a diff: one line that was *not
 
 - [ ] **Step 57: Run the guards, then prove they bite**
 
-Run: `cargo test --bin chrome-host-app git::merge`
+Run: `cargo test --bin hitch git::merge`
 
 Expected: PASS — `test result: ok. 17 passed; 0 failed`. **These two are expected to pass on
 the first run**: no production code changes for them, because the behaviour they lock in is
@@ -3149,7 +3149,7 @@ already correct. That makes them worth falsifying once, so you know they are not
    `assert!(!a.join(".git/MERGE_HEAD").exists())`.
    Revert.
 
-Confirm `cargo test --bin chrome-host-app git::merge` is green again before committing.
+Confirm `cargo test --bin hitch git::merge` is green again before committing.
 
 - [ ] **Step 58: Commit**
 
@@ -3171,7 +3171,7 @@ Run, in order:
 ```bash
 cargo fmt
 cargo clippy --all-targets -- -D warnings
-cargo test --bin chrome-host-app
+cargo test --bin hitch
 ```
 
 Expected: `cargo fmt` produces no diff (or only whitespace, which you commit); clippy is

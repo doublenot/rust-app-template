@@ -181,7 +181,7 @@ error[E0599]: no method named `git_enabled` found for struct `config::AppConfig`
     |         assert!(c.git_enabled());
     |                   ^^^^^^^^^^^ method not found in `config::AppConfig`
 
-error: could not compile `chrome-host-app` (bin "chrome-host-app" test) due to 6 previous errors
+error: could not compile `hitch` (bin "hitch" test) due to 6 previous errors
 ```
 
 - [ ] **Step 3: Add `GitSection`, `SshHostKeyPolicy`, `AppConfig::git` and `git_enabled()`**
@@ -345,7 +345,7 @@ error[E0425]: cannot find value `MAX_BRANCH_NAME_LEN` in this scope
     |         assert!(validate_branch_name(&"a".repeat(MAX_BRANCH_NAME_LEN)));
     |                                                  ^^^^^^^^^^^^^^^^^^^ not found in this scope
 
-error: could not compile `chrome-host-app` (bin "chrome-host-app" test) due to 5 previous errors
+error: could not compile `hitch` (bin "hitch" test) due to 5 previous errors
 ```
 
 - [ ] **Step 8: Add `MAX_BRANCH_NAME_LEN`, `validate_branch_name`, and the `default_branch` rule**
@@ -612,7 +612,7 @@ error[E0609]: no field `repos_dir` on type `config::RuntimePaths`
 error[E0609]: no field `registry_file` on type `config::RuntimePaths`
 error[E0609]: no field `git_state_file` on type `config::RuntimePaths`
 
-error: could not compile `chrome-host-app` (bin "chrome-host-app" test) due to 6 previous errors
+error: could not compile `hitch` (bin "hitch" test) due to 6 previous errors
 ```
 
 - [ ] **Step 18: Add the three fields — and leave `ensure()` alone**
@@ -825,7 +825,7 @@ cargo test
 
 Expected: `cargo fmt --check` silent; clippy `Finished` with no warnings; `cargo test` reports
 `test result: ok. 43 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out` for the
-`chrome-host-app` binary (up from 33 passed at the start of the task) plus `0 passed` for
+`hitch` binary (up from 33 passed at the start of the task) plus `0 passed` for
 `gen_icons`.
 
 The task adds **ten** tests — four in step 1, two in step 6, two in step 11, one in step 16

@@ -132,9 +132,9 @@ mod tray;
 - [ ] **Step 2: Run the test and watch it fail to compile**
 
 This crate is a binary, not a library — there is no `--lib` target, and `src/bin/gen_icons.rs`
-is a second binary. Unit tests live in the `chrome-host-app` bin target:
+is a second binary. Unit tests live in the `hitch` bin target:
 
-Run: `cargo test --bin chrome-host-app git::tests`
+Run: `cargo test --bin hitch git::tests`
 
 Expected: FAIL — compile error, because `git2` is not a dependency yet.
 
@@ -148,7 +148,7 @@ error[E0433]: cannot find module or crate `git2` in this scope
    = help: if you wanted to use a crate named `git2`, use `cargo add git2` to add it to your `Cargo.toml`
 
 For more information about this error, try `rustc --explain E0433`.
-error: could not compile `chrome-host-app` (bin "chrome-host-app" test) due to 1 previous error
+error: could not compile `hitch` (bin "hitch" test) due to 1 previous error
 ```
 
 - [ ] **Step 3: Add the dependency the naive way — deliberately wrong**
@@ -162,7 +162,7 @@ git2 = "0.21"
 
 - [ ] **Step 4: Run the test and watch it fail the assertion**
 
-Run: `cargo test --bin chrome-host-app git::tests`
+Run: `cargo test --bin hitch git::tests`
 
 This compiles libgit2 from source (~15 s — a local-only libgit2 with no TLS and no SSH is
 cheap). Expected: FAIL, and note *how* it fails — the code compiled and linked, and only the
@@ -234,7 +234,7 @@ is safe to land it here with the rest of the spine rather than in the middle of 
 
 - [ ] **Step 6: Run the test and watch it pass**
 
-Run: `cargo test --bin chrome-host-app git::tests`
+Run: `cargo test --bin hitch git::tests`
 
 **This is the slow one: ~1 m 45 s on an 8-core box**, most of it compiling OpenSSL. Expected: PASS.
 
@@ -267,12 +267,12 @@ openssl-src v300.6.1+3.6.3
 [build-dependencies]
 └── openssl-sys v0.9.117
     ├── git2 v0.21.0
-    │   └── chrome-host-app v0.1.0 (...)
+    │   └── hitch v0.1.0 (...)
     ├── libgit2-sys v0.18.7+1.9.6
     │   └── git2 v0.21.0 (*)
     ├── libssh2-sys v0.3.2
     │   └── libgit2-sys v0.18.7+1.9.6 (*)
-    └── chrome-host-app v0.1.0 (...)
+    └── hitch v0.1.0 (...)
 ```
 
 Expected on `aarch64-apple-darwin` — `openssl-sys` **is** in the graph (this is the
@@ -284,10 +284,10 @@ the `vendored` feature):
 openssl-sys v0.9.117
 ├── libgit2-sys v0.18.7+1.9.6
 │   └── git2 v0.21.0
-│       └── chrome-host-app v0.1.0 (...)
+│       └── hitch v0.1.0 (...)
 ├── libssh2-sys v0.3.2
 │   └── libgit2-sys v0.18.7+1.9.6 (*)
-└── chrome-host-app v0.1.0 (...)
+└── hitch v0.1.0 (...)
 ```
 
 Expected on `x86_64-pc-windows-msvc` — no OpenSSL at all:
@@ -319,7 +319,7 @@ Expected: all four silent/green. Specifically:
   `Cargo.toml`. If it errors with `the lock file ... needs to be updated but --locked was
   passed`, run `cargo build` once without the flag and retry.
 - `cargo test` ends with `test result: ok. 33 passed; 0 failed; 1 ignored` for the
-  `chrome-host-app` binary — 32 pre-existing tests plus the new one. The `1 ignored` is
+  `hitch` binary — 32 pre-existing tests plus the new one. The `1 ignored` is
   pre-existing; you have not added an ignored test.
 
 - [ ] **Step 9: Commit**

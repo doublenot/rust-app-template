@@ -596,7 +596,7 @@ these names, reuse it rather than duplicating it.
 
 - [ ] **Step 2: Run the tests and watch them fail**
 
-Run: `cargo test --bin chrome-host-app git::ops::tests::open_tree`
+Run: `cargo test --bin hitch git::ops::tests::open_tree`
 
 Expected: FAIL — the file does not compile:
 
@@ -613,7 +613,7 @@ error[E0425]: cannot find function `require_branch` in this scope
 NNN |         require_branch(&repo, "main").expect("an unborn head is not a mismatch");
     |         ^^^^^^^^^^^^^^ not found in this scope
 
-error: could not compile `chrome-host-app` (bin "chrome-host-app" test) due to 8 previous errors
+error: could not compile `hitch` (bin "hitch" test) due to 8 previous errors
 ```
 
 - [ ] **Step 3: Implement the shared preamble**
@@ -773,7 +773,7 @@ pub fn require_branch(repo: &git2::Repository, branch: &str) -> Result<(), GitEr
 
 - [ ] **Step 4: Run the tests and watch them pass**
 
-Run: `cargo test --bin chrome-host-app git::ops::tests::`
+Run: `cargo test --bin hitch git::ops::tests::`
 
 Expected: PASS.
 
@@ -871,7 +871,7 @@ Add to the same test module:
 
 - [ ] **Step 7: Run the tests and watch them fail**
 
-Run: `cargo test --bin chrome-host-app git::ops::tests::init_`
+Run: `cargo test --bin hitch git::ops::tests::init_`
 
 Expected: FAIL — the file does not compile:
 
@@ -944,7 +944,7 @@ pub fn init(ctx: &OpCtx) -> Result<OpOutcome, GitError> {
 
 - [ ] **Step 9: Run the tests and watch them pass**
 
-Run: `cargo test --bin chrome-host-app git::ops::tests::init_`
+Run: `cargo test --bin hitch git::ops::tests::init_`
 
 Expected: PASS.
 
@@ -967,7 +967,7 @@ green, and the four remaining verbs land in the commits after this one.
 
 Run it first and watch it fail:
 
-`cargo test --bin chrome-host-app git::ops::tests::run_dispatches_to_a_verb`
+`cargo test --bin hitch git::ops::tests::run_dispatches_to_a_verb`
 
 ```
 running 1 test
@@ -1014,7 +1014,7 @@ to find exactly these three names here.
 
 Run it again and watch it pass:
 
-`cargo test --bin chrome-host-app git::ops::tests::run_dispatches_to_a_verb`
+`cargo test --bin hitch git::ops::tests::run_dispatches_to_a_verb`
 
 ```
 running 1 test
@@ -1176,7 +1176,7 @@ Add to the same test module:
 
 - [ ] **Step 13: Run the tests and watch them fail**
 
-Run: `cargo test --bin chrome-host-app git::ops::tests::clone_`
+Run: `cargo test --bin hitch git::ops::tests::clone_`
 
 Expected: FAIL — the file does not compile:
 
@@ -1301,7 +1301,7 @@ pub fn clone(ctx: &OpCtx) -> Result<OpOutcome, GitError> {
 
 - [ ] **Step 16: Run the tests and watch them pass**
 
-Run: `cargo test --bin chrome-host-app git::ops::tests::clone_`
+Run: `cargo test --bin hitch git::ops::tests::clone_`
 
 Expected: PASS.
 
@@ -1510,7 +1510,7 @@ Add to the same test module:
 
 - [ ] **Step 19: Run the tests and watch them fail**
 
-Run: `cargo test --bin chrome-host-app git::ops::tests::commit_`
+Run: `cargo test --bin hitch git::ops::tests::commit_`
 
 Expected: FAIL — the file does not compile:
 
@@ -1619,7 +1619,7 @@ pub fn commit(ctx: &OpCtx) -> Result<OpOutcome, GitError> {
 
 - [ ] **Step 22: Run the tests and watch them pass**
 
-Run: `cargo test --bin chrome-host-app git::ops::tests::commit_`
+Run: `cargo test --bin hitch git::ops::tests::commit_`
 
 Expected: PASS.
 
@@ -1831,7 +1831,7 @@ Add to the same test module:
 
 - [ ] **Step 25: Run the tests and watch them fail**
 
-Run: `cargo test --bin chrome-host-app git::ops::tests::status_`
+Run: `cargo test --bin hitch git::ops::tests::status_`
 
 Expected: FAIL — the file does not compile:
 
@@ -2111,7 +2111,7 @@ fn dirty_summary(repo: &git2::Repository) -> Result<DirtySummary, GitError> {
 
 - [ ] **Step 28: Run the tests and watch them pass**
 
-Run: `cargo test --bin chrome-host-app git::ops::tests::status_`
+Run: `cargo test --bin hitch git::ops::tests::status_`
 
 Expected: PASS.
 
@@ -2189,7 +2189,7 @@ Add to the same test module:
 
 - [ ] **Step 31: Run the test and watch it fail**
 
-Run: `cargo test --bin chrome-host-app git::ops::tests::branches_`
+Run: `cargo test --bin hitch git::ops::tests::branches_`
 
 Expected: FAIL — the file does not compile:
 
@@ -2264,7 +2264,7 @@ pub fn branches(tree: &std::path::Path, def: &RepoDef) -> Result<BranchesRespons
 
 - [ ] **Step 33: Run the test and watch it pass**
 
-Run: `cargo test --bin chrome-host-app git::ops::tests::branches_`
+Run: `cargo test --bin hitch git::ops::tests::branches_`
 
 Expected: PASS.
 
@@ -2430,7 +2430,7 @@ Add to the same test module:
 
 - [ ] **Step 36: Run the tests and watch them fail**
 
-Run: `cargo test --bin chrome-host-app git::ops::tests::branch_`
+Run: `cargo test --bin hitch git::ops::tests::branch_`
 
 Expected: FAIL — the file does not compile:
 
@@ -2510,7 +2510,7 @@ pub fn branch(ctx: &OpCtx) -> Result<OpOutcome, GitError> {
 
 - [ ] **Step 38: Run the tests and watch them pass**
 
-Run: `cargo test --bin chrome-host-app git::ops::tests::branch_`
+Run: `cargo test --bin hitch git::ops::tests::branch_`
 
 Expected: PASS.
 
@@ -2662,7 +2662,7 @@ Add to the same test module:
 
 - [ ] **Step 41: Run the tests and watch them fail**
 
-Run: `cargo test --bin chrome-host-app git::ops::tests::reset_`
+Run: `cargo test --bin hitch git::ops::tests::reset_`
 
 Expected: FAIL — the file does not compile:
 
@@ -2744,7 +2744,7 @@ pub fn reset(ctx: &OpCtx) -> Result<OpOutcome, GitError> {
 
 - [ ] **Step 43: Run the tests and watch them pass**
 
-Run: `cargo test --bin chrome-host-app git::ops::tests::reset_`
+Run: `cargo test --bin hitch git::ops::tests::reset_`
 
 Expected: PASS.
 
@@ -2832,7 +2832,7 @@ Add to the same test module:
 
 - [ ] **Step 46: Run the tests and watch them fail**
 
-Run: `cargo test --bin chrome-host-app git::ops::tests::purge_`
+Run: `cargo test --bin hitch git::ops::tests::purge_`
 
 Expected: FAIL — the file does not compile:
 
@@ -2882,7 +2882,7 @@ pub fn purge_tree(
 
 - [ ] **Step 48: Run the tests and watch them pass**
 
-Run: `cargo test --bin chrome-host-app git::ops::tests::purge_`
+Run: `cargo test --bin hitch git::ops::tests::purge_`
 
 Expected: PASS.
 
@@ -2975,7 +2975,7 @@ Add to the same test module:
 
 - [ ] **Step 51: Run the test and watch it pass**
 
-Run: `cargo test --bin chrome-host-app git::ops::tests::run_dispatches`
+Run: `cargo test --bin hitch git::ops::tests::run_dispatches`
 
 Expected: PASS on the very first run. That is correct here rather than a missing red step:
 task 6's Step 48 already landed `run` with all eight arms dispatching to a verb of its own
@@ -3025,7 +3025,7 @@ appended a verb instead of replacing its stub, and `cargo build` will already ha
 
 - [ ] **Step 53: Run the whole ops module**
 
-Run: `cargo test --bin chrome-host-app git::ops`
+Run: `cargo test --bin hitch git::ops`
 
 Expected: PASS — everything task 6 left in the module plus everything this task has added, with
 no `is not implemented yet` failure anywhere.
@@ -3087,7 +3087,7 @@ Add this test **inside** the existing `#[cfg(test)] mod tests` block in `src/git
 
 - [ ] **Step 56: Run the test and watch it fail**
 
-Run: `cargo test --bin chrome-host-app git::tests::network_timeouts`
+Run: `cargo test --bin hitch git::tests::network_timeouts`
 
 Expected: FAIL — the file does not compile:
 
@@ -3171,7 +3171,7 @@ fn init_libgit2_timeouts_locked(
 
 - [ ] **Step 58: Run the test and watch it pass**
 
-Run: `cargo test --bin chrome-host-app git::tests::`
+Run: `cargo test --bin hitch git::tests::`
 
 Expected: PASS.
 
@@ -3207,7 +3207,7 @@ Run:
 cargo fmt
 cargo fmt --check
 cargo clippy --all-targets -- -D warnings
-cargo test --bin chrome-host-app
+cargo test --bin hitch
 ```
 
 Expected: all four clean. The two most likely clippy findings and their fixes:
@@ -3242,7 +3242,7 @@ If `cargo fmt` changed nothing, skip this step — do not create an empty commit
 
 **Definition of done for Task 7**
 
-- `cargo test --bin chrome-host-app` green, `cargo fmt --check` clean,
+- `cargo test --bin hitch` green, `cargo fmt --check` clean,
   `cargo clippy --all-targets -- -D warnings` clean.
 - `src/git/ops.rs` names no `tokio`, no `axum`, no `App`, no `Children`, no `HostEvent`.
   Check with `rg -n 'tokio|axum|HostEvent|Children' src/git/ops.rs` — zero hits.

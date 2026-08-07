@@ -251,9 +251,9 @@ six more like them.
 - [ ] **Step 2: Run the test and watch it fail**
 
 This crate is a binary — there is no `--lib` target, and `src/bin/gen_icons.rs` is a
-second binary — so unit tests run in the `chrome-host-app` bin target:
+second binary — so unit tests run in the `hitch` bin target:
 
-Run: `cargo test --bin chrome-host-app git::secret`
+Run: `cargo test --bin hitch git::secret`
 
 Expected: FAIL — compile error.
 
@@ -265,7 +265,7 @@ error[E0432]: unresolved import `super::Secret`
   |         ^^^^^^^^^^^^^ no `Secret` in `git::secret`
 
 For more information about this error, try `rustc --explain E0432`.
-error: could not compile `chrome-host-app` (bin "chrome-host-app" test) due to 1 previous error
+error: could not compile `hitch` (bin "hitch" test) due to 1 previous error
 ```
 
 - [ ] **Step 3: Implement `Secret`**
@@ -337,7 +337,7 @@ impl std::fmt::Debug for Secret {
 
 - [ ] **Step 4: Run the test and watch it pass**
 
-Run: `cargo test --bin chrome-host-app git::secret`
+Run: `cargo test --bin hitch git::secret`
 
 Expected: PASS.
 
@@ -508,7 +508,7 @@ pub mod secret;
 
 - [ ] **Step 7: Run the test and watch it fail**
 
-Run: `cargo test --bin chrome-host-app git::error`
+Run: `cargo test --bin hitch git::error`
 
 Expected: FAIL — compile error.
 
@@ -527,7 +527,7 @@ error[E0425]: cannot find type `GitErrorCode` in this scope
 
 Some errors have detailed explanations: E0425, E0432.
 For more information about an error, try `rustc --explain E0425`.
-error: could not compile `chrome-host-app` (bin "chrome-host-app" test) due to 3 previous errors
+error: could not compile `hitch` (bin "hitch" test) due to 3 previous errors
 ```
 
 - [ ] **Step 8: Implement `GitErrorCode`**
@@ -706,7 +706,7 @@ impl GitErrorCode {
 
 - [ ] **Step 9: Run the test and watch it pass**
 
-Run: `cargo test --bin chrome-host-app git::error`
+Run: `cargo test --bin hitch git::error`
 
 Expected: PASS.
 
@@ -837,7 +837,7 @@ transport failure — all three arrive as byte-identical `git2::Error`s.
 
 - [ ] **Step 12: Run the test and watch it fail**
 
-Run: `cargo test --bin chrome-host-app git::error`
+Run: `cargo test --bin hitch git::error`
 
 Expected: FAIL — compile error, eleven instances of two kinds:
 
@@ -936,7 +936,7 @@ pub fn classify(e: &git2::Error, abort: AbortReason) -> GitErrorCode {
 
 - [ ] **Step 14: Run the test and watch it pass**
 
-Run: `cargo test --bin chrome-host-app git::error`
+Run: `cargo test --bin hitch git::error`
 
 Expected: PASS.
 
@@ -1023,7 +1023,7 @@ Add to the existing `mod tests` in `src/git/error.rs`, after
 
 - [ ] **Step 17: Run the test and watch it fail**
 
-Run: `cargo test --bin chrome-host-app git::error::tests::scrub`
+Run: `cargo test --bin hitch git::error::tests::scrub`
 
 Expected: FAIL — compile error, once per call site:
 
@@ -1034,7 +1034,7 @@ error[E0425]: cannot find function `scrub` in this scope
 391 |         assert_eq!(scrub("https://u:p@h/x", &[]), "https://h/x");
     |                    ^^^^^ not found in this scope
 
-error: could not compile `chrome-host-app` (bin "chrome-host-app" test) due to 8 previous errors
+error: could not compile `hitch` (bin "hitch" test) due to 8 previous errors
 ```
 
 - [ ] **Step 18: Implement `scrub`**
@@ -1146,7 +1146,7 @@ fn strip_userinfo(message: &str) -> String {
 
 - [ ] **Step 19: Run the test and watch it pass**
 
-Run: `cargo test --bin chrome-host-app git::error::tests::scrub`
+Run: `cargo test --bin hitch git::error::tests::scrub`
 
 Expected: PASS.
 
@@ -1260,7 +1260,7 @@ narrower than the HTTP envelope. `repo_id` is set on that error and deliberately
 
 - [ ] **Step 22: Run the test and watch it fail**
 
-Run: `cargo test --bin chrome-host-app git::error`
+Run: `cargo test --bin hitch git::error`
 
 Expected: FAIL — compile error, nine instances:
 
@@ -1273,7 +1273,7 @@ error[E0433]: cannot find type `GitError` in this scope
 
 error[E0422]: cannot find struct, variant or union type `Git2Hint` in this scope
 
-error: could not compile `chrome-host-app` (bin "chrome-host-app" test) due to 9 previous errors
+error: could not compile `hitch` (bin "hitch" test) due to 9 previous errors
 ```
 
 - [ ] **Step 23: Implement `Git2Hint` and `GitError`**
@@ -1710,7 +1710,7 @@ impl From<serde_json::Error> for GitError {
 
 - [ ] **Step 24: Run the test and watch it pass**
 
-Run: `cargo test --bin chrome-host-app git::error`
+Run: `cargo test --bin hitch git::error`
 
 Expected: PASS.
 
@@ -1824,7 +1824,7 @@ the case where no `GitService` and therefore no `host_instance` exists.
 
 - [ ] **Step 27: Run the test and watch it fail**
 
-Run: `cargo test --bin chrome-host-app git::error`
+Run: `cargo test --bin hitch git::error`
 
 Expected: FAIL — compile error.
 
@@ -1841,7 +1841,7 @@ error[E0599]: no method named `into_response` found for struct `git::error::GitE
 995 |         let r = GitError::repo_busy("notes", "sync").into_response();
     |                                                      ^^^^^^^^^^^^^
 
-error: could not compile `chrome-host-app` (bin "chrome-host-app" test) due to 5 previous errors
+error: could not compile `hitch` (bin "hitch" test) due to 5 previous errors
 ```
 
 - [ ] **Step 28: Implement `IntoResponse`**
@@ -1913,7 +1913,7 @@ impl IntoResponse for GitError {
 
 - [ ] **Step 29: Run the test and watch it pass**
 
-Run: `cargo test --bin chrome-host-app git::error`
+Run: `cargo test --bin hitch git::error`
 
 Expected: PASS.
 
@@ -2018,7 +2018,7 @@ regenerate any you doubt with that command rather than by hand.
 
 - [ ] **Step 32: Run the test and watch it fail**
 
-Run: `cargo test --bin chrome-host-app git::util`
+Run: `cargo test --bin hitch git::util`
 
 Expected: FAIL — compile error, one per helper referenced (plus an
 `unused import: super::*` warning, since nothing resolves through the glob yet).
@@ -2034,7 +2034,7 @@ error[E0425]: cannot find function `utc_stamp` in this scope
 error[E0425]: cannot find function `b64_nopad` in this scope
 error[E0425]: cannot find function `bytes_to_path` in this scope
 
-error: could not compile `chrome-host-app` (bin "chrome-host-app" test) due to 19 previous errors
+error: could not compile `hitch` (bin "hitch" test) due to 19 previous errors
 ```
 
 - [ ] **Step 33: Implement the helpers**
@@ -2144,7 +2144,7 @@ on Windows alike — no platform gets a `cfg`-gated unused-import warning.
 
 - [ ] **Step 34: Run the test and watch it pass**
 
-Run: `cargo test --bin chrome-host-app git::util`
+Run: `cargo test --bin hitch git::util`
 
 Expected: PASS.
 

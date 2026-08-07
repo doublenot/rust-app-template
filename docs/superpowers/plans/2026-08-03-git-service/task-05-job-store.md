@@ -290,9 +290,9 @@ touch different lines and do not collide.)
 - [ ] **Step 2: Run the test and watch it fail**
 
 This crate is a binary — there is no `--lib` target, and `src/bin/gen_icons.rs` is a
-second binary — so unit tests run in the `chrome-host-app` bin target.
+second binary — so unit tests run in the `hitch` bin target.
 
-Run: `cargo test --bin chrome-host-app git::jobs`
+Run: `cargo test --bin hitch git::jobs`
 
 Expected: FAIL — compile errors, two distinct ones:
 
@@ -357,7 +357,7 @@ pub fn random_host_instance() -> String {
 
 - [ ] **Step 4: Run the test and watch it pass**
 
-Run: `cargo test --bin chrome-host-app git::jobs`
+Run: `cargo test --bin hitch git::jobs`
 
 Expected: PASS — `test result: ok. 2 passed`. Warnings about unused imports
 (`AbortReason`, `GitError`, `NowFn`, `system_now`, `BTreeMap`, `VecDeque`, the atomics,
@@ -428,7 +428,7 @@ test pins `as_str()` and the serde rename together — two angles on one behavio
 
 - [ ] **Step 7: Run the test and watch it fail**
 
-Run: `cargo test --bin chrome-host-app git::jobs::tests::the_wire_vocabulary_is_fixed`
+Run: `cargo test --bin hitch git::jobs::tests::the_wire_vocabulary_is_fixed`
 
 Expected: FAIL — compile errors:
 
@@ -542,7 +542,7 @@ impl Phase {
 
 - [ ] **Step 9: Run the test and watch it pass**
 
-Run: `cargo test --bin chrome-host-app git::jobs`
+Run: `cargo test --bin hitch git::jobs`
 
 Expected: PASS — `test result: ok. 3 passed`.
 
@@ -582,7 +582,7 @@ Add to `mod tests`:
 
 - [ ] **Step 12: Run the test and watch it fail**
 
-Run: `cargo test --bin chrome-host-app git::jobs::tests::abort_flag_keeps_the_first_reason`
+Run: `cargo test --bin hitch git::jobs::tests::abort_flag_keeps_the_first_reason`
 
 Expected: FAIL —
 
@@ -644,7 +644,7 @@ so it keeps stating "the initial value is `AbortReason::None`", not "zero".
 
 - [ ] **Step 14: Run the test and watch it pass**
 
-Run: `cargo test --bin chrome-host-app git::jobs`
+Run: `cargo test --bin hitch git::jobs`
 
 Expected: PASS — `test result: ok. 4 passed`.
 
@@ -801,7 +801,7 @@ Add the clock helper and `test_slot` at the **top** of `mod tests`, immediately 
 
 - [ ] **Step 17: Run the tests and watch them fail**
 
-Run: `cargo test --bin chrome-host-app git::jobs`
+Run: `cargo test --bin hitch git::jobs`
 
 Expected: FAIL — compile errors:
 
@@ -1041,7 +1041,7 @@ section.
 
 - [ ] **Step 19: Run the tests and watch them pass**
 
-Run: `cargo test --bin chrome-host-app git::jobs`
+Run: `cargo test --bin hitch git::jobs`
 
 Expected: PASS — `test result: ok. 7 passed`.
 
@@ -1103,7 +1103,7 @@ Add to `mod tests`:
 
 - [ ] **Step 22: Run the test and watch it fail**
 
-Run: `cargo test --bin chrome-host-app git::jobs::tests::progress_is_throttled_but_percent_changes_always_land`
+Run: `cargo test --bin hitch git::jobs::tests::progress_is_throttled_but_percent_changes_always_land`
 
 Expected: FAIL —
 
@@ -1159,7 +1159,7 @@ so `same_percent` is false however the transfer starts.
 
 - [ ] **Step 24: Run the test and watch it pass**
 
-Run: `cargo test --bin chrome-host-app git::jobs`
+Run: `cargo test --bin hitch git::jobs`
 
 Expected: PASS — `test result: ok. 8 passed`.
 
@@ -1375,7 +1375,7 @@ directly under `use super::*;`, the helpers after `test_slot`, the tests at the 
 
 - [ ] **Step 27: Run the tests and watch them fail**
 
-Run: `cargo test --bin chrome-host-app git::jobs`
+Run: `cargo test --bin hitch git::jobs`
 
 Expected: FAIL — compile errors:
 
@@ -1580,7 +1580,7 @@ Step 53 and the signature is part of the contract from the start.
 
 - [ ] **Step 29: Run the tests and watch them pass**
 
-Run: `cargo test --bin chrome-host-app git::jobs`
+Run: `cargo test --bin hitch git::jobs`
 
 Expected: PASS — `test result: ok. 11 passed`. `lease_is_released_when_the_worker_panics`
 prints a `thread '<unnamed>' panicked at ...: worker exploded` line plus a note about
@@ -1679,7 +1679,7 @@ Add to `mod tests`:
 
 - [ ] **Step 32: Run the tests and watch them fail**
 
-Run: `cargo test --bin chrome-host-app git::jobs::tests::replay`
+Run: `cargo test --bin hitch git::jobs::tests::replay`
 
 These compile — there is no index yet, so the second `admit` for `"r1"` falls through to
 the busy check.
@@ -1759,7 +1759,7 @@ the end of `admit` with:
 
 - [ ] **Step 34: Run the tests and watch them pass**
 
-Run: `cargo test --bin chrome-host-app git::jobs`
+Run: `cargo test --bin hitch git::jobs`
 
 Expected: PASS — `test result: ok. 13 passed`.
 
@@ -1816,7 +1816,7 @@ Add it after `start_gated`, and the test at the bottom:
 
 - [ ] **Step 37: Run the test and watch it fail**
 
-Run: `cargo test --bin chrome-host-app git::jobs::tests::lookup_rejects_a_foreign_host_instance`
+Run: `cargo test --bin hitch git::jobs::tests::lookup_rejects_a_foreign_host_instance`
 
 Expected: FAIL —
 
@@ -1848,7 +1848,7 @@ Add to `impl JobStore`, directly after `get`:
 
 - [ ] **Step 39: Run the test and watch it pass**
 
-Run: `cargo test --bin chrome-host-app git::jobs`
+Run: `cargo test --bin hitch git::jobs`
 
 Expected: PASS — `test result: ok. 14 passed`.
 
@@ -1917,7 +1917,7 @@ Add the `ids` helper after `finish_now`, and the test at the bottom:
 
 - [ ] **Step 42: Run the test and watch it fail**
 
-Run: `cargo test --bin chrome-host-app git::jobs::tests::list_is_newest_first_and_honours_the_filter`
+Run: `cargo test --bin hitch git::jobs::tests::list_is_newest_first_and_honours_the_filter`
 
 Expected: FAIL —
 
@@ -1977,7 +1977,7 @@ and `list` in `impl JobStore`, between `lookup` and `busy`:
 
 - [ ] **Step 44: Run the test and watch it pass**
 
-Run: `cargo test --bin chrome-host-app git::jobs`
+Run: `cargo test --bin hitch git::jobs`
 
 Expected: PASS — `test result: ok. 15 passed`.
 
@@ -2080,7 +2080,7 @@ Add to `mod tests`:
 
 - [ ] **Step 47: Run the tests and watch them fail**
 
-Run: `cargo test --bin chrome-host-app git::jobs`
+Run: `cargo test --bin hitch git::jobs`
 
 They compile — nothing is ever evicted, so the counts are wrong.
 
@@ -2240,7 +2240,7 @@ Wire it into the three call sites.
 
 - [ ] **Step 49: Run the tests and watch them pass**
 
-Run: `cargo test --bin chrome-host-app git::jobs`
+Run: `cargo test --bin hitch git::jobs`
 
 Expected: PASS — `test result: ok. 18 passed`.
 
@@ -2307,7 +2307,7 @@ Add to `mod tests`:
 
 - [ ] **Step 52: Run the tests and watch them fail**
 
-Run: `cargo test --bin chrome-host-app git::jobs`
+Run: `cargo test --bin hitch git::jobs`
 
 Expected: FAIL —
 
@@ -2375,7 +2375,7 @@ released before any slot is touched — the same nesting discipline as everywher
 
 - [ ] **Step 54: Run the tests and watch them pass**
 
-Run: `cargo test --bin chrome-host-app git::jobs`
+Run: `cargo test --bin hitch git::jobs`
 
 Expected: PASS — `test result: ok. 20 passed`.
 
@@ -2421,7 +2421,7 @@ Add to `mod tests`:
 
 - [ ] **Step 57: Run the test and watch it fail**
 
-Run: `cargo test --bin chrome-host-app git::jobs::tests::forget_repo_drops_terminal_records_and_leaves_a_live_job_alone`
+Run: `cargo test --bin hitch git::jobs::tests::forget_repo_drops_terminal_records_and_leaves_a_live_job_alone`
 
 Expected: FAIL —
 
@@ -2463,7 +2463,7 @@ Add to `impl JobStore`, after `abort_all` — it is the last method in the block
 
 - [ ] **Step 59: Run the test and watch it pass**
 
-Run: `cargo test --bin chrome-host-app git::jobs`
+Run: `cargo test --bin hitch git::jobs`
 
 Expected: PASS — `test result: ok. 21 passed`.
 

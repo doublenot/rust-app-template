@@ -215,9 +215,9 @@ whenever `remote` is `Some` and the credential is not `CredentialSpec::None`.
 
 **Orientation for the engineer.**
 
-`chrome-host-app` is a single binary with **no lib target** — unit tests live in the binary, in a
+`hitch` is a single binary with **no lib target** — unit tests live in the binary, in a
 `#[cfg(test)] mod tests` at the bottom of the file they test, and the test filter is a module path:
-`cargo test --bin chrome-host-app git::registry::tests::<name>`. Never `cargo test --lib`.
+`cargo test --bin hitch git::registry::tests::<name>`. Never `cargo test --lib`.
 `tempfile` is already a dev-dependency; `serde_json` and `serde` are normal dependencies.
 
 House rules that will be checked in review: comments explain **why** (the invariant, the race, the
@@ -345,7 +345,7 @@ the top, alphabetically (after `pub mod error;`).
 
 - [ ] **Step 2: Run the tests and watch them fail**
 
-Run: `cargo test --bin chrome-host-app git::registry::tests`
+Run: `cargo test --bin hitch git::registry::tests`
 
 Expected: FAIL to compile — the types do not exist yet.
 
@@ -523,7 +523,7 @@ pub struct AuthorSpec {
 
 - [ ] **Step 4: Run the tests and watch them pass**
 
-Run: `cargo test --bin chrome-host-app git::registry::tests`
+Run: `cargo test --bin hitch git::registry::tests`
 
 Expected: PASS — `4 passed`.
 
@@ -582,7 +582,7 @@ Append inside `mod tests` in `src/git/registry.rs`:
 
 - [ ] **Step 7: Run the tests and watch them fail**
 
-Run: `cargo test --bin chrome-host-app git::registry::tests::valid_ids_are_lowercase_and_filesystem_safe`
+Run: `cargo test --bin hitch git::registry::tests::valid_ids_are_lowercase_and_filesystem_safe`
 
 Expected: FAIL to compile.
 
@@ -652,7 +652,7 @@ pub fn validate_id(id: &str) -> Result<(), GitError> {
 
 - [ ] **Step 9: Run the tests and watch them pass**
 
-Run: `cargo test --bin chrome-host-app git::registry::tests`
+Run: `cargo test --bin hitch git::registry::tests`
 
 Expected: PASS — `6 passed`.
 
@@ -767,7 +767,7 @@ Append inside `mod tests`:
 
 - [ ] **Step 12: Run the tests and watch them fail**
 
-Run: `cargo test --bin chrome-host-app git::registry::tests::remote_host_is_lowercased_and_scp_aware`
+Run: `cargo test --bin hitch git::registry::tests::remote_host_is_lowercased_and_scp_aware`
 
 Expected: FAIL to compile.
 
@@ -929,7 +929,7 @@ pub fn validate_remote(remote: &str, allow_http: bool) -> Result<(), GitError> {
 
 - [ ] **Step 14: Run the tests and watch them pass**
 
-Run: `cargo test --bin chrome-host-app git::registry::tests`
+Run: `cargo test --bin hitch git::registry::tests`
 
 Expected: PASS — `9 passed`.
 
@@ -1058,7 +1058,7 @@ Append inside `mod tests`:
 
 - [ ] **Step 17: Run the tests and watch them fail**
 
-Run: `cargo test --bin chrome-host-app git::registry::tests::validate_def_reports_the_offending_field`
+Run: `cargo test --bin hitch git::registry::tests::validate_def_reports_the_offending_field`
 
 Expected: FAIL to compile.
 
@@ -1211,7 +1211,7 @@ pub fn validate_def(def: &RepoDef, d: &RegistryDefaults) -> Result<(), GitError>
 
 - [ ] **Step 19: Run the tests and watch them pass**
 
-Run: `cargo test --bin chrome-host-app git::registry::tests`
+Run: `cargo test --bin hitch git::registry::tests`
 
 Expected: PASS — `14 passed`.
 
@@ -1320,7 +1320,7 @@ Append inside `mod tests`:
 
 - [ ] **Step 22: Run the tests and watch them fail**
 
-Run: `cargo test --bin chrome-host-app git::registry::tests::redaction_never_emits_a_secret`
+Run: `cargo test --bin hitch git::registry::tests::redaction_never_emits_a_secret`
 
 Expected: FAIL to compile.
 
@@ -1447,7 +1447,7 @@ impl RepoView {
 
 - [ ] **Step 24: Run the tests and watch them pass**
 
-Run: `cargo test --bin chrome-host-app git::registry::tests`
+Run: `cargo test --bin hitch git::registry::tests`
 
 Expected: PASS — `17 passed`.
 
@@ -1554,7 +1554,7 @@ Append inside `mod tests`:
 
 - [ ] **Step 27: Run the tests and watch them fail**
 
-Run: `cargo test --bin chrome-host-app git::registry::tests::save_writes_the_token_and_leaves_no_temp_file`
+Run: `cargo test --bin hitch git::registry::tests::save_writes_the_token_and_leaves_no_temp_file`
 
 Expected: FAIL to compile.
 
@@ -1689,7 +1689,7 @@ pub(crate) fn save(path: &Path, file: &RegistryFile) -> Result<(), GitError> {
 
 - [ ] **Step 29: Run the tests and watch them pass**
 
-Run: `cargo test --bin chrome-host-app git::registry::tests`
+Run: `cargo test --bin hitch git::registry::tests`
 
 Expected: PASS — `22 passed` (21 on Windows, where the mode test is `#[cfg(unix)]`).
 
@@ -1910,7 +1910,7 @@ Append inside `mod tests`:
 
 - [ ] **Step 32: Run the tests and watch them fail**
 
-Run: `cargo test --bin chrome-host-app git::registry::tests::a_missing_file_loads_an_empty_writable_registry`
+Run: `cargo test --bin hitch git::registry::tests::a_missing_file_loads_an_empty_writable_registry`
 
 Expected: FAIL to compile.
 
@@ -2517,7 +2517,7 @@ fn normalise_def(def: &mut RepoDef, d: &RegistryDefaults, now: u64) -> Vec<Warni
 
 - [ ] **Step 34: Run the tests and watch them pass**
 
-Run: `cargo test --bin chrome-host-app git::registry::tests`
+Run: `cargo test --bin hitch git::registry::tests`
 
 Expected: PASS — `32 passed` (30 on Windows, where the two `#[cfg(unix)]` mode tests are absent).
 
@@ -2639,7 +2639,7 @@ Append inside `mod tests`:
 
 - [ ] **Step 37: Run the tests and watch them fail**
 
-Run: `cargo test --bin chrome-host-app git::registry::tests::put_creates_then_updates_and_persists`
+Run: `cargo test --bin hitch git::registry::tests::put_creates_then_updates_and_persists`
 
 Expected: FAIL to compile.
 
@@ -2714,7 +2714,7 @@ wrong, and step 43 fixes it.
 
 - [ ] **Step 39: Run the tests and watch them pass**
 
-Run: `cargo test --bin chrome-host-app git::registry::tests`
+Run: `cargo test --bin hitch git::registry::tests`
 
 Expected: PASS — `37 passed` (35 on Windows).
 
@@ -2843,7 +2843,7 @@ Append inside `mod tests`:
 
 - [ ] **Step 42: Run the tests and watch two of them fail**
 
-Run: `cargo test --bin chrome-host-app git::registry::tests`
+Run: `cargo test --bin hitch git::registry::tests`
 
 Expected: FAIL — three of the five new tests pass already (binding and clamping are
 `normalise_def`'s job and landed in step 33); the two that describe credential *carry-forward*
@@ -2930,7 +2930,7 @@ Insert into `Registry::put`, between `let existing = …;` and `let now = now_ms
 
 - [ ] **Step 44: Run the tests and watch them pass**
 
-Run: `cargo test --bin chrome-host-app git::registry::tests`
+Run: `cargo test --bin hitch git::registry::tests`
 
 Expected: PASS — `42 passed` (40 on Windows).
 
@@ -2985,7 +2985,7 @@ Append inside `mod tests`:
 
 - [ ] **Step 47: Run the tests and watch them fail**
 
-Run: `cargo test --bin chrome-host-app git::registry::tests::remove_deletes_the_entry_and_persists`
+Run: `cargo test --bin hitch git::registry::tests::remove_deletes_the_entry_and_persists`
 
 Expected: FAIL to compile.
 
@@ -3020,7 +3020,7 @@ Add inside `impl Registry`, after `put`:
 
 - [ ] **Step 49: Run the tests and watch them pass**
 
-Run: `cargo test --bin chrome-host-app git::registry::tests`
+Run: `cargo test --bin hitch git::registry::tests`
 
 Expected: PASS — `44 passed` (42 on Windows).
 
@@ -3129,7 +3129,7 @@ Then add `pub mod state;` to `src/git/mod.rs`, alphabetically after `pub mod sec
 
 - [ ] **Step 52: Run the tests and watch them fail**
 
-Run: `cargo test --bin chrome-host-app git::state::tests`
+Run: `cargo test --bin hitch git::state::tests`
 
 Expected: FAIL to compile.
 
@@ -3273,7 +3273,7 @@ impl StateStore {
 
 - [ ] **Step 54: Run the tests and watch them pass**
 
-Run: `cargo test --bin chrome-host-app git::state::tests`
+Run: `cargo test --bin hitch git::state::tests`
 
 Expected: PASS — `4 passed`.
 
@@ -3366,7 +3366,7 @@ Append inside `git::state`'s `mod tests`:
 
 - [ ] **Step 57: Run the tests and watch them fail**
 
-Run: `cargo test --bin chrome-host-app git::state::tests::recorded_state_survives_a_reload`
+Run: `cargo test --bin hitch git::state::tests::recorded_state_survives_a_reload`
 
 Expected: FAIL to compile.
 
@@ -3438,7 +3438,7 @@ fn persist(path: &Path, file: &StateFile) -> std::io::Result<()> {
 
 - [ ] **Step 59: Run the tests and watch them pass**
 
-Run: `cargo test --bin chrome-host-app git::state::tests`
+Run: `cargo test --bin hitch git::state::tests`
 
 Expected: PASS — `9 passed` (8 on Windows).
 

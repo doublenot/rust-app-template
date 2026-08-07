@@ -1,4 +1,7 @@
-# Chrome Host App
+# Hitch
+
+**Ride the Chrome you already have.** A native Rust shell for your web app —
+no bundled browser engine, no embedded webview.
 
 ## 1. What this is
 
@@ -294,8 +297,8 @@ cargo build --release   # optimized binary in target/release/
 cargo run               # debug build + launch (development)
 ```
 
-The release binary lands at `target/release/chrome-host-app`
-(`chrome-host-app.exe` on Windows) and embeds `app.toml`, the internal
+The release binary lands at `target/release/hitch`
+(`hitch.exe` on Windows) and embeds `app.toml`, the internal
 pages, and the icon — it is self-contained apart from Google Chrome itself
 and, on Linux, the tray runtime library.
 
@@ -944,14 +947,14 @@ already matches HEAD is a no-op, a push that already landed reports
 
   ```bash
   # No credentials needed: the vendored-TLS canary and the credential retry cap.
-  cargo test --bin chrome-host-app git::tests:: -- --ignored --nocapture
+  cargo test --bin hitch git::tests:: -- --ignored --nocapture
 
   # The credentialed pair, against a scratch repository you own.
   GIT_TEST_HTTPS_URL=https://github.com/you/scratch.git \
   GIT_TEST_TOKEN=github_pat_... \
   GIT_TEST_SSH_URL=git@github.com:you/scratch.git \
   GIT_TEST_SSH_KEY=$HOME/.ssh/id_ed25519 \
-  cargo test --bin chrome-host-app git::tests:: -- --ignored --nocapture
+  cargo test --bin hitch git::tests:: -- --ignored --nocapture
   ```
 
   The scratch repository must be non-empty and have a `main` branch; the HTTPS

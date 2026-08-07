@@ -30,8 +30,8 @@ the correct behaviour and a comment says so; `cargo fmt` and
 `cargo clippy --all-targets -- -D warnings` clean at every commit.
 
 **This crate has no `--lib` target** (`src/main.rs` is the only entry point and
-`src/bin/gen_icons.rs` is a second binary), so unit tests run in the `chrome-host-app` bin
-target: `cargo test --bin chrome-host-app <filter>`.
+`src/bin/gen_icons.rs` is a second binary), so unit tests run in the `hitch` bin
+target: `cargo test --bin hitch <filter>`.
 
 **No `#![allow(dead_code)]` of its own is needed anywhere in this task.** `src/git/mod.rs` carries
 `#![allow(dead_code)]` and `#![allow(clippy::result_large_err)]` from task 3, and lint levels
@@ -248,7 +248,7 @@ task 8. Everything else is fully qualified so nothing new has to be imported.
 
 - [ ] **Step 2: Run the tests and watch them fail**
 
-Run: `cargo test --bin chrome-host-app git::ops::tests::settings_copy_in git::ops::tests::sync_settings_without`
+Run: `cargo test --bin hitch git::ops::tests::settings_copy_in git::ops::tests::sync_settings_without`
 
 Expected: FAIL to compile — the function does not exist yet:
 
@@ -259,7 +259,7 @@ error[E0425]: cannot find function `settings_copy_in` in this scope
 NNN |         let hash = settings_copy_in(&fx.job.ctx, &mut ignored_outcome()).expect("copy in");
     |                    ^^^^^^^^^^^^^^^^ not found in this scope
 
-error: could not compile `chrome-host-app` (bin "chrome-host-app" test) due to 3 previous errors
+error: could not compile `hitch` (bin "hitch" test) due to 3 previous errors
 ```
 
 - [ ] **Step 3: Implement `settings_copy_in` and its three helpers**
@@ -421,7 +421,7 @@ pub fn settings_copy_in(ctx: &OpCtx, out: &mut OpOutcome) -> Result<Option<u64>,
 
 - [ ] **Step 4: Run the tests and watch them pass**
 
-Run: `cargo test --bin chrome-host-app git::ops::tests::settings_copy_in git::ops::tests::sync_settings_without`
+Run: `cargo test --bin hitch git::ops::tests::settings_copy_in git::ops::tests::sync_settings_without`
 
 Expected: PASS — `test result: ok. 3 passed; 0 failed`.
 
@@ -583,7 +583,7 @@ neither.
 
 - [ ] **Step 7: Run the tests and watch them fail**
 
-Run: `cargo test --bin chrome-host-app git::ops::tests::settings git::ops::tests::valid git::ops::tests::rejected git::ops::tests::unchanged git::ops::tests::unparseable git::ops::tests::apply_back`
+Run: `cargo test --bin hitch git::ops::tests::settings git::ops::tests::valid git::ops::tests::rejected git::ops::tests::unchanged git::ops::tests::unparseable git::ops::tests::apply_back`
 
 Expected: FAIL to compile:
 
@@ -594,7 +594,7 @@ error[E0425]: cannot find function `settings_apply_back` in this scope
 NNN |         settings_apply_back(&fx.job.ctx, before, &mut out).expect("apply back");
     |         ^^^^^^^^^^^^^^^^^^^ not found in this scope
 
-error: could not compile `chrome-host-app` (bin "chrome-host-app" test) due to 6 previous errors
+error: could not compile `hitch` (bin "hitch" test) due to 6 previous errors
 ```
 
 - [ ] **Step 8: Implement `settings_apply_back` and `heal_tree_copy`**
@@ -688,7 +688,7 @@ fn heal_tree_copy(ctx: &OpCtx, sc: &SettingsCtx, out: &mut OpOutcome) -> Result<
 
 - [ ] **Step 9: Run the tests and watch them pass**
 
-Run: `cargo test --bin chrome-host-app git::ops::tests::settings git::ops::tests::valid git::ops::tests::rejected git::ops::tests::unchanged git::ops::tests::unparseable git::ops::tests::apply_back`
+Run: `cargo test --bin hitch git::ops::tests::settings git::ops::tests::valid git::ops::tests::rejected git::ops::tests::unchanged git::ops::tests::unparseable git::ops::tests::apply_back`
 
 Expected: PASS — `test result: ok. 9 passed; 0 failed` (the three from Cycle A plus these six).
 
@@ -844,7 +844,7 @@ merge. Append to `mod tests` in `src/git/ops.rs`:
 
 - [ ] **Step 12: Run the tests and watch them fail**
 
-Run: `cargo test --bin chrome-host-app git::ops::tests::sync_adopts git::ops::tests::sync_survives git::ops::tests::first_sync`
+Run: `cargo test --bin hitch git::ops::tests::sync_adopts git::ops::tests::sync_survives git::ops::tests::first_sync`
 
 Expected: FAIL — three assertion failures, because `sync` does not call either helper yet:
 
@@ -929,7 +929,7 @@ write-back — nothing could have changed the tree copy without a fetch.
 
 - [ ] **Step 14: Run the tests and watch them pass**
 
-Run: `cargo test --bin chrome-host-app git::`
+Run: `cargo test --bin hitch git::`
 
 Expected: PASS — every `git::ops` and `git::merge` test is green, including task 8's
 `sync_commits_and_publishes_in_one_pass` and `sync_without_a_remote_only_commits` (both use repos
@@ -1092,7 +1092,7 @@ reports `cannot find type X in this scope` for any of them, add that one import
 
 - [ ] **Step 17: Run the tests and read the result carefully**
 
-Run: `cargo test --bin chrome-host-app git::tests::a_settings_change git::tests::a_sync_that_changed -- --nocapture`
+Run: `cargo test --bin hitch git::tests::a_settings_change git::tests::a_sync_that_changed -- --nocapture`
 
 This is a characterization test over task 9's `after_job`, so there are two legitimate outcomes
 and they need different responses.
@@ -1155,7 +1155,7 @@ Expected: two hits — the `decide_restart` guard and the `reason` selection.
 
 - [ ] **Step 19: Run the tests and watch them pass**
 
-Run: `cargo test --bin chrome-host-app git::tests::a_settings_change git::tests::a_sync_that_changed`
+Run: `cargo test --bin hitch git::tests::a_settings_change git::tests::a_sync_that_changed`
 
 Expected: PASS — `test result: ok. 2 passed; 0 failed`.
 

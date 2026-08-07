@@ -13,7 +13,7 @@
 ## Global Constraints
 
 - Rust stable, `edition = "2021"`, `rust-version = "1.85"`.
-- Package/binary name: `chrome-host-app`. Config file: `app.toml` at repo root, embedded via `include_str!`.
+- Package/binary name: `hitch`. Config file: `app.toml` at repo root, embedded via `include_str!`.
 - Google Chrome only — no Chromium/Edge/Brave fallback. Download URL: `https://www.google.com/chrome/`.
 - Internal server binds `127.0.0.1` only; mutating endpoints require header `x-host-token` matching a per-launch random token.
 - Settings env var contract: `APP_SETTING_<KEY uppercased>` per field + `APP_SETTINGS_FILE=<path to settings.json>`.
@@ -32,13 +32,13 @@
 
 **Interfaces:**
 - Consumes: nothing (first task).
-- Produces: a compiling crate named `chrome-host-app`; `app.toml` in placeholder mode (empty `url`, no `[server]`) that later tasks embed.
+- Produces: a compiling crate named `hitch`; `app.toml` in placeholder mode (empty `url`, no `[server]`) that later tasks embed.
 
 - [ ] **Step 1: Write `Cargo.toml`**
 
 ```toml
 [package]
-name = "chrome-host-app"
+name = "hitch"
 version = "0.1.0"
 edition = "2021"
 rust-version = "1.85"
@@ -68,8 +68,8 @@ winreg = "0.55"
 tempfile = "3"
 
 [package.metadata.packager]
-product-name = "Chrome Host App"
-identifier = "com.example.chromehost"
+product-name = "Hitch"
+identifier = "com.example.hitch"
 icons = ["icons/icon.png"]
 ```
 
@@ -78,12 +78,12 @@ Note: `rfd`'s `gtk3` feature only affects Linux; on Windows/macOS it uses native
 - [ ] **Step 2: Write `app.toml` (placeholder mode — the file app developers edit)**
 
 ```toml
-# ── Chrome Host App configuration ─────────────────────────────
+# ── Hitch configuration ─────────────────────────────
 # Edit this file, then `cargo build`. Full reference in README.md.
 
 [app]
-name = "Chrome Host App"                # window title, tray tooltip
-identifier = "com.example.chromehost"   # reverse-domain; names the app-data dir
+name = "Hitch"                # window title, tray tooltip
+identifier = "com.example.hitch"   # reverse-domain; names the app-data dir
 url = ""                                # target URL; empty → built-in placeholder page
 
 # Uncomment to start a local server before showing the app.
@@ -123,7 +123,7 @@ items = []                              # e.g. [{ id = "docs", label = "Docs", o
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 fn main() {
-    println!("chrome-host-app scaffold");
+    println!("hitch scaffold");
 }
 ```
 
@@ -136,7 +136,7 @@ Expected: success (warnings acceptable only in this task).
 
 ```bash
 git add Cargo.toml Cargo.lock app.toml .gitignore src/main.rs
-git commit -m "feat: scaffold chrome-host-app crate with default app.toml"
+git commit -m "feat: scaffold hitch crate with default app.toml"
 ```
 
 ---
@@ -544,7 +544,7 @@ Also change `src/main.rs` to:
 mod config;
 
 fn main() {
-    println!("chrome-host-app scaffold");
+    println!("hitch scaffold");
 }
 ```
 
@@ -2576,7 +2576,7 @@ Expected: all tests from Tasks 2–7 still PASS.
 - [ ] **Step 4: Manual smoke test (requires Chrome + a desktop session)**
 
 Run: `cargo run`
-Expected: Chrome app-mode window opens showing "Chrome Host App is ready to be configured"; tray icon appears with Restart App / Quit; Quit closes window and exits; a second `cargo run` while one is running shows "already running". Record what you observed in the commit body. If no desktop session is available, state that explicitly in the commit body instead.
+Expected: Chrome app-mode window opens showing "Hitch is ready to be configured"; tray icon appears with Restart App / Quit; Quit closes window and exits; a second `cargo run` while one is running shows "already running". Record what you observed in the commit body. If no desktop session is available, state that explicitly in the commit body instead.
 
 - [ ] **Step 5: Commit**
 

@@ -31,22 +31,23 @@ references below (§2, §5.4, …) point into it.
   `rust-version = "1.85"` and `edition = "2021"` are unchanged.
 - **The binary name is never hardcoded.** This repository is a template. Derive
   it from `cargo metadata --no-deps … .packages[0].default_run`, which returns
-  `chrome-host-app` and is the same key `cargo build` uses to disambiguate the
+  `hitch` and is the same key `cargo build` uses to disambiguate the
   two bin targets (`gen_icons` is the other).
 - **The four artifact names** (§2), which every glob and count below depends on:
   | format | filename | directory |
   |---|---|---|
-  | deb | `chrome-host-app_0.1.0_amd64.deb` | `target/release/` |
-  | AppImage | `chrome-host-app_0.1.0_x86_64.AppImage` | `target/release/` |
-  | NSIS | `chrome-host-app_0.1.0_x64-setup.exe` | `target/release/` |
-  | dmg | `Chrome Host App_0.1.0_universal.dmg` | `target/universal-apple-darwin/release/` |
+  | deb | `hitch_0.1.0_amd64.deb` | `target/release/` |
+  | AppImage | `hitch_0.1.0_x86_64.AppImage` | `target/release/` |
+  | NSIS | `hitch_0.1.0_x64-setup.exe` | `target/release/` |
+  | dmg | `Hitch_0.1.0_universal.dmg` | `target/universal-apple-darwin/release/` |
 
-  The `.dmg` is the only one named from `product-name`, so the only one with
-  **spaces**, and under a universal build the only one outside `target/release/`.
-  Quote every expansion that touches it — and note that quoting is necessary but
-  not sufficient: the staging step renames it to `Chrome-Host-App_…` because
-  GitHub rewrites spaces in a release asset's filename, which would otherwise
-  leave `SHA256SUMS` naming a file no downloader has (spec §5.7).
+  The `.dmg` is the only one named from `product-name` and, under a universal
+  build, the only one outside `target/release/`. It is also the only one that can
+  contain **spaces** — it did until the crate was renamed from `Chrome Host App`
+  to `Hitch` (spec §0.1). Quote every expansion that touches it, and note that
+  quoting is necessary but not sufficient: the staging step strips spaces because
+  GitHub rewrites them in a release asset's filename, which would otherwise leave
+  `SHA256SUMS` naming a file no downloader has (spec §5.7).
 - **`scripts/*.sh` must be committed executable** (`git update-index --chmod=+x`
   if the working filesystem loses the bit).
 - **Comments explain why, not what**, matching the density of `src/supervisor.rs`
@@ -610,15 +611,17 @@ jobs:
             exit 1; }
           mkdir -p dist
           # Spaces are stripped here, before SHA256SUMS is computed over dist/.
-          # GitHub rewrites spaces in a release asset's filename -- it uploaded
-          # "Chrome Host App_0.1.0_universal.dmg" as
-          # "Chrome.Host.App_0.1.0_universal.dmg" -- so the name a user downloads
-          # would not be the name the manifest records, and `sha256sum -c` reports
-          # "No such file or directory" for it. With the --ignore-missing the
-          # README recommends it is worse: the check passes while silently never
-          # verifying the .dmg. Only the .dmg is affected, being the one format
-          # named from product-name. The app's display name is untouched; this
-          # renames the file only.
+          # GitHub rewrites spaces in a release asset's filename. Measured on the
+          # v0.1.0 release, when product-name was still two words: the .dmg
+          # uploaded as "Chrome.Host.App_0.1.0_universal.dmg" while SHA256SUMS
+          # recorded the name cargo-packager had produced, so `sha256sum -c` said
+          # "No such file or directory". With the --ignore-missing the README
+          # recommends it is worse -- the check passes while silently never
+          # verifying the .dmg.
+          #
+          # The current product-name has no space, so this is dormant. Keep it
+          # anyway: product-name is among the first things a fork changes, and
+          # only the .dmg is exposed, being the one format named from it.
           for f in "${found[@]}"; do
             base=$(basename -- "$f")
             cp -- "$f" "dist/${base// /-}"
@@ -722,8 +725,8 @@ bash -c '
 '
 ```
 
-Expected: two `found:` lines naming `chrome-host-app_<version>_amd64.deb` and
-`chrome-host-app_<version>_x86_64.AppImage`, then `staging logic OK`.
+Expected: two `found:` lines naming `hitch_<version>_amd64.deb` and
+`hitch_<version>_x86_64.AppImage`, then `staging logic OK`.
 
 (Requires `cargo install cargo-packager --version 0.11.8 --locked` once.)
 
@@ -732,10 +735,10 @@ Expected: two `found:` lines naming `chrome-host-app_<version>_amd64.deb` and
 ```bash
 bash -c '
   t=$(mktemp -d) && cd "$t" && mkdir dist
-  echo a > "dist/chrome-host-app_0.1.0_amd64.deb"
-  echo b > "dist/chrome-host-app_0.1.0_x86_64.AppImage"
-  echo c > "dist/chrome-host-app_0.1.0_x64-setup.exe"
-  echo d > "dist/Chrome Host App_0.1.0_universal.dmg"
+  echo a > "dist/hitch_0.1.0_amd64.deb"
+  echo b > "dist/hitch_0.1.0_x86_64.AppImage"
+  echo c > "dist/hitch_0.1.0_x64-setup.exe"
+  echo d > "dist/Hitch_0.1.0_universal.dmg"
   ( cd dist && sha256sum -- * ) > SHA256SUMS
   mv SHA256SUMS dist/
   [ "$(wc -l < dist/SHA256SUMS)" -eq 4 ] || { echo "FAIL: wrong entry count"; exit 1; }
@@ -1003,10 +1006,10 @@ exactly five files:
 gh release view v0.1.0 --json isDraft,assets -q '{draft: .isDraft, assets: [.assets[].name]}'
 ```
 
-- `chrome-host-app_0.1.0_amd64.deb`
-- `chrome-host-app_0.1.0_x86_64.AppImage`
-- `Chrome Host App_0.1.0_universal.dmg`
-- `chrome-host-app_0.1.0_x64-setup.exe`
+- `hitch_0.1.0_amd64.deb`
+- `hitch_0.1.0_x86_64.AppImage`
+- `Hitch_0.1.0_universal.dmg`
+- `hitch_0.1.0_x64-setup.exe`
 - `SHA256SUMS`
 
 - [ ] **Step 5: Verify the checksums round-trip from a real download**

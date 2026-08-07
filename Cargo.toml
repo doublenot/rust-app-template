@@ -1,10 +1,10 @@
 [package]
-name = "chrome-host-app"
+name = "hitch"
 version = "0.1.1"
 edition = "2021"
 rust-version = "1.85"
-default-run = "chrome-host-app"
-description = "Desktop app template: Rust host rendering a configured URL in Google Chrome"
+default-run = "hitch"
+description = "Desktop app template: a native Rust shell that renders your web app in the Chrome you already have"
 license = "MIT"
 
 [dependencies]
@@ -45,8 +45,8 @@ winreg = "0.55"
 tempfile = "3"
 
 [package.metadata.packager]
-product-name = "Chrome Host App"
-identifier = "com.example.chromehost"
+product-name = "Hitch"
+identifier = "com.example.hitch"
 icons = ["icons/icon.png"]
 # Without this, cargo-packager packages EVERY bin target in the crate, and this
 # one has two: the .deb was shipping `gen_icons` -- a build-time placeholder-icon
@@ -54,4 +54,4 @@ icons = ["icons/icon.png"]
 # outright, because only the main binary is lipo'd into
 # target/universal-apple-darwin/release/ and the copy of the other one failed.
 # Paths are resolved from the output directory, and `.exe` is added on Windows.
-binaries = [{ path = "chrome-host-app", main = true }]
+binaries = [{ path = "hitch", main = true }]

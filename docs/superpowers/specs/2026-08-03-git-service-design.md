@@ -1,4 +1,4 @@
-# Git service for `chrome-host-app` — design
+# Git service for `hitch` — design
 
 Status: approved, ready to plan. Every git2 signature below is checked against **git2 0.21.0 / libgit2 1.9.6**, and the ones this document originally flagged were then re-checked directly against the vendored crate source at `~/.cargo/registry/src/*/git2-0.21.0/` (`merge_commits`, `merge_trees`, `treebuilder`, `Reference::shorthand`, `Branch::name`, `Cert::as_hostkey`, `CertHostkey::hash_sha256`, `CertificateCheckStatus::CertificatePassthrough`, both `git2::opts` timeout setters, `IndexConflict`/`IndexEntry`). One **[VERIFY]** remains, in §12.1: its dependency-resolution half is now closed (macOS does resolve `openssl-sys → openssl-src`), but only a real macOS build can confirm that the vendored OpenSSL compiles and links there.
 
@@ -508,7 +508,7 @@ Uniform on every non-2xx from `/api/git/*`:
 ```json
 { "repo": {
     "id": "notes",
-    "path": "/home/u/.local/share/com.example.chromehost/repos/notes",
+    "path": "/home/u/.local/share/com.example.hitch/repos/notes",
     "exists": false,
     "remote": "https://github.com/acme/notes.git",
     "remote_name": "origin", "branch": "main",
@@ -583,7 +583,7 @@ failed — note the failure is **in the job**, not in an HTTP status; `GET /jobs
 { "repo": { "…redacted definition…" },
   "status": {
     "id": "notes",
-    "path": "/home/u/.local/share/com.example.chromehost/repos/notes",
+    "path": "/home/u/.local/share/com.example.hitch/repos/notes",
     "exists": true, "is_repository": true,
     "state": "dirty",
     "branch": "main", "head": "b4a71dd…", "unborn": false, "detached": false,
@@ -613,12 +613,12 @@ HTTP/1.1 403 Forbidden
 
 ```json
 { "host_instance": "7c1e93aa",
-  "repos_root": "/home/u/.local/share/com.example.chromehost/repos",
-  "registry_file": "/home/u/.local/share/com.example.chromehost/repos.json",
-  "log_file": "/home/u/.local/share/com.example.chromehost/logs/git.log",
+  "repos_root": "/home/u/.local/share/com.example.hitch/repos",
+  "registry_file": "/home/u/.local/share/com.example.hitch/repos.json",
+  "log_file": "/home/u/.local/share/com.example.hitch/logs/git.log",
   "registry_writable": true, "registry_error": null,
   "defaults": { "branch": "main",
-                "author": { "name": "Chrome Host App", "email": "com.example.chromehost@laptop" },
+                "author": { "name": "Hitch", "email": "com.example.hitch@laptop" },
                 "network_timeout_secs": 120 },
   "features": { "tray_sync": false, "error_dialogs": false, "status_api": false },
   "job_retention": 50, "job_ttl_secs": 3600, "job_min_age_secs": 60,

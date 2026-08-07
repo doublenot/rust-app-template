@@ -122,7 +122,7 @@ cargo test 2>&1 | grep -E '^test result' > /tmp/task0-summary-before.txt
 cat /tmp/task0-summary-before.txt
 ```
 
-Expected (the two suites are the `chrome-host-app` binary and the `gen_icons` helper binary;
+Expected (the two suites are the `hitch` binary and the `gen_icons` helper binary;
 the `finished in` timings will differ run to run and are not part of the comparison):
 
 ```
@@ -244,7 +244,7 @@ note: the struct `App` is defined here
 error[E0603]: struct `Children` is private
   --> src/main.rs:12:17
 
-error: could not compile `chrome-host-app` (bin "chrome-host-app") due to 2 previous errors
+error: could not compile `hitch` (bin "hitch") due to 2 previous errors
 ```
 
 Note what is *not* here: `dialog` and `UserEvent` stayed private and `src/host.rs` imports
@@ -286,7 +286,7 @@ error[E0624]: method `restart` is private                     (×3)
 error[E0624]: method `quit` is private                        (×3)
 error[E0624]: method `restart_chrome_only` is private         (×1)
 error[E0624]: method `open_settings` is private               (×1)
-error: could not compile `chrome-host-app` (bin "chrome-host-app") due to 35 previous errors
+error: could not compile `hitch` (bin "hitch") due to 35 previous errors
 ```
 
 ---
@@ -370,7 +370,7 @@ Run: `cargo build`
 Expected: PASS —
 
 ```
-   Compiling chrome-host-app v0.1.0 (/home/doublenot/sites/doublenot/rust-app-template)
+   Compiling hitch v0.1.0 (/home/doublenot/sites/doublenot/rust-app-template)
     Finished `dev` profile [unoptimized + debuginfo] target(s) in 8.07s
 ```
 
@@ -513,7 +513,7 @@ error: function `notice` is never used
    = note: `-D dead-code` implied by `-D warnings`
    = help: to override `-D warnings` add `#[expect(dead_code)]` or `#[allow(dead_code)]`
 
-error: could not compile `chrome-host-app` (bin "chrome-host-app") due to 1 previous error
+error: could not compile `hitch` (bin "hitch") due to 1 previous error
 ```
 
 ---

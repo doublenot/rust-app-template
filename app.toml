@@ -1,9 +1,9 @@
-# ── Chrome Host App configuration ─────────────────────────────
+# ── Hitch configuration ───────────────────────────────────────
 # Edit this file, then `cargo build`. Full reference in README.md.
 
 [app]
-name = "Chrome Host App"                # window title, tray tooltip
-identifier = "com.example.chromehost"   # reverse-domain; names the app-data dir
+name = "Hitch"                          # window title, tray tooltip
+identifier = "com.example.hitch"        # reverse-domain; names the app-data dir
 url = ""                                # target URL; empty → built-in placeholder page
 
 # Uncomment to start a local server before showing the app.

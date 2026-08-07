@@ -1,4 +1,4 @@
-# Release pipeline for `chrome-host-app` — design
+# Release pipeline for `hitch` — design
 
 Status: approved, ready to plan.
 
@@ -16,6 +16,21 @@ touches three operating systems, two of which cannot be exercised here.
 > recorded in §9. The predictions were correct — including the `.dmg` carrying
 > spaces — but two things the design did *not* predict came out of the same runs
 > and are recorded as defect 6 (§5.6) and in §9.
+
+### 0.1 The app was renamed after this document was written
+
+Everything below said `chrome-host-app` / `Chrome Host App` when it was written.
+The crate, binary, `product-name` and identifier were renamed to **`hitch`** /
+**`Hitch`** / `com.example.hitch` after v0.1.1, because the old name read as a
+relative of Google's discontinued Chrome Apps platform.
+
+The rename was applied throughout, with one deliberate exception: **quoted
+observations keep the names that were actually observed.** §5.7 records a real
+failure whose whole substance is a filename containing a space, and §9.1 records
+CI runs that emitted `chrome-host-app_*` artifacts. Rewriting those would have
+made this document claim measurements that never happened. Everywhere else —
+including §2's contract table — carries the current name, because those describe
+what the pipeline produces now.
 
 ---
 
@@ -68,7 +83,7 @@ that looks complete and is quietly missing a platform.
 > **Defect 6 was found by the first dry run, not by this design.** It is listed
 > here because it belongs with the others, but nothing in the original analysis
 > caught it: `dpkg -c` on a locally built `.deb` shows `usr/bin/gen_icons`
-> alongside `usr/bin/chrome-host-app`. See §5.6.
+> alongside `usr/bin/hitch`. See §5.6.
 
 ---
 
@@ -79,20 +94,23 @@ defect 4 all over again.
 
 | format | filename | directory | provenance |
 |---|---|---|---|
-| deb | `chrome-host-app_0.1.0_amd64.deb` | `target/release/` | **measured** — 6.7 MB, Linux x86_64 |
-| AppImage | `chrome-host-app_0.1.0_x86_64.AppImage` | `target/release/` | **measured** — 16.0 MB, Linux x86_64 |
-| NSIS | `chrome-host-app_0.1.0_x64-setup.exe` | `target/release/` | **measured** — windows-latest, run 31183489259 |
-| dmg | `Chrome Host App_0.1.0_universal.dmg` | `target/universal-apple-darwin/release/` | **measured** — macos-latest, run 31184474049 |
+| deb | `hitch_0.1.0_amd64.deb` | `target/release/` | **measured** — 6.7 MB, Linux x86_64 |
+| AppImage | `hitch_0.1.0_x86_64.AppImage` | `target/release/` | **measured** — 16.0 MB, Linux x86_64 |
+| NSIS | `hitch_0.1.0_x64-setup.exe` | `target/release/` | **measured** — windows-latest, run 31183489259 |
+| dmg | `Hitch_0.1.0_universal.dmg` | `target/universal-apple-darwin/release/` | **measured** — macos-latest, run 31184474049 |
 
-The `.dmg` is **published** as `Chrome-Host-App_0.1.0_universal.dmg`: §5.7 strips
-the spaces during staging, so the name above is what cargo-packager emits and the
-hyphenated one is what a user downloads.
+These filenames were measured under the old crate name and are shown here with
+the new one (§0.1); the runs cited emitted `chrome-host-app_*`. The *shape* is
+what was established, and the rename does not change it — except that `Hitch`
+has no space where `Chrome Host App` did, which makes §5.7 dormant rather than
+unnecessary.
 
 The `.dmg` is the outlier twice over, and both differences are load-bearing:
 
 - It is the **only** format named from `product-name` rather than the binary
-  name, so it is the only one containing **spaces**. Any shell that handles it
-  must quote.
+  name, so it is the only one that can contain **spaces** — as it did until the
+  rename. Any shell that handles it must quote, and §5.7 covers what quoting
+  alone does not.
 - Under decision 3 it is the only one **not** in `target/release/`.
   `cargo-packager` computes its directory as `target/<triple>/<profile>` when a
   target triple is supplied and `target/<profile>` when it is not (from source:
@@ -330,7 +348,7 @@ would surface as a silently incomplete release rather than a failure.
 
 ### 5.3 The binary name is derived, not hardcoded
 
-`cargo metadata --no-deps … .packages[0].default_run` returns `chrome-host-app`
+`cargo metadata --no-deps … .packages[0].default_run` returns `hitch`
 (measured on this machine). The package has two bin targets — `gen_icons` is the
 other — so `default_run` is the disambiguator, and it is the same key
 `cargo build` itself uses. This repository is a **template**; hardcoding the
@@ -370,7 +388,7 @@ legs' logs and artifacts available for diagnosis.
 Added after the first dry run. `[package.metadata.packager]` now carries:
 
 ```toml
-binaries = [{ path = "chrome-host-app", main = true }]
+binaries = [{ path = "hitch", main = true }]
 ```
 
 Without it cargo-packager packages **every** bin target the crate declares, and
@@ -390,11 +408,15 @@ A single-binary crate would never have surfaced any of it.
 
 ### 5.7 Spaces are stripped during staging
 
-Added after the first *published* release. GitHub rewrites spaces in a release
-asset's filename: the `.dmg` was uploaded as
+Added after the first *published* release, and **written when `product-name` was
+still `Chrome Host App`** — the names below are quoted as they were observed, not
+translated into the current one (see §0.1).
+
+GitHub rewrites spaces in a release asset's filename. The `.dmg` that
+cargo-packager produced as `Chrome Host App_0.1.0_universal.dmg` was uploaded as
 `Chrome.Host.App_0.1.0_universal.dmg`, while `SHA256SUMS` recorded the name
-cargo-packager produced. Downloading the release and running the documented check
-gave:
+cargo-packager had produced. Downloading the release and running the documented
+check gave:
 
 ```
 sha256sum: 'Chrome Host App_0.1.0_universal.dmg': No such file or directory
@@ -410,10 +432,16 @@ before `SHA256SUMS` is computed, the uploaded name is the name in the manifest,
 and `sha256sum -c` round-trips. Only the file is renamed; `product-name` and the
 app's display name are untouched.
 
-This is the second defect in this design traceable to one root cause — the
-`.dmg` being the only artifact named from `product-name`, and therefore the only
-one with spaces in it. §2 flagged the spaces and said "any shell that handles it
-must quote", which was right and insufficient: the problem was not a shell.
+**This is now dormant**, because `Hitch` has no space in it. It stays anyway:
+`product-name` is among the first things a fork changes, and a two-word name
+would walk straight back into it — silently, since the pipeline goes green either
+way and only a download reveals the problem.
+
+It was also the second defect in this design traceable to one root cause: the
+`.dmg` being the only artifact named from `product-name`. §2 flagged the spaces
+and concluded "any shell that handles it must quote", which was right and
+insufficient — every shell did quote correctly, and the thing that renamed the
+file was not a shell.
 
 ---
 
@@ -472,7 +500,7 @@ left over from any earlier step or rerun is matched by `*` like anything else.
 The subshell removes the dependency on both, which is worth one line for a step
 whose failure mode is a checksum manifest that silently checksums itself.
 
-`sha256sum -- *` handles the space in `Chrome Host App_0.1.0_universal.dmg`:
+`sha256sum -- *` handles the space in `Hitch_0.1.0_universal.dmg`:
 the shell passes it as a single argv entry, and GNU coreutils escapes only
 backslashes and newlines. `sha256sum -c SHA256SUMS` round-trips all four names,
 verified locally.
@@ -585,7 +613,8 @@ because the first dry run and the first published release each found a defect.
 | positive | `31185495123` | **published, then failed verification.** Draft correct, five assets — but the downloaded `.dmg` did not match `SHA256SUMS`, because GitHub had renamed it. → §5.7. |
 | positive | `31185885528` | **passed.** `sha256sum -c SHA256SUMS` exits 0 on all four downloaded installers with no `--ignore-missing`. |
 
-The macOS build-side reasoning in §5.4 is confirmed:
+The macOS build-side reasoning in §5.4 is confirmed. Quoted as the runners
+emitted it, which was before the rename (§0.1) — the binary is `hitch` now:
 
 ```
 Architectures in the fat file: …/chrome-host-app are: x86_64 arm64

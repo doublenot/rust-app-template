@@ -595,14 +595,14 @@ Append to the end of `README.md`:
 
   ```bash
   # No credentials needed: the vendored-TLS canary and the credential retry cap.
-  cargo test --bin chrome-host-app git::tests:: -- --ignored --nocapture
+  cargo test --bin hitch git::tests:: -- --ignored --nocapture
 
   # The credentialed pair, against a scratch repository you own.
   GIT_TEST_HTTPS_URL=https://github.com/you/scratch.git \
   GIT_TEST_TOKEN=github_pat_... \
   GIT_TEST_SSH_URL=git@github.com:you/scratch.git \
   GIT_TEST_SSH_KEY=$HOME/.ssh/id_ed25519 \
-  cargo test --bin chrome-host-app git::tests:: -- --ignored --nocapture
+  cargo test --bin hitch git::tests:: -- --ignored --nocapture
   ```
 
   The scratch repository must be non-empty and have a `main` branch; the HTTPS
@@ -1196,8 +1196,8 @@ network_timeout_secs = 60
 Run:
 
 ```bash
-cargo test --bin chrome-host-app -- --ignored --list
-cargo test --bin chrome-host-app
+cargo test --bin hitch -- --ignored --list
+cargo test --bin hitch
 ```
 
 Expected: the first command lists `git::tests::vendored_tls_trusts_public_ca: test`
@@ -1215,7 +1215,7 @@ the contract — fix the call site here, do not change the earlier task's signat
 Run:
 
 ```bash
-cargo test --bin chrome-host-app git::tests::vendored_tls_trusts_public_ca \
+cargo test --bin hitch git::tests::vendored_tls_trusts_public_ca \
   -- --ignored --exact --nocapture
 ```
 
@@ -1345,8 +1345,8 @@ Append inside the same `mod tests` block, after the previous test:
 Run:
 
 ```bash
-cargo test --bin chrome-host-app -- --ignored --list
-cargo test --bin chrome-host-app
+cargo test --bin hitch -- --ignored --list
+cargo test --bin hitch
 ```
 
 Expected: `git::tests::real_https_clone_and_push_and_server_rejection: test` now
@@ -1360,7 +1360,7 @@ Run:
 ```bash
 GIT_TEST_HTTPS_URL=https://github.com/you/scratch.git \
 GIT_TEST_TOKEN=github_pat_... \
-cargo test --bin chrome-host-app git::tests::real_https_clone_and_push_and_server_rejection \
+cargo test --bin hitch git::tests::real_https_clone_and_push_and_server_rejection \
   -- --ignored --exact --nocapture
 ```
 
@@ -1464,10 +1464,10 @@ Append inside the same `mod tests` block:
 Run:
 
 ```bash
-cargo test --bin chrome-host-app -- --ignored --list
+cargo test --bin hitch -- --ignored --list
 GIT_TEST_SSH_URL=git@github.com:you/scratch.git \
 GIT_TEST_SSH_KEY=$HOME/.ssh/id_ed25519 \
-cargo test --bin chrome-host-app git::tests::real_ssh_clone_pins_the_host_key \
+cargo test --bin hitch git::tests::real_ssh_clone_pins_the_host_key \
   -- --ignored --exact --nocapture
 ```
 
@@ -1549,8 +1549,8 @@ Append inside the same `mod tests` block:
 Run:
 
 ```bash
-cargo test --bin chrome-host-app -- --ignored --list
-cargo test --bin chrome-host-app git::tests::wrong_token_fails_once \
+cargo test --bin hitch -- --ignored --list
+cargo test --bin hitch git::tests::wrong_token_fails_once \
   -- --ignored --exact --nocapture
 ```
 
@@ -1588,7 +1588,7 @@ Run:
 cargo fmt --check
 cargo clippy --all-targets --locked -- -D warnings
 cargo test --locked
-cargo test --bin chrome-host-app -- --ignored --list
+cargo test --bin hitch -- --ignored --list
 ```
 
 Expected: `cargo fmt --check` prints nothing and exits 0; clippy prints

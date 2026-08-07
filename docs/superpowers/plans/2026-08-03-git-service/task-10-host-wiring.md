@@ -220,7 +220,7 @@ mod tests {
 
 - [ ] **Step 2: Run the tests and watch them fail**
 
-Run: `cargo test --bin chrome-host-app host::tests`
+Run: `cargo test --bin hitch host::tests`
 
 Expected: FAIL — nothing is defined yet:
 
@@ -235,7 +235,7 @@ error[E0425]: cannot find value `RESTART_DEBOUNCE_MS` in this scope
 error[E0425]: cannot find function `notice_is_new` in this scope
 error[E0425]: cannot find value `GIT_NOTICE_HISTORY` in this scope
 
-error: could not compile `chrome-host-app` (bin "chrome-host-app" test) due to 9 previous errors
+error: could not compile `hitch` (bin "hitch" test) due to 9 previous errors
 ```
 
 (Nine, because `RESTART_DEBOUNCE_MS` is named three times, `notice_is_new` five and
@@ -327,7 +327,7 @@ error[E0063]: missing fields `last_git_restart` and `git_notices` in initializer
 190 |     let mut app = App {
     |                   ^^^ missing `last_git_restart` and `git_notices`
 
-error: could not compile `chrome-host-app` (bin "chrome-host-app") due to 1 previous error
+error: could not compile `hitch` (bin "hitch") due to 1 previous error
 ```
 
 - [ ] **Step 5: Fill the literal and add the three `HostEvent` arms**
@@ -446,7 +446,7 @@ task 0 chose `expect` over `allow`.
 Run:
 
 ```bash
-cargo test --bin chrome-host-app host::tests
+cargo test --bin hitch host::tests
 cargo fmt --check && echo FMT_CLEAN
 cargo clippy --all-targets -- -D warnings
 ```
@@ -546,7 +546,7 @@ version below and add the second test after it:
 
 - [ ] **Step 9: Run the tests and watch them fail**
 
-Run: `cargo test --bin chrome-host-app supervisor::tests::build_env`
+Run: `cargo test --bin hitch supervisor::tests::build_env`
 
 Expected: FAIL —
 
@@ -560,7 +560,7 @@ error[E0422]: cannot find struct, variant or union type `HostAccess` in this sco
 error[E0061]: this function takes 3 arguments but 4 arguments were supplied
    --> src/supervisor.rs:152:19
 
-error: could not compile `chrome-host-app` (bin "chrome-host-app" test) due to 4 previous errors
+error: could not compile `hitch` (bin "hitch" test) due to 4 previous errors
 ```
 
 - [ ] **Step 10: Add `HostAccess` and the three env vars**
@@ -626,7 +626,7 @@ error[E0061]: this function takes 4 arguments but 3 arguments were supplied
 207 |                 supervisor::build_env(&server_cfg.env, &settings_env, &self.paths.settings_file);
     |                                                                                                 ---- argument #4 of type `&HostAccess<'_>` is missing
 
-error: could not compile `chrome-host-app` (bin "chrome-host-app") due to 1 previous error
+error: could not compile `hitch` (bin "hitch") due to 1 previous error
 ```
 
 - [ ] **Step 12: Thread the token from `main()` to the call site**
@@ -703,7 +703,7 @@ and the field to the `App` literal, after `port,`:
 Run:
 
 ```bash
-cargo test --bin chrome-host-app supervisor::tests::build_env
+cargo test --bin hitch supervisor::tests::build_env
 cargo fmt --check && echo FMT_CLEAN
 cargo clippy --all-targets -- -D warnings
 ```
@@ -779,7 +779,7 @@ error[E0609]: no field `git` on type `App`
     |
     = note: available fields are: `cfg`, `paths`, `chrome_exe`, `port`, `host_token` ...
 
-error: could not compile `chrome-host-app` (bin "chrome-host-app") due to 1 previous error
+error: could not compile `hitch` (bin "hitch") due to 1 previous error
 ```
 
 - [ ] **Step 15: Build the service in `main()` and hand it to both consumers**
@@ -953,7 +953,7 @@ third that pins the position of the new entry:
 
 - [ ] **Step 18: Run the tests and watch them fail**
 
-Run: `cargo test --bin chrome-host-app tray::tests`
+Run: `cargo test --bin hitch tray::tests`
 
 Expected: FAIL —
 
@@ -970,7 +970,7 @@ error[E0599]: no variant or associated item named `GitSync` found for enum `Tray
 131 |             Entry::Action(TrayAction::GitSync, "Sync now".to_string()),
     |                                       ^^^^^^^ variant or associated item not found in `TrayAction`
 
-error: could not compile `chrome-host-app` (bin "chrome-host-app" test) due to 5 previous errors
+error: could not compile `hitch` (bin "hitch" test) due to 5 previous errors
 ```
 
 - [ ] **Step 19: Add the variant and the parameter**
@@ -1045,7 +1045,7 @@ error[E0004]: non-exhaustive patterns: `Some(TrayAction::GitSync)` not covered
 200 |                 match action {
     |                       ^^^^^^ pattern `Some(TrayAction::GitSync)` not covered
 
-error: could not compile `chrome-host-app` (bin "chrome-host-app") due to 2 previous errors
+error: could not compile `hitch` (bin "hitch") due to 2 previous errors
 ```
 
 The second error is the point of adding the variant before the handler: an unhandled tray
@@ -1093,7 +1093,7 @@ action is a compile error here, not a menu entry that silently does nothing.
 Run:
 
 ```bash
-cargo test --bin chrome-host-app tray::tests
+cargo test --bin hitch tray::tests
 cargo fmt --check && echo FMT_CLEAN
 cargo clippy --all-targets -- -D warnings
 ```
@@ -1255,7 +1255,7 @@ guard that says the change was additive, and editing it would defeat that.
 
 - [ ] **Step 26: Run the tests and watch them fail**
 
-Run: `cargo test --bin chrome-host-app internal_server::tests::status`
+Run: `cargo test --bin hitch internal_server::tests::status`
 
 Expected: FAIL —
 
@@ -1266,7 +1266,7 @@ error[E0422]: cannot find struct, variant or union type `StatusResponse` in this
 298 |             let wrapped = serde_json::to_string(&StatusResponse { app: st, git: None }).unwrap();
     |                                                  ^^^^^^^^^^^^^^ not found in this scope
 
-error: could not compile `chrome-host-app` (bin "chrome-host-app" test) due to 1 previous error
+error: could not compile `hitch` (bin "hitch" test) due to 1 previous error
 ```
 
 - [ ] **Step 27: Add `StatusResponse` and retype the handler**
@@ -1317,7 +1317,7 @@ already entitled to. Anything that could carry a credential goes through `/api/g
 
 - [ ] **Step 28: Run the tests and watch them pass**
 
-Run: `cargo test --bin chrome-host-app internal_server::tests`
+Run: `cargo test --bin hitch internal_server::tests`
 
 Expected: PASS — including the untouched pre-existing test:
 
@@ -1489,7 +1489,7 @@ scope` for any of them, add the matching import to the test module
 
 - [ ] **Step 31: Run the test and read the result carefully**
 
-Run: `cargo test --bin chrome-host-app git::tests::git_failed_is_emitted_only_on_an_ok_to_fail_transition -- --nocapture`
+Run: `cargo test --bin hitch git::tests::git_failed_is_emitted_only_on_an_ok_to_fail_transition -- --nocapture`
 
 This is a characterization test over task 9's `after_job`. It must **PASS with no edit to
 `src/git/mod.rs`** — task 9 already implements the gate, and this test is what stops it
@@ -1570,7 +1570,7 @@ user's window. Append to the same test module:
     }
 ```
 
-Run: `cargo test --bin chrome-host-app git::tests::an_automatic_sync_can_never_restart_the_children`
+Run: `cargo test --bin hitch git::tests::an_automatic_sync_can_never_restart_the_children`
 
 Expected: PASS —
 
@@ -1629,7 +1629,7 @@ key in `/api/status`, and `/api/git/*` answering `git_disabled`.
 
 ```bash
 grep -c '^\[git\]' app.toml
-rm -rf ~/.local/share/com.example.chromehost
+rm -rf ~/.local/share/com.example.hitch
 ```
 
 Expected: `0` from the grep — `app.toml`'s `[git]` block is commented out.
@@ -1649,9 +1649,9 @@ cargo run
 Check, then quit from the tray:
 
 - the tray menu has **no** "Sync now" entry;
-- `ls ~/.local/share/com.example.chromehost` shows `chrome-profile`, `logs`, `app.lock` and
+- `ls ~/.local/share/com.example.hitch` shows `chrome-profile`, `logs`, `app.lock` and
   **no** `repos`, `repos.json` or `git-state.json`;
-- `ls ~/.local/share/com.example.chromehost/logs` has `host.log` and `chrome.log`, **no**
+- `ls ~/.local/share/com.example.hitch/logs` has `host.log` and `chrome.log`, **no**
   `git.log`;
 - the app quits immediately when you click Quit.
 
@@ -1682,7 +1682,7 @@ port and token (the token is embedded in the loading page, and the port is whate
 bound):
 
 ```bash
-PORT=$(ss -ltnp 2>/dev/null | grep chrome-host-app | grep -o '127.0.0.1:[0-9]*' | cut -d: -f2 | head -1)
+PORT=$(ss -ltnp 2>/dev/null | grep hitch | grep -o '127.0.0.1:[0-9]*' | cut -d: -f2 | head -1)
 TOKEN=$(curl -s http://127.0.0.1:$PORT/loading | grep -o "TOKEN[^0-9a-f]*[0-9a-f]\{32\}" | grep -o '[0-9a-f]\{32\}')
 curl -s -X PUT http://127.0.0.1:$PORT/api/git/repos/notes \
   -H "x-host-token: $TOKEN" -H 'content-type: application/json' \
@@ -1701,7 +1701,7 @@ curl -s -X POST http://127.0.0.1:$PORT/api/git/repos/notes/clone -H "x-host-toke
    cd /tmp/git-smoke/seed && git pull --ff-only
    printf 'remote edit\n' > shared.txt
    git -c user.email=a@b -c user.name=a commit -am remote && git push
-   printf 'local edit\n' > ~/.local/share/com.example.chromehost/repos/notes/shared.txt
+   printf 'local edit\n' > ~/.local/share/com.example.hitch/repos/notes/shared.txt
    curl -s -X POST http://127.0.0.1:$PORT/api/git/repos/notes/sync -H "x-host-token: $TOKEN"
    ```
    Exactly **one** warning-level modal appears, naming `shared.txt` and printing

@@ -39,7 +39,7 @@ panic is the correct behaviour and a comment says so; `cargo fmt` and
 
 **This crate has no `--lib` target** (`src/main.rs` is the only entry point; `src/bin/gen_icons.rs`
 is a second binary), so unit tests run in the bin target:
-`cargo test --bin chrome-host-app <filter>`. Never `cargo test --lib`.
+`cargo test --bin hitch <filter>`. Never `cargo test --lib`.
 
 `src/git/mod.rs` already carries `#![allow(dead_code)]` and `#![allow(clippy::result_large_err)]`
 from task 3; both propagate into `git::api`. Do not add a second copy.
@@ -385,7 +385,7 @@ has `use super::*;`, do not add a second one.
 
 - [ ] **Step 2: Run the tests and watch them fail**
 
-Run: `cargo test --bin chrome-host-app git::tests::contained_in`
+Run: `cargo test --bin hitch git::tests::contained_in`
 
 Expected: FAIL — compile errors, one per missing item.
 
@@ -451,7 +451,7 @@ fn canonical_root(path: &Path) -> PathBuf {
 
 - [ ] **Step 4: Run the tests and watch them pass**
 
-Run: `cargo test --bin chrome-host-app git::tests::c`
+Run: `cargo test --bin hitch git::tests::c`
 
 Expected: PASS.
 
@@ -568,7 +568,7 @@ Append to `mod tests` in `src/git/mod.rs`:
 
 - [ ] **Step 7: Run the tests and watch them fail**
 
-Run: `cargo test --bin chrome-host-app git::tests::a_git_section`
+Run: `cargo test --bin hitch git::tests::a_git_section`
 
 Expected: FAIL — compile errors.
 
@@ -805,7 +805,7 @@ Also create `src/git/api.rs` with nothing but a module comment so `pub mod api;`
 
 - [ ] **Step 9: Run the tests and watch them pass**
 
-Run: `cargo test --bin chrome-host-app git::tests::`
+Run: `cargo test --bin hitch git::tests::`
 
 Expected: PASS.
 
@@ -905,7 +905,7 @@ Append to `mod tests` in `src/git/mod.rs`:
 
 - [ ] **Step 12: Run the tests and watch them fail**
 
-Run: `cargo test --bin chrome-host-app git::tests::start_`
+Run: `cargo test --bin hitch git::tests::start_`
 
 Expected: FAIL — compile error.
 
@@ -1006,7 +1006,7 @@ compiles; the next two cycles replace their bodies:
 
 - [ ] **Step 14: Run the tests and watch them pass**
 
-Run: `cargo test --bin chrome-host-app git::tests::start_`
+Run: `cargo test --bin hitch git::tests::start_`
 
 Expected: PASS.
 
@@ -1093,7 +1093,7 @@ Append to `mod tests` in `src/git/mod.rs`:
 
 - [ ] **Step 17: Run the tests and watch them fail**
 
-Run: `cargo test --bin chrome-host-app git::tests::startup_clears`
+Run: `cargo test --bin hitch git::tests::startup_clears`
 
 Expected: FAIL — `put_repo` does not exist yet, and the recovery is a no-op.
 
@@ -1217,7 +1217,7 @@ mutators inside `impl GitService`:
 
 - [ ] **Step 19: Run the tests and watch them pass**
 
-Run: `cargo test --bin chrome-host-app git::tests::startup_clears`
+Run: `cargo test --bin hitch git::tests::startup_clears`
 
 Expected: PASS.
 
@@ -1304,7 +1304,7 @@ Append to `mod tests` in `src/git/mod.rs`:
 
 - [ ] **Step 22: Run the tests and watch them fail**
 
-Run: `cargo test --bin chrome-host-app git::tests::delete_`
+Run: `cargo test --bin hitch git::tests::delete_`
 
 Expected: FAIL — compile error.
 
@@ -1382,7 +1382,7 @@ and, inside `impl GitService`, immediately after `put_repo`:
 
 - [ ] **Step 24: Run the tests and watch them pass**
 
-Run: `cargo test --bin chrome-host-app git::tests::`
+Run: `cargo test --bin hitch git::tests::`
 
 Expected: PASS.
 
@@ -1475,7 +1475,7 @@ Append to `mod tests` in `src/git/mod.rs`:
 
 - [ ] **Step 27: Run the tests and watch them fail**
 
-Run: `cargo test --bin chrome-host-app git::tests::service_info`
+Run: `cargo test --bin hitch git::tests::service_info`
 
 Expected: FAIL — compile error.
 
@@ -1615,7 +1615,7 @@ and inside `impl GitService`:
 
 - [ ] **Step 29: Run the tests and watch them pass**
 
-Run: `cargo test --bin chrome-host-app git::tests::`
+Run: `cargo test --bin hitch git::tests::`
 
 Expected: PASS.
 
@@ -1734,7 +1734,7 @@ Append to `mod tests` in `src/git/mod.rs`:
 
 - [ ] **Step 32: Run the tests and watch them fail**
 
-Run: `cargo test --bin chrome-host-app git::tests::read_`
+Run: `cargo test --bin hitch git::tests::read_`
 
 Expected: FAIL — compile error.
 
@@ -1820,7 +1820,7 @@ and inside `impl GitService`:
 
 - [ ] **Step 34: Run the tests and watch them pass**
 
-Run: `cargo test --bin chrome-host-app git::tests::read`
+Run: `cargo test --bin hitch git::tests::read`
 
 Expected: PASS.
 
@@ -1974,7 +1974,7 @@ Append to `mod tests` in `src/git/mod.rs`:
 
 - [ ] **Step 37: Run the tests and watch them fail**
 
-Run: `cargo test --bin chrome-host-app git::tests::a_job_runs`
+Run: `cargo test --bin hitch git::tests::a_job_runs`
 
 Expected: FAIL — compile errors.
 
@@ -2198,7 +2198,7 @@ and inside `impl GitService`:
 
 - [ ] **Step 39: Run the tests and watch them pass**
 
-Run: `cargo test --bin chrome-host-app git::tests::a_`
+Run: `cargo test --bin hitch git::tests::a_`
 
 Expected: PASS.
 
@@ -2295,7 +2295,7 @@ Append to `mod tests` in `src/git/mod.rs`:
 
 - [ ] **Step 42: Run the tests and watch them fail**
 
-Run: `cargo test --bin chrome-host-app git::tests::remote_verbs`
+Run: `cargo test --bin hitch git::tests::remote_verbs`
 
 Expected: FAIL — the guards do not exist, so `start_job` admits the job and returns `Ok`.
 
@@ -2346,7 +2346,7 @@ Insert into `start_job`, immediately after `let def = self.registry.snapshot(rep
 
 - [ ] **Step 44: Run the tests and watch them pass**
 
-Run: `cargo test --bin chrome-host-app git::tests::`
+Run: `cargo test --bin hitch git::tests::`
 
 Expected: PASS.
 
@@ -2518,7 +2518,7 @@ Append to `mod tests` in `src/git/mod.rs`:
 
 - [ ] **Step 47: Run the tests and watch them fail**
 
-Run: `cargo test --bin chrome-host-app git::tests::git_failed_fires`
+Run: `cargo test --bin hitch git::tests::git_failed_fires`
 
 Expected: FAIL — no event is ever sent.
 
@@ -2672,7 +2672,7 @@ and in the `Err(e)` arm, after `self.log_job(...)`:
 
 - [ ] **Step 50: Run the tests and watch them pass**
 
-Run: `cargo test --bin chrome-host-app git::tests::`
+Run: `cargo test --bin hitch git::tests::`
 
 Expected: PASS.
 
@@ -2739,7 +2739,7 @@ Append to `mod tests` in `src/git/mod.rs`:
 
 - [ ] **Step 53: Run the test and watch it fail**
 
-Run: `cargo test --bin chrome-host-app git::tests::the_watchdog`
+Run: `cargo test --bin hitch git::tests::the_watchdog`
 
 Expected: FAIL — compile errors.
 
@@ -2799,7 +2799,7 @@ and replace the `spawn_watchdog` placeholder in `impl GitService`:
 
 - [ ] **Step 55: Run the test and watch it pass**
 
-Run: `cargo test --bin chrome-host-app git::tests::the_watchdog`
+Run: `cargo test --bin hitch git::tests::the_watchdog`
 
 Expected: PASS.
 
@@ -2887,7 +2887,7 @@ Append to `mod tests` in `src/git/mod.rs`:
 
 - [ ] **Step 58: Run the tests and watch them fail**
 
-Run: `cargo test --bin chrome-host-app git::tests::sync_all_manual`
+Run: `cargo test --bin hitch git::tests::sync_all_manual`
 
 Expected: FAIL — compile errors.
 
@@ -2993,7 +2993,7 @@ Replace the `spawn_auto_timer` placeholder and add the trigger methods inside
 
 - [ ] **Step 60: Run the tests and watch them pass**
 
-Run: `cargo test --bin chrome-host-app git::tests::`
+Run: `cargo test --bin hitch git::tests::`
 
 Expected: PASS.
 
@@ -3065,7 +3065,7 @@ Append to `mod tests` in `src/git/mod.rs`:
 
 - [ ] **Step 63: Run the tests and watch them fail**
 
-Run: `cargo test --bin chrome-host-app git::tests::quit_syncs`
+Run: `cargo test --bin hitch git::tests::quit_syncs`
 
 Expected: FAIL — compile error.
 
@@ -3165,7 +3165,7 @@ fn wait_until_terminal(slots: &[Arc<JobSlot>], budget: Duration) -> bool {
 
 - [ ] **Step 65: Run the tests and watch them pass**
 
-Run: `cargo test --bin chrome-host-app git::tests::`
+Run: `cargo test --bin hitch git::tests::`
 
 Expected: PASS.
 
@@ -3182,7 +3182,7 @@ test result: ok. 32 passed; 0 failed; 0 ignored; 0 measured; N filtered out
 ```bash
 cargo fmt
 cargo clippy --all-targets -- -D warnings
-cargo test --bin chrome-host-app
+cargo test --bin hitch
 git add src/git/mod.rs
 git commit -m "feat(git): run_quit_syncs, draining, and the abandonment log
 
@@ -3255,7 +3255,7 @@ mod tests {
 
 - [ ] **Step 68: Run the tests and watch them fail**
 
-Run: `cargo test --bin chrome-host-app git::api`
+Run: `cargo test --bin hitch git::api`
 
 Expected: FAIL — compile errors.
 
@@ -3365,7 +3365,7 @@ impl IntoResponse for ApiError {
 
 - [ ] **Step 70: Run the tests and watch them pass**
 
-Run: `cargo test --bin chrome-host-app git::api`
+Run: `cargo test --bin hitch git::api`
 
 Expected: PASS.
 
@@ -3500,7 +3500,7 @@ Append inside `mod tests` in `src/git/api.rs`:
 
 - [ ] **Step 73: Run the tests and watch them fail**
 
-Run: `cargo test --bin chrome-host-app git::api`
+Run: `cargo test --bin hitch git::api`
 
 Expected: FAIL — compile errors.
 
@@ -3788,7 +3788,7 @@ a data-loss bug.
 
 - [ ] **Step 75: Run the tests and watch them pass**
 
-Run: `cargo test --bin chrome-host-app git::api`
+Run: `cargo test --bin hitch git::api`
 
 Expected: PASS.
 
@@ -3871,7 +3871,7 @@ Append inside `mod tests` in `src/internal_server.rs`:
 
 - [ ] **Step 78: Run the test and watch it fail**
 
-Run: `cargo test --bin chrome-host-app internal_server::tests::every_git_route`
+Run: `cargo test --bin hitch internal_server::tests::every_git_route`
 
 Expected: FAIL — the paths are not routed at all, so axum answers with an empty 404 body
 and the JSON decode fails.
@@ -3998,7 +3998,7 @@ pub(crate) fn authorized(headers: &HeaderMap, state: &HostState) -> bool {
 
 - [ ] **Step 80: Run the tests and watch them pass**
 
-Run: `cargo test --bin chrome-host-app internal_server::tests`
+Run: `cargo test --bin hitch internal_server::tests`
 
 Expected: PASS — including the six pre-existing tests, unchanged.
 
@@ -4143,7 +4143,7 @@ Append inside `mod tests` in `src/internal_server.rs`:
 
 - [ ] **Step 83: Run the tests and watch them fail**
 
-Run: `cargo test --bin chrome-host-app internal_server::tests::service_info_and`
+Run: `cargo test --bin hitch internal_server::tests::service_info_and`
 
 Expected: FAIL — the two routes do not exist, so `route_layer` never runs and axum answers
 404.
@@ -4255,7 +4255,7 @@ async fn list_repos(State(state): State<HostState>) -> Response {
 
 - [ ] **Step 85: Run the tests and watch them pass**
 
-Run: `cargo test --bin chrome-host-app internal_server::tests`
+Run: `cargo test --bin hitch internal_server::tests`
 
 Expected: PASS.
 
@@ -4444,7 +4444,7 @@ Append inside `mod tests` in `src/internal_server.rs`:
 
 - [ ] **Step 88: Run the tests and watch them fail**
 
-Run: `cargo test --bin chrome-host-app internal_server::tests::put_creates`
+Run: `cargo test --bin hitch internal_server::tests::put_creates`
 
 Expected: FAIL — the route does not exist, so `route_layer` never runs and axum answers 404.
 
@@ -4557,7 +4557,7 @@ async fn delete_repo(
 
 - [ ] **Step 90: Run the tests and watch them pass**
 
-Run: `cargo test --bin chrome-host-app internal_server::tests`
+Run: `cargo test --bin hitch internal_server::tests`
 
 Expected: PASS.
 
@@ -4729,7 +4729,7 @@ Append inside `mod tests` in `src/internal_server.rs`:
 
 - [ ] **Step 93: Run the tests and watch them fail**
 
-Run: `cargo test --bin chrome-host-app internal_server::tests::sync_returns_202`
+Run: `cargo test --bin hitch internal_server::tests::sync_returns_202`
 
 Expected: FAIL — the route does not exist.
 
@@ -4977,7 +4977,7 @@ async fn post_reset(
 
 - [ ] **Step 95: Run the tests and watch them pass**
 
-Run: `cargo test --bin chrome-host-app internal_server::tests`
+Run: `cargo test --bin hitch internal_server::tests`
 
 Expected: PASS.
 
@@ -5125,7 +5125,7 @@ Append inside `mod tests` in `src/internal_server.rs`:
 
 - [ ] **Step 98: Run the tests and watch them fail**
 
-Run: `cargo test --bin chrome-host-app internal_server::tests::jobs_can_be_listed`
+Run: `cargo test --bin hitch internal_server::tests::jobs_can_be_listed`
 
 Expected: FAIL — `/jobs` is not routed, so it falls through to a plain 404 and the
 whole-table loop fails on the last two rows for the same reason.
@@ -5193,7 +5193,7 @@ async fn get_job(State(state): State<HostState>, Path(job_id): Path<String>) -> 
 
 - [ ] **Step 100: Run the tests and watch them pass**
 
-Run: `cargo test --bin chrome-host-app internal_server::tests`
+Run: `cargo test --bin hitch internal_server::tests`
 
 Expected: PASS.
 
@@ -5272,7 +5272,7 @@ Item 5 must print `4`; anything else means a secret escaped `creds.rs` and the a
 cargo fmt
 cargo fmt --check
 cargo clippy --all-targets -- -D warnings
-cargo test --bin chrome-host-app
+cargo test --bin hitch
 ```
 
 Expected: `cargo fmt --check` silent, clippy silent, and the full suite green — the

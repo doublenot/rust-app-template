@@ -14,7 +14,7 @@
 
 ## Global Constraints
 
-- Rust stable, `edition = "2021"`, `rust-version = "1.85"`. Package/binary name `chrome-host-app`.
+- Rust stable, `edition = "2021"`, `rust-version = "1.85"`. Package/binary name `hitch`.
 - `git2 = { version = "0.21", features = ["https", "ssh", "vendored-libgit2"] }`. **git2 0.21 has `default = []`** — omitting those features yields a silently local-only build with no network transports. `[target.'cfg(unix)'.dependencies] openssl-sys = { version = "0.9", features = ["vendored"] }` is required because `libssh2-sys` declares a **non-optional** `openssl-sys` dependency on all of `cfg(unix)`, macOS included.
 - **No cargo feature gate for git.** One binary, one configuration. The gate is runtime: `[git]` absent from `app.toml` ⇒ `/api/git/*` returns 404 `git_disabled`, no registry file is created, and no libgit2 work happens.
 - Every `/api/git/*` route requires the `x-host-token` header — **including GETs**. This is a deliberate divergence from the unauthenticated `/api/status`.
