@@ -414,11 +414,15 @@ cleared first. The risk that held this on a branch did not materialise:
 cargo-packager passes `--timestamp`, ad-hoc signatures cannot be timestamped,
 and `codesign` accepted the combination anyway rather than failing the leg.
 
-**Still unverified:** that this turns "damaged" into an ordinary
-unidentified-developer block. Ad-hoc signing is not Developer ID and does not
-notarize anything, so macOS will still refuse the first launch — the claim being
-made is only that it refuses it *for the right reason*, recoverably. That needs
-the same Mac again, against a build carrying this fix.
+**Confirmed on 2026-08-07 against v0.1.3.** The same Mac, downloading the `.dmg`
+in a browser so the quarantine flag was applied: macOS blocked the first launch,
+the app was allowed via System Settings → Privacy & Security, and it opened. No
+"damaged" message. That is the correct end state for an ad-hoc signed,
+unnotarized app — the block is not a defect, and this section's claim was only
+ever that it blocks *recoverably* rather than declaring the code corrupt.
+
+Every claim in §5.4 and §5.8 is now measured. Nothing in this design remains
+unverified.
 
 **The general lesson, which is why §5.4 is left standing rather than rewritten:**
 two separately-correct findings were combined into a conclusion neither
@@ -690,10 +694,12 @@ it. Neither was reachable by reading.
 - **Package registries** — brew, winget, apt repositories, containers (decision 1).
 - **Real code signing and notarization** — unchanged per-app TODO (§8). Ad-hoc
   signing makes the app run; it does not make it trusted.
-- **Confirming the macOS app launches.** §5.4's reasoning is closed on the build
-  side by §9 run 1, but a human with a Mac must open the `.dmg` and launch the
-  app to close it on the runtime side. This is the same class of gap as the two
-  dialog smoke checks in the git service.
+- ~~**Confirming the macOS app launches.**~~ **Closed 2026-08-07.** It was worth
+  the wait: the human check found that v0.1.0–v0.1.2 shipped an unsigned bundle
+  and macOS called it damaged (§5.8). Fixed in v0.1.3, retested on the same Mac,
+  and it opens. The lesson is not that this belonged out of scope — it is that a
+  gap the pipeline structurally cannot close still has to be closed by someone,
+  and naming it here is what made that happen rather than letting it be forgotten.
 - **Linux arm64 and Windows arm64.** GitHub's runner matrix can supply both; no
   demand has been stated, and each adds a leg.
 - **Automatic publishing.** Drafts are deliberate (decision 4).

@@ -30,9 +30,14 @@ downloaded copy reported *"Hitch is damaged and should be moved to the Trash."*
 CI could not have caught it — `codesign --verify` ran against the binary, which
 was never the problem. It took someone installing the app.
 
-Fixed after v0.1.2 by having cargo-packager sign the bundle
-(`signing-identity = "-"`). The post-mortem is §5.8 of
+Fixed in **v0.1.3** by having cargo-packager sign the bundle
+(`signing-identity = "-"`), and confirmed on the same Mac that found it: the app
+is now blocked as an unidentified developer and opens once allowed, instead of
+being declared damaged. The post-mortem is §5.8 of
 `docs/superpowers/specs/2026-08-07-release-pipeline-design.md`.
+
+**So: use v0.1.3 or later.** Everything below applies to any version, but the
+signature checks in §2.3 will fail on v0.1.2 and earlier by design.
 
 ---
 
