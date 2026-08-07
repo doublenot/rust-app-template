@@ -70,9 +70,6 @@ check "refuses no argument" 1 $?; rm -rf "$d"
 d=$(fixture); ( cd "$d" && "$release_sh" 1.2 >/dev/null 2>&1 )
 check "refuses a non-semver version" 1 $?; rm -rf "$d"
 
-d=$(fixture); ( cd "$d" && "$release_sh" 0.1.0 >/dev/null 2>&1 )
-check "refuses the version it is already at" 1 $?; rm -rf "$d"
-
 d=$(fixture); echo dirt > "$d/dirt.txt"; git -C "$d" add dirt.txt
 ( cd "$d" && "$release_sh" 1.2.0 >/dev/null 2>&1 )
 check "refuses a dirty working tree" 1 $?; rm -rf "$d"
@@ -111,6 +108,40 @@ if [ -z "$(git -C "$d" status --porcelain)" ]; then
 else
   not_ok "the working tree is clean afterwards"
 fi
+rm -rf "$d"
+
+# --- the first release ----------------------------------------------------
+# A crate's first release has nothing to bump: the manifest already carries the
+# version being tagged. Refusing that made this script unusable for the one
+# release every fork of this template cuts first, so the same-version case is
+# allowed and simply skips the bump. The invariant is that any given version can
+# be tagged exactly once, and the "tag already exists" guard is what enforces it.
+d=$(fixture)
+before=$(git -C "$d" rev-parse HEAD)
+( cd "$d" && "$release_sh" 0.1.0 >/dev/null 2>&1 )
+check "cuts a first release at the current version" 0 $?
+
+assert "the first-release tag exists"  git -C "$d" rev-parse -q --verify refs/tags/v0.1.0
+assert "the manifest is left alone"    grep -q '^version = "0.1.0"' "$d/Cargo.toml"
+
+# The bump branch commits; this branch must not, or every first release would
+# carry an empty "chore: release" commit.
+if [ "$(git -C "$d" rev-parse HEAD)" = "$before" ]; then
+  ok "no empty commit is created"
+else
+  not_ok "no empty commit is created"
+fi
+
+if [ -z "$(git -C "$d" status --porcelain)" ]; then
+  ok "the tree is clean after a first release"
+else
+  not_ok "the tree is clean after a first release"
+fi
+
+# What the dropped same-version guard was really protecting: releasing a version
+# twice. That is now the tag guard's job, so prove it does it.
+( cd "$d" && "$release_sh" 0.1.0 >/dev/null 2>&1 )
+check "refuses to cut the same version twice" 1 $?
 rm -rf "$d"
 
 echo

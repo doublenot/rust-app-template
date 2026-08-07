@@ -420,8 +420,18 @@ git push origin v1.2.0     # this is what starts the release
 ```
 
 `scripts/release.sh` deliberately does not push. It refuses a dirty tree, a
-version that is not semver, the version you are already on, and a tag that
-already exists.
+version that is not semver, and a version that has already been tagged — any
+given version can be tagged exactly once.
+
+For a **first release**, where `Cargo.toml` already carries the version you want
+to ship, pass it anyway:
+
+```bash
+scripts/release.sh 0.1.0   # nothing to bump; tags the current commit
+git push origin v0.1.0
+```
+
+There is no version bump and no commit in that case, just the tag.
 
 Pushing the tag triggers `.github/workflows/release.yml`, which:
 

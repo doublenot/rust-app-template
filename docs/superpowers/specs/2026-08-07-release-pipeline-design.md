@@ -495,7 +495,7 @@ Required behaviour:
 |---|---|---|
 | 1 | refuse a dirty working tree | the tag would capture unrelated work |
 | 2 | refuse a non-semver argument | the tag drives artifact names |
-| 3 | refuse a version equal to the current one | a no-op bump usually means a typo |
+| 3 | accept a version equal to the current one, tagging **without** a bump or a commit | a crate's first release has nothing to bump (§7.1) |
 | 4 | refuse when `refs/tags/v<version>` already exists | tags are what the pipeline keys on |
 | 5 | edit `version` **only inside the `[package]` table** | a naive substitution would rewrite a dependency that happens to carry the same string |
 | 6 | refresh `Cargo.lock` in the same commit | a lockfile disagreeing with the manifest fails `--locked` on all three runners |
@@ -507,6 +507,31 @@ to `sed`. The edit must be scoped to the `[package]` table.
 
 Requirement 7 keeps the script safe to run and re-run. `git push origin v1.2.0`
 is the separate, deliberate step that starts a release.
+
+### 7.1 Requirement 3 was originally the opposite, and was wrong
+
+This section first specified *"refuse a version equal to the current one — a
+no-op bump usually means a typo."* That guard was implemented, tested, and then
+made the script unusable the first time anyone tried to use it for its actual
+purpose: cutting `v0.1.0` on a manifest sitting at `0.1.0` produced
+
+```
+release: already at 0.1.0
+```
+
+which is the **first release of every fork of this template**. The real v0.1.0
+had to be tagged by hand.
+
+The guard was protecting against releasing a version twice, and requirement 4
+already does that — a duplicate tag is refused. So requirement 3 is inverted:
+when `new == cur`, the script tags the current commit and stops, skipping the
+manifest edit and the commit. The invariant is now stated positively: **any
+given version can be tagged exactly once.**
+
+Note what is *not* guarded as a result: at `0.2.0`, `release.sh 0.1.0` will
+happily bump the version *down*. That is a different typo from the one
+requirement 3 was aimed at, it has never been guarded here, and it is left
+alone rather than folded in silently.
 
 ---
 

@@ -43,7 +43,10 @@ references below (§2, §5.4, …) point into it.
 
   The `.dmg` is the only one named from `product-name`, so the only one with
   **spaces**, and under a universal build the only one outside `target/release/`.
-  Quote every expansion that touches it.
+  Quote every expansion that touches it — and note that quoting is necessary but
+  not sufficient: the staging step renames it to `Chrome-Host-App_…` because
+  GitHub rewrites spaces in a release asset's filename, which would otherwise
+  leave `SHA256SUMS` naming a file no downloader has (spec §5.7).
 - **`scripts/*.sh` must be committed executable** (`git update-index --chmod=+x`
   if the working filesystem loses the bit).
 - **Comments explain why, not what**, matching the density of `src/supervisor.rs`
@@ -77,10 +80,12 @@ on both being final so the documentation describes what shipped.
 
 **Interfaces:**
 - Consumes: nothing from earlier tasks.
-- Produces: `scripts/release.sh <version>` — creates commit `chore: release v<version>`
-  and annotated tag `v<version>` in the current repository. Exit 0 on success,
-  exit 1 with a `release: <reason>` message on stderr for every refusal. Task 3
-  documents this command; Task 4 does not use it.
+- Produces: `scripts/release.sh <version>` — creates annotated tag `v<version>` in
+  the current repository, preceded by commit `chore: release v<version>` **when a
+  bump is needed**. If the manifest already carries `<version>` there is nothing
+  to bump, so it tags and stops (spec §7.1). Exit 0 on success, exit 1 with a
+  `release: <reason>` message on stderr for every refusal. Task 3 documents this
+  command; Task 4 does not use it.
 
 - [ ] **Step 1: Write the failing test**
 
@@ -159,9 +164,6 @@ check "refuses no argument" 1 $?; rm -rf "$d"
 d=$(fixture); ( cd "$d" && "$release_sh" 1.2 >/dev/null 2>&1 )
 check "refuses a non-semver version" 1 $?; rm -rf "$d"
 
-d=$(fixture); ( cd "$d" && "$release_sh" 0.1.0 >/dev/null 2>&1 )
-check "refuses the version it is already at" 1 $?; rm -rf "$d"
-
 d=$(fixture); echo dirt > "$d/dirt.txt"; git -C "$d" add dirt.txt
 ( cd "$d" && "$release_sh" 1.2.0 >/dev/null 2>&1 )
 check "refuses a dirty working tree" 1 $?; rm -rf "$d"
@@ -200,6 +202,40 @@ if [ -z "$(git -C "$d" status --porcelain)" ]; then
 else
   not_ok "the working tree is clean afterwards"
 fi
+rm -rf "$d"
+
+# --- the first release ----------------------------------------------------
+# A crate's first release has nothing to bump: the manifest already carries the
+# version being tagged. Refusing that made this script unusable for the one
+# release every fork of this template cuts first, so the same-version case is
+# allowed and simply skips the bump. The invariant is that any given version can
+# be tagged exactly once, and the "tag already exists" guard is what enforces it.
+d=$(fixture)
+before=$(git -C "$d" rev-parse HEAD)
+( cd "$d" && "$release_sh" 0.1.0 >/dev/null 2>&1 )
+check "cuts a first release at the current version" 0 $?
+
+assert "the first-release tag exists"  git -C "$d" rev-parse -q --verify refs/tags/v0.1.0
+assert "the manifest is left alone"    grep -q '^version = "0.1.0"' "$d/Cargo.toml"
+
+# The bump branch commits; this branch must not, or every first release would
+# carry an empty "chore: release" commit.
+if [ "$(git -C "$d" rev-parse HEAD)" = "$before" ]; then
+  ok "no empty commit is created"
+else
+  not_ok "no empty commit is created"
+fi
+
+if [ -z "$(git -C "$d" status --porcelain)" ]; then
+  ok "the tree is clean after a first release"
+else
+  not_ok "the tree is clean after a first release"
+fi
+
+# What the dropped same-version guard was really protecting: releasing a version
+# twice. That is now the tag guard's job, so prove it does it.
+( cd "$d" && "$release_sh" 0.1.0 >/dev/null 2>&1 )
+check "refuses to cut the same version twice" 1 $?
 rm -rf "$d"
 
 echo
@@ -243,15 +279,34 @@ cd "$(git rev-parse --show-toplevel)"
 [ -z "$(git status --porcelain)" ] || die "working tree is dirty"
 
 cur=$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[0].version')
-[ "$cur" != "$new" ] || die "already at $new"
 
+# The only guard against releasing a version twice, and deliberately the only
+# one. There is no "refuses the version you are already on" check: a crate's
+# first release has nothing to bump, and refusing it made this script unusable
+# for the one release every fork of this template cuts first. The invariant is
+# that any given version can be tagged exactly once, and this enforces it.
 ! git rev-parse -q --verify "refs/tags/v$new" >/dev/null || die "tag v$new already exists"
 
-# Scoped to the [package] table. `version = "0.1.0"` also appears under
-# [package.metadata.packager], and a dependency could be pinned to the same
-# string -- both are indistinguishable from the real one to sed. The lookahead is
-# line-anchored (^\[) rather than a plain [^\[]* so an array value inside
-# [package], such as `keywords = [...]`, does not truncate the table.
+# First release: the manifest already carries the version being tagged, so there
+# is nothing to edit and nothing to commit. Tag the current commit and stop --
+# committing anyway would put an empty "chore: release" on every first release.
+if [ "$cur" = "$new" ]; then
+  git tag -a "v$new" -m "v$new"
+  echo "tagged v$new (manifest was already at $new, so no bump was needed)"
+  echo "push when ready:  git push origin v$new"
+  exit 0
+fi
+
+# Scoped to the [package] table, not substituted across the file. This manifest
+# already carries a second `version = "0.1.0"` under [package.metadata.packager],
+# and a dependency could be pinned to the same string -- both are
+# indistinguishable from the real one to sed.
+#
+# The lookahead is line-anchored (^\[) rather than a plain [^\[]*, which would
+# stop at the '[' opening an array value such as `keywords = [...]`. Measured:
+# the truncating form never corrupts the manifest -- it captures a short table,
+# finds no version key, and refuses -- but it refuses on manifests this form
+# handles, so the anchored one is what keeps working as [package] grows.
 python3 - "$new" <<'PY'
 import pathlib
 import re
@@ -298,7 +353,17 @@ chmod +x scripts/release.sh
 scripts/test-release.sh
 ```
 
-Expected: `13 passed, 0 failed`, exit 0.
+Expected: `18 passed, 0 failed`, exit 0.
+
+> **Amended after the real v0.1.0 release.** The task originally specified a
+> guard that refused a version equal to the current one, and the suite asserted
+> it (`refuses the version it is already at`, 13 assertions total). That guard
+> made the script unusable for a crate's *first* release, which is the one every
+> fork cuts first — the real `v0.1.0` had to be tagged by hand. Requirement 3 is
+> now inverted: `new == cur` tags the current commit and skips the bump and the
+> commit entirely. Six assertions replace the removed one, including that no
+> empty commit is created and that the same version cannot be tagged twice. See
+> spec §7.1.
 
 - [ ] **Step 5: Mutation-check the table scoping**
 
@@ -317,6 +382,17 @@ Expected: exactly one assertion flips — `NOT OK  the [package.metadata] versio
 `r"(?ms)^\[package\]\s*\n.*?(?=^\[|\Z)"` to `r"(?ms)^\[package\][^\[]*"`.
 
 Expected: **6 failures**, starting with `bumps, commits, and tags`.
+
+**(c) The first-release path must not commit.** Add
+`git commit -q --allow-empty -m "chore: release v$new"` before the `git tag` in
+the `[ "$cur" = "$new" ]` branch. Expected: one failure,
+`no empty commit is created`.
+
+**(d) The duplicate-tag guard.** Replace the `! git rev-parse … || die` line with
+`:`. Expected: two failures — `refuses a tag that already exists` and `refuses to
+cut the same version twice`, both exiting 128 as git rejects the existing tag
+instead. That guard now carries the whole "release a version once" invariant, so
+it is worth knowing it can fail.
 
 > **Amended during execution.** Mutation (b) was originally expected to corrupt
 > the manifest. Measured: it does not. The truncating regex captures a short
@@ -443,7 +519,8 @@ jobs:
       - uses: actions/checkout@v4
 
       # perl and pkg-config are for the vendored OpenSSL that libssh2-sys pulls
-      # in on every unix target (git2 = vendored-libgit2 + ssh). macos-latest and
+      # in on every unix target (git2 = vendored-libgit2 + ssh). make already
+      # comes with build-essential on the GitHub runners. macos-latest and
       # windows-latest need nothing extra: macOS gets perl and make from the
       # Xcode CLT, and Windows MSVC builds no OpenSSL at all.
       - name: Install Linux system deps
@@ -481,8 +558,8 @@ jobs:
           cargo build --release --locked
           cargo packager --release --formats ${{ matrix.formats }} --verbose
 
-      # macos-latest is arm64, so a plain build ships an Apple-Silicon-only .dmg and
-      # Intel Macs get nothing. Build both targets here and lipo them into one.
+      # macos-latest is arm64, so a plain build ships an Apple-Silicon-only .dmg
+      # and Intel Macs get nothing. Build both targets here and lipo them into one.
       - name: Build, lipo, sign, and package (macOS universal)
         if: runner.os == 'macOS'
         run: |
@@ -508,8 +585,8 @@ jobs:
           cargo packager --release --target universal-apple-darwin --formats dmg --verbose
 
       # Staged flat rather than uploaded by glob, for two independent reasons.
-      # upload-artifact roots an artifact at the least common ancestor of its search
-      # paths, so listing target/release/*.deb beside
+      # upload-artifact roots an artifact at the least common ancestor of its
+      # search paths, so listing target/release/*.deb beside
       # target/universal-apple-darwin/release/*.dmg would root at target/ and keep
       # the nesting -- publish's dist/ would then hold directories, not files.
       # And an exact count catches a leg that emits one file where two were

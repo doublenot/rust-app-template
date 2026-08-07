@@ -20,9 +20,23 @@ cd "$(git rev-parse --show-toplevel)"
 [ -z "$(git status --porcelain)" ] || die "working tree is dirty"
 
 cur=$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[0].version')
-[ "$cur" != "$new" ] || die "already at $new"
 
+# The only guard against releasing a version twice, and deliberately the only
+# one. There is no "refuses the version you are already on" check: a crate's
+# first release has nothing to bump, and refusing it made this script unusable
+# for the one release every fork of this template cuts first. The invariant is
+# that any given version can be tagged exactly once, and this enforces it.
 ! git rev-parse -q --verify "refs/tags/v$new" >/dev/null || die "tag v$new already exists"
+
+# First release: the manifest already carries the version being tagged, so there
+# is nothing to edit and nothing to commit. Tag the current commit and stop --
+# committing anyway would put an empty "chore: release" on every first release.
+if [ "$cur" = "$new" ]; then
+  git tag -a "v$new" -m "v$new"
+  echo "tagged v$new (manifest was already at $new, so no bump was needed)"
+  echo "push when ready:  git push origin v$new"
+  exit 0
+fi
 
 # Scoped to the [package] table, not substituted across the file. This manifest
 # already carries a second `version = "0.1.0"` under [package.metadata.packager],
