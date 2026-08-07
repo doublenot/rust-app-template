@@ -72,7 +72,37 @@ fn build_menu(model: &[Entry]) -> anyhow::Result<(Menu, HashMap<MenuId, TrayActi
     Ok((menu, actions))
 }
 
-/// 32x32 solid rounded-square RGBA icon so the template needs no binary assets.
+/// Side length of the tray icon. Small because tray icons are drawn tiny, and
+/// `icons/icon.png` is 512x512 — handing that to the tray wastes memory and, on
+/// some desktops, gets scaled worse than doing it here.
+const TRAY_PX: u32 = 32;
+
+/// The tray icon, decoded from the same `icons/icon.png` the installers use, so
+/// replacing that one file rebrands the app everywhere it appears.
+///
+/// Embedded with `include_bytes!` rather than read at runtime, to match how
+/// `app.toml` is embedded: the binary stays self-contained and there is no file
+/// to lose between build and install.
+fn tray_icon() -> Icon {
+    // A generated square is a poor icon but a missing tray is worse -- the tray
+    // carries Settings, Sync now and Restart, so failing to build it would take
+    // the app's only controls with it. Degrade rather than propagate.
+    decode_png_icon(include_bytes!("../icons/icon.png")).unwrap_or_else(default_icon)
+}
+
+fn decode_png_icon(bytes: &[u8]) -> Option<Icon> {
+    let img = image::load_from_memory_with_format(bytes, image::ImageFormat::Png).ok()?;
+    let scaled = image::imageops::resize(
+        &img.to_rgba8(),
+        TRAY_PX,
+        TRAY_PX,
+        image::imageops::FilterType::Lanczos3,
+    );
+    Icon::from_rgba(scaled.into_raw(), TRAY_PX, TRAY_PX).ok()
+}
+
+/// 32x32 solid rounded-square RGBA icon, used only when the PNG cannot be
+/// decoded. Kept so the tray can always be built.
 fn default_icon() -> Icon {
     const S: u32 = 32;
     let mut rgba = Vec::with_capacity((S * S * 4) as usize);
@@ -96,7 +126,7 @@ pub fn build(model: &[Entry], tooltip: &str) -> anyhow::Result<Tray> {
     let tray = TrayIconBuilder::new()
         .with_menu(Box::new(menu))
         .with_tooltip(tooltip)
-        .with_icon(default_icon())
+        .with_icon(tray_icon())
         .build()?;
     Ok(Tray { tray, actions })
 }
@@ -122,6 +152,28 @@ mod tests {
                 open_url: "https://example.com".to_string(),
             }],
         }
+    }
+
+    #[test]
+    fn the_shipped_icon_decodes_rather_than_falling_back() {
+        // The fallback exists so a broken PNG cannot take the tray down with it,
+        // which also means a broken PNG is silent. This is what makes it loud:
+        // replace icons/icon.png with something undecodable and this fails,
+        // instead of the app shipping a blue square nobody chose.
+        assert!(
+            decode_png_icon(include_bytes!("../icons/icon.png")).is_some(),
+            "icons/icon.png must decode as PNG -- the tray would silently fall \
+             back to the generated placeholder square"
+        );
+    }
+
+    #[test]
+    fn a_broken_icon_falls_back_instead_of_panicking() {
+        assert!(decode_png_icon(b"not a png at all").is_none());
+        assert!(decode_png_icon(&[]).is_none());
+        // The PNG magic number followed by nothing usable: past the sniffing
+        // stage, so it exercises the decode failure rather than format detection.
+        assert!(decode_png_icon(&[0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a]).is_none());
     }
 
     #[test]
