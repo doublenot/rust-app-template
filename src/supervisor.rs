@@ -229,11 +229,27 @@ mod tests {
                     return;
                 };
                 // Drain the request before answering it. Closing a socket whose receive
-                // buffer still holds unread bytes is an *abortive* close on Windows -- the
-                // stack sends RST instead of FIN, and the reset outruns the response we just
-                // wrote, so every poll `wait_healthy` makes fails and the 5s budget expires.
-                // This is the whole of why the test failed on windows-latest and nowhere
-                // else; the real child servers this stands in for read their requests.
+                // buffer still holds unread bytes is an *abortive* close on Windows: the
+                // teardown outruns the response we just wrote, hyper fails the exchange in
+                // SendRequest, and every poll `wait_healthy` makes fails until the 5s budget
+                // expires. This is the whole of why the test failed on windows-latest and
+                // nowhere else; the real child servers this stands in for read their requests.
+                //
+                // Measured on the runner rather than reasoned, because this machine cannot
+                // reproduce it -- all four combinations below pass on Linux. 5 requests each,
+                // `os=windows`:
+                //
+                //     drain  shutdown            result
+                //     no     no                  0/5, os error 10053
+                //     yes    no                  5/5
+                //     no     yes                 0/5, os error 10053
+                //     yes    yes                 5/5
+                //
+                // So the drain is the entire fix and a graceful `shutdown()` is worth nothing
+                // here -- the abort comes from the unread bytes, not from skipping the FIN,
+                // and 10053 is WSAECONNABORTED (the local stack tore it down), not the
+                // WSAECONNRESET a peer's RST would raise. Do not "simplify" this by keeping
+                // a shutdown and dropping the read loop; that is the combination that fails.
                 let mut req = Vec::new();
                 loop {
                     let mut buf = [0u8; 1024];
@@ -252,8 +268,6 @@ mod tests {
                 let _ = sock
                     .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 0\r\n\r\n")
                     .await;
-                // FIN, not RST: let the client read what we wrote.
-                let _ = sock.shutdown().await;
             }
         });
         wait_healthy(&format!("http://{addr}/"), Duration::from_secs(5))

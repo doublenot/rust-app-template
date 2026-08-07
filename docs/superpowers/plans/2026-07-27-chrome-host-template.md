@@ -1047,11 +1047,27 @@ mod tests {
                     return;
                 };
                 // Drain the request before answering it. Closing a socket whose receive
-                // buffer still holds unread bytes is an *abortive* close on Windows -- the
-                // stack sends RST instead of FIN, and the reset outruns the response we just
-                // wrote, so every poll `wait_healthy` makes fails and the 5s budget expires.
-                // This is the whole of why the test failed on windows-latest and nowhere
-                // else; the real child servers this stands in for read their requests.
+                // buffer still holds unread bytes is an *abortive* close on Windows: the
+                // teardown outruns the response we just wrote, hyper fails the exchange in
+                // SendRequest, and every poll `wait_healthy` makes fails until the 5s budget
+                // expires. This is the whole of why the test failed on windows-latest and
+                // nowhere else; the real child servers this stands in for read their requests.
+                //
+                // Measured on the runner rather than reasoned, because this machine cannot
+                // reproduce it -- all four combinations below pass on Linux. 5 requests each,
+                // `os=windows`:
+                //
+                //     drain  shutdown            result
+                //     no     no                  0/5, os error 10053
+                //     yes    no                  5/5
+                //     no     yes                 0/5, os error 10053
+                //     yes    yes                 5/5
+                //
+                // So the drain is the entire fix and a graceful `shutdown()` is worth nothing
+                // here -- the abort comes from the unread bytes, not from skipping the FIN,
+                // and 10053 is WSAECONNABORTED (the local stack tore it down), not the
+                // WSAECONNRESET a peer's RST would raise. Do not "simplify" this by keeping
+                // a shutdown and dropping the read loop; that is the combination that fails.
                 let mut req = Vec::new();
                 loop {
                     let mut buf = [0u8; 1024];
@@ -1070,8 +1086,6 @@ mod tests {
                 let _ = sock
                     .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 0\r\n\r\n")
                     .await;
-                // FIN, not RST: let the client read what we wrote.
-                let _ = sock.shutdown().await;
             }
         });
         wait_healthy(&format!("http://{addr}/"), Duration::from_secs(5))
@@ -1249,12 +1263,19 @@ pub async fn wait_healthy(url: &str, timeout: Duration) -> Result<(), String> {
 > **Amended by the first CI run on Windows.** Two changes above, one in the test and one in
 > `wait_healthy` itself. The test's stand-in server wrote its response and dropped the socket
 > without ever reading the request; closing a socket whose receive buffer still holds unread
-> bytes is an abortive close on Windows, so the RST outran the response and every poll failed
-> until the 5s budget expired — systematically, on `windows-latest` only. The discriminating
-> evidence is that `internal_server`'s loopback tests, which run a real axum server that does
-> read its requests, passed on the same run. The server now drains the request, answers, and
-> shuts the write half down with FIN; the test asserts the drained request so the fix is
-> pinned on every platform rather than taken on faith about one nobody here can run.
+> bytes is an abortive close on Windows, so the teardown outran the response and every poll
+> failed until the 5s budget expired — systematically, on `windows-latest` only. The server
+> now drains the request before answering, and the test asserts the drained request so the fix
+> is pinned on every platform rather than taken on faith about one nobody here can run.
+>
+> The 2×2 was then measured on the runner, because a green suite proves the fix and not the
+> explanation. Five requests per configuration, `os=windows`: no drain scores **0/5** with or
+> without a graceful `shutdown()`, and drain scores **5/5** with or without one. So the drain
+> is the whole fix; the first version of this amendment also shut the write half down and
+> credited the FIN, which measurably does nothing. The error is `os error 10053`
+> (`WSAECONNABORTED`, the local stack tearing it down), not the 10054 `WSAECONNRESET` a peer's
+> RST would raise. All four configurations pass on Linux, which is why this survived every
+> gate that ran here.
 >
 > `wait_healthy` discarded the transport error, so its timeout could only ever say that the
 > server did not come up and never why — the reason this took a second CI round to diagnose.

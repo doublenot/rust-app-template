@@ -235,21 +235,52 @@ one refusal that was already `invalid_request` is now documented as also firing 
 | **1** | `registry.rs`, task 4 | all three legs, no tests ran | **[blocking]** `clippy::question_mark` in Rust 1.97 sees through `match host.find(']') { Some(j) => …, None => return None }`. CI pins `dtolnay/rust-toolchain@stable`, which floats; the local gate was 1.95 and genuinely clean, so the merge turned every matrix leg red on a lint that did not exist when the code was written. The rewrite is what the lint asks for and what the same function already does one arm above. The `remote_host` table gains a row for the unterminated bracket, because the arm was otherwise vacuous and `Some("[::1")` is a host a stored credential could bind to that is not the host we would connect to |
 | **2** | `mod.rs`, tasks 5–9 | **8** | **[blocking]** The job-test fixture `const REMOTE: &str = "/nonexistent/origin.git"` is not an absolute path on Windows — `Path::is_absolute` wants a drive or UNC prefix there — so `start_job`'s pre-admission `validate_remote` refused it and eight job tests failed at their scaffolding, before touching anything they were written to test. `cfg!(windows)`-selected now. Nothing asserts on the literal or builds a path from it, so the swap is inert: every use is `Some(REMOTE)` into `repo_def` |
 | **3** | `registry.rs`, task 4 | **1** | **[blocking]** `validate_remote_accepts_the_documented_forms` asserted `/srv/repos/x.git` is accepted, which is true only off Windows. Same cause as #2, different site, and the one that says what the product should do: the behaviour is right and was right, because a drive-relative remote stored now and resolved later, against whatever drive happens to be current, is exactly the ambiguity worth refusing. It was the fixtures and the *documentation* that were POSIX-only — README §9 and spec §4.2 both said "an absolute local path" flat. The test now asserts the foreign form's refusal as well, so the dependence is pinned in both directions |
-| **4** | `supervisor.rs` | **1** | **[blocking, pre-existing]** `wait_healthy_succeeds_once_server_responds` has failed on `windows-latest` since before this subsystem existed — it was the sole failure on `main@9e03fad2` in July and nobody was watching. Its stand-in server writes the response and drops the socket without ever reading the request, and closing a socket whose receive buffer still holds unread bytes is an *abortive* close on Windows: RST rather than FIN, outrunning the response, so every poll fails until the 5s budget expires. Systematic, not flaky. The discriminating evidence is that `internal_server`'s loopback tests — a real axum server, which reads its requests — passed on the same run. The server drains, answers, then shuts the write half down; the test asserts the drained request, so the fix is pinned everywhere rather than believed about one platform |
+| **4** | `supervisor.rs` | **1** | **[blocking, pre-existing]** `wait_healthy_succeeds_once_server_responds` has failed on `windows-latest` since before this subsystem existed — it was the sole failure on `main@9e03fad2` in July and nobody was watching. Its stand-in server writes the response and drops the socket without ever reading the request, and closing a socket whose receive buffer still holds unread bytes is an *abortive* close on Windows: the teardown outruns the response, hyper fails the exchange in `SendRequest`, and every poll fails until the 5s budget expires. Systematic, not flaky. The server drains the request before answering; the test asserts the drained request, so the fix is pinned everywhere rather than believed about one platform. See the measurement below — the first shipped explanation of *why* was half wrong |
 
 Finding 4 also exposed why the diagnosis needed a whole extra CI round: `wait_healthy` discarded
 the transport error, so its timeout could say only *that* the server never came up. It now
 carries the last error or status into the message, which is the difference between a CI log that
 names a connection reset and one that names nothing.
 
-**Verified the way the other rounds were**, with one exception that CI has since closed. Findings
-1–3 are pinned by tests checked by mutation — reverting the fix in place and confirming the new
-assertion goes red. Finding 4's *cause* could not be reproduced on any machine available here:
-what mutation pinned was only that the drain happens at all, and the RST diagnosis itself rested
-on Winsock's documented `closesocket` behaviour, the systematic failure shape, and the axum
-control arm. CI was named the adjudicator and it agreed — `main@8af95cb` is green on all three
-legs, and `windows-latest` ran **378 tests, 373 passed, 0 failed, 5 ignored**, which is the
-previous run's 363 plus exactly the ten that were failing.
+**Verified the way the other rounds were**, with one exception that has since been closed twice
+over. Findings 1–3 are pinned by tests checked by mutation — reverting the fix in place and
+confirming the new assertion goes red. Finding 4's *cause* could not be reproduced on any machine
+available here: what mutation pinned was only that the drain happens at all, and the diagnosis
+itself rested on Winsock's documented `closesocket` behaviour, the systematic failure shape, and
+the control arm that `internal_server`'s loopback tests — a real axum server, which reads its
+requests — passed on the same run. CI was named the adjudicator and agreed: `main@8af95cb` is
+green on all three legs, and `windows-latest` ran **378 tests, 373 passed, 0 failed, 5 ignored**,
+the previous run's 363 plus exactly the ten that were failing.
+
+#### Finding 4, measured
+
+A green suite proves the *fix* and says nothing about the *explanation*, and the fix changed two
+things at once. So the 2×2 was run on the runner itself, on a throwaway branch opened as a PR —
+`pull_request` is the only trigger that reaches Windows without touching `main` — with the server
+answering five requests per configuration:
+
+| drain | shutdown | | `os=windows` | `os=linux` |
+|---|---|---|---|---|
+| ✗ | ✗ | the old server | **0/5**, os error 10053 | 5/5 |
+| ✓ | ✗ | | **5/5** | 5/5 |
+| ✗ | ✓ | | **0/5**, os error 10053 | 5/5 |
+| ✓ | ✓ | as first shipped | **5/5** | 5/5 |
+
+Two things this settles, and the shipped explanation got one of them wrong:
+
+- **The drain is the entire fix.** A graceful `shutdown()` buys nothing — it is 0/5 without the
+  drain and 5/5 is reached without it. The abort comes from the unread bytes, not from skipping
+  the FIN. The `shutdown()` call and its "FIN, not RST" comment have been removed, because a line
+  that reads as protective and measurably is not is exactly what would tempt the next reader to
+  keep it and drop the read loop — the one combination that fails.
+- **The errno is 10053, `WSAECONNABORTED`**, reported through hyper as
+  `client error (SendRequest) <- connection error <- An established connection was aborted by the
+  software in your host machine`. Not the 10054 `WSAECONNRESET` a peer's RST raises. The abortive
+  close is real; "the stack sends RST instead of FIN and the reset outruns the response" named the
+  wrong half of the teardown and the wrong error.
+
+Linux cannot discriminate any of it — all four configurations pass here, which is why the bug
+survived two audit rounds and a 60-run stability sweep.
 
 Both halves of #2 and #3's premise are **measured on the runner rather than taken from the
 docs**, and by the same run that failed. `Path::is_absolute` is false for a POSIX root there —
