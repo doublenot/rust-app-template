@@ -370,11 +370,60 @@ which **dies on launch** — not a Gatekeeper prompt, a crash. `codesign --force
 Because `--formats dmg` builds the `.app` in the same pass (§2), the signature
 must go on the binary *before* packaging copies it into `Contents/MacOS/`.
 
-**Epistemic status: unverified.** The SIGKILL behaviour is drawn from public
-reports, not from a machine available here, and no Mac in this project has run
-the resulting app. §9 puts `lipo -info` and `codesign --verify` in the run log so
-the build side is proven; confirming the app actually *launches* needs a human
-with a Mac and is listed in §10 as out of scope for the pipeline itself.
+**This section was wrong, and a Mac proved it.** See §5.8. Signing the binary is
+necessary and is *not* sufficient: Gatekeeper validates the bundle, not the
+executable inside it. The paragraph above stands as far as it goes; what it
+missed is everything the bundle needs.
+
+### 5.8 Signing the binary is not signing the bundle
+
+v0.1.2 was installed on a real Mac and macOS offered to **move it to the Trash
+as damaged**. That is the outcome §2.5 of `docs/macos.md` listed as the worst of
+three, and §5.4 had predicted an unidentified-developer warning instead.
+
+The reasoning failed at a join. §5.4 correctly established that the `lipo`'d
+binary must be ad-hoc signed, and §2 correctly established that cargo-packager
+signs nothing without a configured identity. Both were true, and the conclusion
+drawn from them — sign the binary before packaging copies it in — quietly
+assumed that a validly signed executable makes a valid *app*. It does not.
+Gatekeeper validates the bundle: `Hitch.app` had no `_CodeSignature` at all, and
+a quarantined download of an unsigned bundle is precisely what "damaged" means.
+
+Nothing in CI could have caught this. The job runs `codesign --verify` **on the
+binary**, and it passes — the binary was never the problem.
+
+The fix is to let cargo-packager do the signing it already knows how to do:
+
+```toml
+[package.metadata.packager.macos]
+signing-identity = "-"
+```
+
+Measured on the runner (run `31196542098`), that one line makes it:
+
+```
+Codesigning .../Hitch.app
+Running Command `"xattr" "-cr" ".../Hitch.app"`
+Codesigning .../Hitch.app/Contents/MacOS/hitch
+Codesigning .../Hitch.app with identity "-"
+Codesigning .../Hitch_0.1.2_universal.dmg
+```
+
+— the executable, the bundle, *and* the disk image, with extended attributes
+cleared first. The risk that held this on a branch did not materialise:
+cargo-packager passes `--timestamp`, ad-hoc signatures cannot be timestamped,
+and `codesign` accepted the combination anyway rather than failing the leg.
+
+**Still unverified:** that this turns "damaged" into an ordinary
+unidentified-developer block. Ad-hoc signing is not Developer ID and does not
+notarize anything, so macOS will still refuse the first launch — the claim being
+made is only that it refuses it *for the right reason*, recoverably. That needs
+the same Mac again, against a build carrying this fix.
+
+**The general lesson, which is why §5.4 is left standing rather than rewritten:**
+two separately-correct findings were combined into a conclusion neither
+supported, and it survived a green pipeline, a verified checksum, and a released
+artifact. It took a person opening the app.
 
 ### 5.5 Cost
 

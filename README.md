@@ -474,13 +474,18 @@ The `.dmg` contains a universal binary — `aarch64-apple-darwin` and
 `x86_64-apple-darwin` both built on the arm64 runner and combined with `lipo` —
 so one download serves Apple Silicon and Intel.
 
-It is **ad-hoc signed** (`codesign --sign -`), and that is required rather than
-cosmetic: `lipo` output carries only the minimal signature the Apple linker
-applies, and recent macOS refuses to run linker-signed-only binaries on Apple
-Silicon. Ad-hoc signing makes the app *run*; it does not make it *trusted*.
-Gatekeeper still reports an unidentified developer, so the first launch needs
-right-click → **Open**. Real signing and notarization remain a per-app TODO
-(§7 above).
+It is **ad-hoc signed** — the binary, the `.app` bundle, and the `.dmg`. That is
+required rather than cosmetic. `lipo` output carries only the minimal signature
+the Apple linker applies, and recent macOS refuses to run linker-signed-only
+binaries on Apple Silicon; and Gatekeeper validates the *bundle*, so signing the
+binary alone leaves the app reading as damaged (fixed after v0.1.2 — see
+`docs/macos.md` §1).
+
+Ad-hoc signing makes the app *run*; it does not make it *trusted*. macOS still
+refuses the first launch, and on **macOS 15 (Sequoia) and later the old
+right-click → Open trick no longer works** — you must allow the app in System
+Settings → Privacy & Security. Real signing and notarization remain a per-app
+TODO (§7 above).
 
 **[`docs/macos.md`](docs/macos.md)** covers macOS specifically: a checklist for
 verifying a downloaded `.dmg`, how to build a universal one locally, and what to
