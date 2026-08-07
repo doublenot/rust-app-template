@@ -752,6 +752,27 @@ mod tests {
     }
 
     #[test]
+    fn the_crate_names_an_author_so_the_deb_gets_a_maintainer() {
+        // cargo-packager writes the .deb's `Maintainer:` from CARGO_PKG_AUTHORS.
+        // Omitting `authors` does NOT omit the field: cargo reports an absent
+        // list as an empty one, so the control file ships `Maintainer:` with
+        // nothing after it. dpkg warns on install, copies the malformed record
+        // into /var/lib/dpkg/status, and then warns on every later dpkg run on
+        // that machine -- a defect the user carries around, not a one-off.
+        let authors = env!("CARGO_PKG_AUTHORS");
+        assert!(
+            !authors.trim().is_empty(),
+            "Cargo.toml [package].authors must not be empty"
+        );
+        // Debian's format is `Name <email>`. An author string without one is
+        // accepted by cargo and rejected by anything that lints a package.
+        assert!(
+            authors.contains('<') && authors.contains('@') && authors.contains('>'),
+            "authors must be `Name <email>` for the deb Maintainer; got {authors:?}"
+        );
+    }
+
+    #[test]
     fn shipped_git_block_is_commented_out_but_valid() {
         assert!(!AppConfig::load().unwrap().git_enabled());
         // The shipped `[git]` block is documentation users uncomment. Rename a key
