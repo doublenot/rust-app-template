@@ -38,13 +38,38 @@ Fixed after v0.1.2 by having cargo-packager sign the bundle
 
 ## 2. Testing a published release
 
-### 2.1 Download and verify
+### 2.1 Download
+
+**How you download decides what you are able to test.** macOS attaches the
+`com.apple.quarantine` extended attribute to files fetched by browsers and other
+quarantine-aware apps. Gatekeeper only engages on quarantined files — so a
+`.dmg` fetched with `curl`, `wget` or `gh` opens with **no prompt at all**,
+regardless of whether it is signed.
+
+| method | quarantined? | good for |
+|---|---|---|
+| Browser (Safari, Chrome, Firefox) | yes | testing Gatekeeper — this is what a user actually does |
+| `curl` / `wget` / `gh release download` | **no** | checksums, inspecting the build, scripting |
+
+For a Gatekeeper test, download from the
+[releases page](https://github.com/doublenot/rust-app-template/releases) in a
+browser, then confirm the flag is really there before you install:
+
+```bash
+xattr -p com.apple.quarantine ~/Downloads/Hitch_*_universal.dmg
+```
+
+A value printed means the test is real. `No such xattr` means the download
+bypassed Gatekeeper and any result you get is meaningless.
+
+#### Terminal download, for checksums and inspection
 
 ```bash
 cd ~/Downloads
-VER=0.1.2
-curl -LO "https://github.com/doublenot/rust-app-template/releases/download/v$VER/Hitch_${VER}_universal.dmg"
-curl -LO "https://github.com/doublenot/rust-app-template/releases/download/v$VER/SHA256SUMS"
+VER=0.1.3
+BASE=https://github.com/doublenot/rust-app-template/releases/download/v$VER
+curl -LO "$BASE/Hitch_${VER}_universal.dmg"
+curl -LO "$BASE/SHA256SUMS"
 shasum -a 256 -c SHA256SUMS --ignore-missing
 ```
 
@@ -52,7 +77,7 @@ Use `shasum -a 256`, not `sha256sum` — macOS ships the Perl implementation fro
 `Digest::SHA`, not GNU coreutils. `--ignore-missing` lets you check the one file
 you downloaded instead of requiring all four.
 
-Expected: `Hitch_0.1.2_universal.dmg: OK`.
+Expected: `Hitch_0.1.3_universal.dmg: OK`.
 
 If your `shasum` is old enough to reject `--ignore-missing`, compare by hand
 instead — this works on every version:
@@ -63,6 +88,25 @@ grep 'universal\.dmg$' SHA256SUMS
 ```
 
 The two hashes must match.
+
+#### Making a terminal download testable
+
+If you would rather stay in the terminal, apply the quarantine flag yourself.
+The attribute is `flags;date;agent;UUID`, and `0081` is the code for "has not
+been executed yet":
+
+```bash
+xattr -w com.apple.quarantine \
+  "0081;$(printf %x $(date +%s));Safari;$(uuidgen)" \
+  "Hitch_${VER}_universal.dmg"
+
+xattr -p com.apple.quarantine "Hitch_${VER}_universal.dmg"   # confirm it took
+```
+
+The flag propagates to the `.app` when you copy it out of the mounted image, so
+the rest of §2 then behaves exactly as it would for a browser download. This is
+a testing convenience, not a security measure — you are re-creating a check you
+could equally have skipped.
 
 ### 2.2 Install
 
