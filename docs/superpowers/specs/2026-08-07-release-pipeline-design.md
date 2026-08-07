@@ -547,6 +547,39 @@ version bump because `Cargo.toml` is already at `0.1.0`, so the gate passes as-i
 Cleanup afterwards: delete the draft release, then both tags locally and on the
 remote.
 
+### 9.1 What the runners actually measured
+
+All three runs were performed on 2026-08-07. It took **five** runs, not three,
+because the first dry run and the first published release each found a defect.
+
+| run | id | outcome |
+|---|---|---|
+| dry run | `31183489259` | **failed.** Linux: `expected 2 artifact(s) on Linux, got 1` — the matrix was written as a YAML flow mapping, so `formats: deb,appimage` parsed as `formats: "deb"` plus a junk key. macOS: `Failed to copy … /gen_icons` → defect 6, §5.6. Windows passed, promoting NSIS to *measured*. |
+| dry run | `31184474049` | **passed.** All three legs green, `publish` skipped, all four filenames confirmed — promoting dmg to *measured*. |
+| negative | — | **passed.** `verify` failed with `tag v9.9.9 != crate version 0.1.0`; `package` and `publish` both skipped, so the matrix never started. |
+| positive | `31185495123` | **published, then failed verification.** Draft correct, five assets — but the downloaded `.dmg` did not match `SHA256SUMS`, because GitHub had renamed it. → §5.7. |
+| positive | `31185885528` | **passed.** `sha256sum -c SHA256SUMS` exits 0 on all four downloaded installers with no `--ignore-missing`. |
+
+The macOS build-side reasoning in §5.4 is confirmed:
+
+```
+Architectures in the fat file: …/chrome-host-app are: x86_64 arm64
+…/chrome-host-app: replacing existing signature
+…/chrome-host-app: valid on disk
+…/chrome-host-app: satisfies its Designated Requirement
+```
+
+`replacing existing signature` is the detail worth keeping: it confirms the
+`lipo` output really did carry the linker signature §5.4 predicted, which is what
+made the ad-hoc `codesign` necessary rather than decorative.
+
+**Scorecard.** The design predicted all four filenames correctly, including that
+the `.dmg` would carry spaces. It did not predict that a second bin target would
+be packaged into every installer, nor that GitHub would rewrite an asset name.
+Both were found by running the thing — the first by an assertion written for
+exactly that failure, the second only by downloading a real release and checking
+it. Neither was reachable by reading.
+
 ---
 
 ## 10. Out of scope
