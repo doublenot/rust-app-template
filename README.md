@@ -308,8 +308,13 @@ and, on Linux, the tray runtime library.
 Google Chrome is a **runtime** requirement on every OS, never a build-time
 one. Cross-compiling between OSes is not supported — build on each target
 OS, or let CI do it: `.github/workflows/ci.yml` builds and tests all three
-platforms on every push, and the release workflow packages installers for
-all three on every `v*` tag (see §8).
+platforms on pull requests and on pushes to `main`, and the release workflow
+packages installers for all three on every `v*` tag (see §8).
+
+Note the trigger list: a branch pushed to the remote **without** a pull request
+gets no CI at all, so the macOS and Windows legs first see the work only after
+it has already landed on `main`. Open a pull request for anything non-trivial
+even when you intend to fast-forward it.
 
 ### Why perl and make
 
@@ -398,13 +403,68 @@ are a per-app TODO:
 - macOS notarization: <https://developer.apple.com/documentation/security/notarizing_macos_software_before_distribution>
 - Windows code signing: <https://learn.microsoft.com/windows/msix/package/signing-package-overview>
 
+The release workflow pins **cargo-packager 0.11.8** (`PACKAGER_VERSION` in
+`.github/workflows/release.yml`). The installer filenames come from format
+strings inside that tool and the workflow globs them, so pin the same version
+locally if you want to reproduce what CI produces.
+
 ## 8. Releasing
 
-Pushing a tag matching `v*` (e.g. `v1.0.0`) triggers the GitHub Actions
-release workflow (`.github/workflows/release.yml`), which runs
-`cargo build --release --locked` followed by `cargo packager --release` on
-each supported OS runner and attaches the resulting installers to the
-GitHub release for that tag.
+`Cargo.toml` is the authority on the version. Cut a release with:
+
+```bash
+scripts/release.sh 1.2.0   # bumps [package].version, syncs Cargo.lock,
+                           # commits, and creates the v1.2.0 tag
+git push origin main
+git push origin v1.2.0     # this is what starts the release
+```
+
+`scripts/release.sh` deliberately does not push. It refuses a dirty tree, a
+version that is not semver, the version you are already on, and a tag that
+already exists.
+
+Pushing the tag triggers `.github/workflows/release.yml`, which:
+
+1. **Checks the tag against the crate version**, failing in seconds with
+   `::error::tag v1.2.0 != crate version 0.1.0` if they disagree. Without this a
+   mismatched tag spends half an hour building installers named after the wrong
+   version.
+2. **Builds and packages on three runners** — `.deb` and AppImage on Linux, a
+   universal `.dmg` on macOS, an NSIS `-setup.exe` on Windows.
+3. **Creates one draft release** carrying all four installers plus
+   `SHA256SUMS`. Every leg must succeed: if one fails, no release is created at
+   all, so you never get a partial release that looks finished.
+
+The release is a **draft**. Review it and publish it yourself — a broken build
+never becomes public on its own.
+
+Verify a download against the published checksums:
+
+```bash
+sha256sum -c SHA256SUMS --ignore-missing
+```
+
+### Dry runs
+
+The workflow also accepts `workflow_dispatch`. Running it from the Actions tab
+**against a branch** builds all three legs and uploads the installers as workflow
+artifacts without touching a release — the way to check a packaging change before
+committing to a tag. Running it **against a tag** does publish, which is how to
+re-cut a release whose upload failed.
+
+### macOS: universal, and ad-hoc signed
+
+The `.dmg` contains a universal binary — `aarch64-apple-darwin` and
+`x86_64-apple-darwin` both built on the arm64 runner and combined with `lipo` —
+so one download serves Apple Silicon and Intel.
+
+It is **ad-hoc signed** (`codesign --sign -`), and that is required rather than
+cosmetic: `lipo` output carries only the minimal signature the Apple linker
+applies, and recent macOS refuses to run linker-signed-only binaries on Apple
+Silicon. Ad-hoc signing makes the app *run*; it does not make it *trusted*.
+Gatekeeper still reports an unidentified developer, so the first launch needs
+right-click → **Open**. Real signing and notarization remain a per-app TODO
+(§7 above).
 
 ## 9. Git service
 
