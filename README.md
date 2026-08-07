@@ -14,6 +14,23 @@ and a system tray icon — Chrome only ever renders the page. There is no
 embedded webview and no bundled browser engine: it drives the Chrome already
 installed on the machine.
 
+### The window belongs to Chrome, and that shows
+
+Because the host launches the real Chrome binary rather than embedding a
+browser, the app-mode window is owned by the **Google Chrome** process. On macOS
+that means the Dock icon and the menu bar are Chrome's, not your app's, and no
+command-line flag changes it — it is the direct cost of not shipping a browser
+engine. Electron and Tauri avoid it by owning the window themselves, at the
+price of a bundled engine or a system webview.
+
+What you *can* brand: the tray icon and its tooltip (the host owns those), the
+page itself, and — on Linux and Windows, where Chrome takes an app window's icon
+from the page — the window icon, by serving a favicon from your app. On macOS
+the Dock is Chrome's regardless.
+
+Worth deciding early: if your app must look like its own application in the Dock,
+this template is the wrong shape for it.
+
 On a fresh clone, `app.toml`'s `[app].url` is empty, so the host serves a
 built-in placeholder page (from its internal loopback server) explaining
 that no URL is configured yet, and opens Chrome against that. Point `url` at
