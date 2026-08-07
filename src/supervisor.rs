@@ -269,6 +269,81 @@ mod tests {
         assert!(req.starts_with("GET / HTTP/1.1\r\n"), "got: {req:?}");
     }
 
+    /// THROWAWAY PROBE — this branch is not for merging.
+    ///
+    /// `wait_healthy_succeeds_once_server_responds` failed on windows-latest and nowhere else,
+    /// and the fix changed two things at once: the stand-in server now drains the request
+    /// before answering, and it shuts the write half down with FIN rather than dropping the
+    /// socket. The shipped explanation is that closing a socket whose receive buffer still
+    /// holds unread bytes is an *abortive* close on Windows, so the RST outruns the response.
+    ///
+    /// That was inferred, never measured — on Linux all four configurations below succeed, so
+    /// this machine cannot discriminate. This runs the matrix on the CI runner and panics with
+    /// the table, so the Windows job's log carries the answer.
+    #[tokio::test]
+    async fn probe_close_semantics() {
+        let mut table = String::new();
+        for (name, drain, shutdown) in [
+            ("no-drain no-shutdown (the old server)", false, false),
+            ("drain    no-shutdown                 ", true, false),
+            ("no-drain shutdown                    ", false, true),
+            ("drain    shutdown    (the new server)", true, true),
+        ] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            tokio::spawn(async move {
+                use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                while let Ok((mut sock, _)) = listener.accept().await {
+                    if drain {
+                        let mut req = Vec::new();
+                        loop {
+                            let mut buf = [0u8; 1024];
+                            match sock.read(&mut buf).await {
+                                Ok(0) => break,
+                                Ok(n) => {
+                                    req.extend_from_slice(&buf[..n]);
+                                    if req.windows(4).any(|w| w == b"\r\n\r\n") {
+                                        break;
+                                    }
+                                }
+                                Err(_) => break,
+                            }
+                        }
+                    }
+                    let _ = sock
+                        .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 0\r\n\r\n")
+                        .await;
+                    if shutdown {
+                        let _ = sock.shutdown().await;
+                    }
+                }
+            });
+            let client = reqwest::Client::builder()
+                .timeout(Duration::from_secs(2))
+                .build()
+                .unwrap();
+            let mut oks = 0;
+            let mut err = String::new();
+            for _ in 0..5 {
+                match client.get(format!("http://{addr}/")).send().await {
+                    Ok(r) if r.status().as_u16() < 400 => oks += 1,
+                    Ok(r) => err = format!("status {}", r.status()),
+                    // The whole point: the *source* is where WSAECONNRESET (10054) shows up.
+                    Err(e) => {
+                        err = format!("{e}");
+                        let mut src: &dyn std::error::Error = &e;
+                        while let Some(s) = std::error::Error::source(src) {
+                            err.push_str(&format!(" <- {s}"));
+                            src = s;
+                        }
+                    }
+                }
+            }
+            table.push_str(&format!("\n  {name}: {oks}/5 ok   err={err}"));
+        }
+        panic!("PROBE RESULTS (os={}){table}", std::env::consts::OS);
+    }
+
     #[tokio::test]
     async fn wait_healthy_times_out_when_nothing_listens() {
         // bind then drop to get a port that refuses connections
