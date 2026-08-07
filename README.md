@@ -444,6 +444,9 @@ Verify a download against the published checksums:
 sha256sum -c SHA256SUMS --ignore-missing
 ```
 
+(`--ignore-missing` lets you check a single installer without downloading all
+four. Drop it to require every listed file to be present.)
+
 ### Dry runs
 
 The workflow also accepts `workflow_dispatch`. Running it from the Actions tab

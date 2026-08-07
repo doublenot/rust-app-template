@@ -3,13 +3,19 @@
 Status: approved, ready to plan.
 
 Every filename and path below carries its provenance: **measured** means it was
-produced on this machine by `cargo-packager 0.11.8` and observed; **from source**
+produced and observed — on this machine or on a named CI run; **from source**
 means it was read out of the cargo-packager tree and has not yet been produced;
 **unverified** means neither, and the verification plan in §9 is what closes it.
 That distinction is the point of this document. The previous subsystem shipped a
 Windows fix whose stated mechanism turned out to be wrong even though the fix
 worked, and it was caught only by measuring on a real runner. This pipeline
 touches three operating systems, two of which cannot be exercised here.
+
+> **All four filenames in §2 are now measured.** The NSIS and dmg rows were
+> *from source* when this document was written and were confirmed by the dry runs
+> recorded in §9. The predictions were correct — including the `.dmg` carrying
+> spaces — but two things the design did *not* predict came out of the same runs
+> and are recorded as defect 6 (§5.6) and in §9.
 
 ---
 
@@ -76,7 +82,11 @@ defect 4 all over again.
 | deb | `chrome-host-app_0.1.0_amd64.deb` | `target/release/` | **measured** — 6.7 MB, Linux x86_64 |
 | AppImage | `chrome-host-app_0.1.0_x86_64.AppImage` | `target/release/` | **measured** — 16.0 MB, Linux x86_64 |
 | NSIS | `chrome-host-app_0.1.0_x64-setup.exe` | `target/release/` | **measured** — windows-latest, run 31183489259 |
-| dmg | `Chrome Host App_0.1.0_universal.dmg` | `target/universal-apple-darwin/release/` | **from source** — `format!("{}_{}_{}", config.product_name, config.version, arch)` |
+| dmg | `Chrome Host App_0.1.0_universal.dmg` | `target/universal-apple-darwin/release/` | **measured** — macos-latest, run 31184474049 |
+
+The `.dmg` is **published** as `Chrome-Host-App_0.1.0_universal.dmg`: §5.7 strips
+the spaces during staging, so the name above is what cargo-packager emits and the
+hyphenated one is what a user downloads.
 
 The `.dmg` is the outlier twice over, and both differences are load-bearing:
 
@@ -377,6 +387,33 @@ ERROR cargo_packager::cli: Failed to copy file from
 This is the third time in this design that the crate's *second* bin target has
 mattered — §5.3 derives the binary name from `default_run` for the same reason.
 A single-binary crate would never have surfaced any of it.
+
+### 5.7 Spaces are stripped during staging
+
+Added after the first *published* release. GitHub rewrites spaces in a release
+asset's filename: the `.dmg` was uploaded as
+`Chrome.Host.App_0.1.0_universal.dmg`, while `SHA256SUMS` recorded the name
+cargo-packager produced. Downloading the release and running the documented check
+gave:
+
+```
+sha256sum: 'Chrome Host App_0.1.0_universal.dmg': No such file or directory
+Chrome Host App_0.1.0_universal.dmg: FAILED open or read
+```
+
+and with the `--ignore-missing` that README §8 recommends it is worse than a
+failure — the command reports success while silently never verifying the one
+file that needed it.
+
+So the staging loop copies each artifact as `${base// /-}`. Spaces are gone
+before `SHA256SUMS` is computed, the uploaded name is the name in the manifest,
+and `sha256sum -c` round-trips. Only the file is renamed; `product-name` and the
+app's display name are untouched.
+
+This is the second defect in this design traceable to one root cause — the
+`.dmg` being the only artifact named from `product-name`, and therefore the only
+one with spaces in it. §2 flagged the spaces and said "any shell that handles it
+must quote", which was right and insufficient: the problem was not a shell.
 
 ---
 

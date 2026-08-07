@@ -532,7 +532,21 @@ jobs:
             echo "::error::expected $want artifact(s) on ${{ runner.os }}, got ${#found[@]}"
             exit 1; }
           mkdir -p dist
-          cp -- "${found[@]}" dist/
+          # Spaces are stripped here, before SHA256SUMS is computed over dist/.
+          # GitHub rewrites spaces in a release asset's filename -- it uploaded
+          # "Chrome Host App_0.1.0_universal.dmg" as
+          # "Chrome.Host.App_0.1.0_universal.dmg" -- so the name a user downloads
+          # would not be the name the manifest records, and `sha256sum -c` reports
+          # "No such file or directory" for it. With the --ignore-missing the
+          # README recommends it is worse: the check passes while silently never
+          # verifying the .dmg. Only the .dmg is affected, being the one format
+          # named from product-name. The app's display name is untouched; this
+          # renames the file only.
+          for f in "${found[@]}"; do
+            base=$(basename -- "$f")
+            cp -- "$f" "dist/${base// /-}"
+          done
+          ls -l dist/
 
       - uses: actions/upload-artifact@v4
         with:
