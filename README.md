@@ -482,6 +482,10 @@ Gatekeeper still reports an unidentified developer, so the first launch needs
 right-click → **Open**. Real signing and notarization remain a per-app TODO
 (§7 above).
 
+**[`docs/macos.md`](docs/macos.md)** covers macOS specifically: a checklist for
+verifying a downloaded `.dmg`, how to build a universal one locally, and what to
+do about the Gatekeeper warning.
+
 ## 9. Git service
 
 Enabled by adding a `[git]` section to `app.toml` (§3). It gives the `[server]`
