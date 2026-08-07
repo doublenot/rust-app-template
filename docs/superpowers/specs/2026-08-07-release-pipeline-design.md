@@ -53,10 +53,16 @@ It has five defects, each of which this design closes:
 | 3 | `cargo install cargo-packager` recompiles the tool from source on every leg of every run, unpinned. | §5 |
 | 4 | The upload globs were never verified. `target/release/*.dmg` in particular matches nothing under decision 3 (§2). | §5, §6 |
 | 5 | No checksums, and `contents: write` is granted to all three build legs. | §6 |
+| 6 | Every installer ships **both** bin targets, so `gen_icons` — a build-time placeholder-icon generator — lands in the user's `/usr/bin`. | §5.6 |
 
 Defect 4 is the dangerous one. A glob that matches nothing is not an error in
 `softprops/action-gh-release@v2` by default, so the failure mode is a release
 that looks complete and is quietly missing a platform.
+
+> **Defect 6 was found by the first dry run, not by this design.** It is listed
+> here because it belongs with the others, but nothing in the original analysis
+> caught it: `dpkg -c` on a locally built `.deb` shows `usr/bin/gen_icons`
+> alongside `usr/bin/chrome-host-app`. See §5.6.
 
 ---
 
@@ -69,7 +75,7 @@ defect 4 all over again.
 |---|---|---|---|
 | deb | `chrome-host-app_0.1.0_amd64.deb` | `target/release/` | **measured** — 6.7 MB, Linux x86_64 |
 | AppImage | `chrome-host-app_0.1.0_x86_64.AppImage` | `target/release/` | **measured** — 16.0 MB, Linux x86_64 |
-| NSIS | `chrome-host-app_0.1.0_x64-setup.exe` | `target/release/` | **from source** — `format!("{}_{}_{}-setup.exe", main_binary_name, config.version, arch)` |
+| NSIS | `chrome-host-app_0.1.0_x64-setup.exe` | `target/release/` | **measured** — windows-latest, run 31183489259 |
 | dmg | `Chrome Host App_0.1.0_universal.dmg` | `target/universal-apple-darwin/release/` | **from source** — `format!("{}_{}_{}", config.product_name, config.version, arch)` |
 
 The `.dmg` is the outlier twice over, and both differences are load-bearing:
@@ -198,10 +204,17 @@ The `GITHUB_REF_TYPE` branch is the dry-run path. Exiting 0 satisfies
     strategy:
       fail-fast: false
       matrix:
+        # Block style, not `- { os: ..., formats: deb,appimage }`. In a YAML flow
+        # mapping the comma is an entry separator, so the compact form parses as
+        # formats: "deb" plus a junk key `appimage: null` -- the Linux leg then
+        # packages the deb, exits 0, and silently produces no AppImage.
         include:
-          - { os: ubuntu-latest,  formats: deb,appimage }
-          - { os: macos-latest,   formats: dmg }
-          - { os: windows-latest, formats: nsis }
+          - os: ubuntu-latest
+            formats: deb,appimage
+          - os: macos-latest
+            formats: dmg
+          - os: windows-latest
+            formats: nsis
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -341,6 +354,29 @@ The macOS leg compiles the whole dependency graph twice — vendored libgit2,
 libssh2 and OpenSSL included — so it runs roughly twice as long as the others.
 `fail-fast: false` is kept so one platform's failure still leaves the other two
 legs' logs and artifacts available for diagnosis.
+
+### 5.6 `binaries` must be declared, or every bin target gets packaged
+
+Added after the first dry run. `[package.metadata.packager]` now carries:
+
+```toml
+binaries = [{ path = "chrome-host-app", main = true }]
+```
+
+Without it cargo-packager packages **every** bin target the crate declares, and
+this crate has two. That is defect 6 on Linux and Windows — `gen_icons` was
+shipping inside the installers — and a hard failure on macOS, where only the
+main binary is `lipo`'d into `target/universal-apple-darwin/release/` and the
+copy of the other one fails the whole job:
+
+```
+ERROR cargo_packager::cli: Failed to copy file from
+  .../target/universal-apple-darwin/release/gen_icons to ...
+```
+
+This is the third time in this design that the crate's *second* bin target has
+mattered — §5.3 derives the binary name from `default_run` for the same reason.
+A single-binary crate would never have surfaced any of it.
 
 ---
 

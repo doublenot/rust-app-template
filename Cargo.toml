@@ -48,3 +48,10 @@ tempfile = "3"
 product-name = "Chrome Host App"
 identifier = "com.example.chromehost"
 icons = ["icons/icon.png"]
+# Without this, cargo-packager packages EVERY bin target in the crate, and this
+# one has two: the .deb was shipping `gen_icons` -- a build-time placeholder-icon
+# generator -- into the user's /usr/bin. It also broke the macOS universal build
+# outright, because only the main binary is lipo'd into
+# target/universal-apple-darwin/release/ and the copy of the other one failed.
+# Paths are resolved from the output directory, and `.exe` is added on Windows.
+binaries = [{ path = "chrome-host-app", main = true }]

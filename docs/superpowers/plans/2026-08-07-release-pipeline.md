@@ -427,10 +427,17 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
+        # Block style, not `- { os: ..., formats: deb,appimage }`. In a YAML flow
+        # mapping the comma is an entry separator, so the compact form parses as
+        # formats: "deb" plus a junk key `appimage: null` -- the Linux leg then
+        # packages the deb, exits 0, and silently produces no AppImage.
         include:
-          - { os: ubuntu-latest,  formats: deb,appimage }
-          - { os: macos-latest,   formats: dmg }
-          - { os: windows-latest, formats: nsis }
+          - os: ubuntu-latest
+            formats: deb,appimage
+          - os: macos-latest
+            formats: dmg
+          - os: windows-latest
+            formats: nsis
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -590,8 +597,14 @@ assert jobs["publish"]["if"] == "github.ref_type == 'tag'"
 assert jobs["publish"]["permissions"] == {"contents": "write"}
 assert "permissions" not in jobs["package"]
 assert jobs["package"]["strategy"]["fail-fast"] is False
-oses = [m["os"] for m in jobs["package"]["strategy"]["matrix"]["include"]]
-assert oses == ["ubuntu-latest", "macos-latest", "windows-latest"], oses
+inc = jobs["package"]["strategy"]["matrix"]["include"]
+assert [m["os"] for m in inc] == ["ubuntu-latest", "macos-latest", "windows-latest"], inc
+# Assert the FORMATS too, and that no entry carries a stray key. Writing the
+# matrix as a YAML flow mapping -- `- { os: ubuntu-latest, formats: deb,appimage }`
+# -- makes the comma an entry separator, so it parses as formats: "deb" plus a
+# junk key `appimage: null`. The Linux leg then packages only the deb and exits 0.
+assert [m["formats"] for m in inc] == ["deb,appimage", "dmg", "nsis"], inc
+assert all(set(m) == {"os", "formats"} for m in inc), inc
 up = [s for s in jobs["package"]["steps"] if str(s.get("uses","")).startswith("actions/upload-artifact")][0]
 assert up["with"]["if-no-files-found"] == "error"
 assert up["with"]["path"] == "dist/"
