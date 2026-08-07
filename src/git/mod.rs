@@ -1508,7 +1508,16 @@ mod tests {
     /// Never dialled: every test that uses it replaces `ops::run` with a fake. It exists
     /// because `start_job` refuses `clone`/`pull`/`push` on a repo with no remote before
     /// admission, so a job test needs one configured to get past that guard.
-    const REMOTE: &str = "/nonexistent/origin.git";
+    ///
+    /// It has to be absolute *on the host running the test*, because that guard runs
+    /// `validate_remote`, which asks `Path::is_absolute`. A POSIX root is drive-relative on
+    /// Windows rather than absolute, so a hard-coded `/nonexistent/…` is refused there and
+    /// every job test fails at its fixture.
+    const REMOTE: &str = if cfg!(windows) {
+        r"C:\nonexistent\origin.git"
+    } else {
+        "/nonexistent/origin.git"
+    };
 
     fn repo_def(id: &str, remote: Option<&str>) -> RepoDef {
         RepoDef {

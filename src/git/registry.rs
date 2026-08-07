@@ -1573,10 +1573,27 @@ mod tests {
             "git://git.example.org/x.git",
             "file:///srv/repos/x.git",
             "git@github.com:acme/notes.git",
-            "/srv/repos/x.git",
+            // "Absolute" is the host filesystem's own answer, not POSIX's: `Path::is_absolute`
+            // wants a drive or UNC prefix on Windows, so a leading `/` is merely
+            // drive-relative there. Only the native form is accepted.
+            if cfg!(windows) {
+                r"C:\repos\x.git"
+            } else {
+                "/srv/repos/x.git"
+            },
         ] {
             assert!(validate_remote(good, false).is_ok(), "rejected {good:?}");
         }
+        // And the other platform's form is refused rather than half-understood. A remote is
+        // stored now and resolved later, possibly against a different current drive, so an
+        // absolute-looking path that this host cannot resolve must not be stored at all.
+        let foreign = if cfg!(windows) {
+            "/srv/repos/x.git"
+        } else {
+            r"C:\repos\x.git"
+        };
+        let e = validate_remote(foreign, false).expect_err("not absolute on this host");
+        assert_eq!(e.code(), GitErrorCode::InvalidRequest);
     }
 
     #[test]
