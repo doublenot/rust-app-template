@@ -223,28 +223,34 @@ The two audit rounds above were run entirely on Linux, and so was every gate bef
 The definition of done below asks for green on **ubuntu, macos and windows**, and until
 `feat/git-service` landed on `main` that line had never actually been tested: CI fires on push
 to `main` and on pull requests, the branch was pushed without a PR, and the last `main` build
-predated the whole subsystem. The first run that mattered found **eleven** defects in two
-commits — none of them findable by reading the code on one platform.
+predated the whole subsystem. It took two CI rounds to clear: the first died at `clippy` before
+a single test ran, and only the second exposed **ten failing tests from three further root
+causes** — none of the four findable by reading the code on one platform.
 
 **The wire vocabulary is still untouched.** Nothing here adds, renames or re-codes anything;
 one refusal that was already `invalid_request` is now documented as also firing on Windows.
 
-| # | where | finding |
-|---|---|---|
-| **1** | `registry.rs`, task 4 | **[blocking]** `clippy::question_mark` in Rust 1.97 sees through `match host.find(']') { Some(j) => …, None => return None }`. CI pins `dtolnay/rust-toolchain@stable`, which floats; the local gate was 1.95 and genuinely clean, so the merge turned all three matrix legs red on a lint that did not exist when the code was written. The rewrite is what the lint asks for and what the same function already does one arm above. The `remote_host` table gains a row for the unterminated bracket, because the arm was otherwise vacuous and `Some("[::1")` is a host a stored credential could bind to that is not the host we would connect to |
-| **2–10** | `mod.rs`, tasks 5–9 | **[blocking]** The job-test fixture `const REMOTE: &str = "/nonexistent/origin.git"` is not an absolute path on Windows — `Path::is_absolute` wants a drive or UNC prefix there — so `start_job`'s pre-admission `validate_remote` refused it and **nine** job tests failed at their fixture, before touching anything they were written to test. `cfg!(windows)`-selected now. The product behaviour is right and was right: a drive-relative remote stored now and resolved later, against whatever drive happens to be current, is exactly the ambiguity worth refusing. It was the fixture and the *documentation* that were POSIX-only — README §9 and spec §4.2 both said "an absolute local path" flat |
-| **11** | `supervisor.rs` | **[blocking, pre-existing]** `wait_healthy_succeeds_once_server_responds` has failed on `windows-latest` since before this subsystem existed — it was the sole failure on `main@9e03fad2` in July and nobody was watching. Its stand-in server writes the response and drops the socket without ever reading the request, and closing a socket whose receive buffer still holds unread bytes is an *abortive* close on Windows: RST rather than FIN, outrunning the response, so every poll fails until the 5s budget expires. Systematic, not flaky. The discriminating evidence is that `internal_server`'s loopback tests — a real axum server, which reads its requests — passed on the same run. The server drains, answers, then shuts the write half down; the test asserts the drained request, so the fix is pinned everywhere rather than believed about one platform |
+| # | where | tests | finding |
+|---|---|---|---|
+| **1** | `registry.rs`, task 4 | all three legs, no tests ran | **[blocking]** `clippy::question_mark` in Rust 1.97 sees through `match host.find(']') { Some(j) => …, None => return None }`. CI pins `dtolnay/rust-toolchain@stable`, which floats; the local gate was 1.95 and genuinely clean, so the merge turned every matrix leg red on a lint that did not exist when the code was written. The rewrite is what the lint asks for and what the same function already does one arm above. The `remote_host` table gains a row for the unterminated bracket, because the arm was otherwise vacuous and `Some("[::1")` is a host a stored credential could bind to that is not the host we would connect to |
+| **2** | `mod.rs`, tasks 5–9 | **8** | **[blocking]** The job-test fixture `const REMOTE: &str = "/nonexistent/origin.git"` is not an absolute path on Windows — `Path::is_absolute` wants a drive or UNC prefix there — so `start_job`'s pre-admission `validate_remote` refused it and eight job tests failed at their scaffolding, before touching anything they were written to test. `cfg!(windows)`-selected now. Nothing asserts on the literal or builds a path from it, so the swap is inert: every use is `Some(REMOTE)` into `repo_def` |
+| **3** | `registry.rs`, task 4 | **1** | **[blocking]** `validate_remote_accepts_the_documented_forms` asserted `/srv/repos/x.git` is accepted, which is true only off Windows. Same cause as #2, different site, and the one that says what the product should do: the behaviour is right and was right, because a drive-relative remote stored now and resolved later, against whatever drive happens to be current, is exactly the ambiguity worth refusing. It was the fixtures and the *documentation* that were POSIX-only — README §9 and spec §4.2 both said "an absolute local path" flat. The test now asserts the foreign form's refusal as well, so the dependence is pinned in both directions |
+| **4** | `supervisor.rs` | **1** | **[blocking, pre-existing]** `wait_healthy_succeeds_once_server_responds` has failed on `windows-latest` since before this subsystem existed — it was the sole failure on `main@9e03fad2` in July and nobody was watching. Its stand-in server writes the response and drops the socket without ever reading the request, and closing a socket whose receive buffer still holds unread bytes is an *abortive* close on Windows: RST rather than FIN, outrunning the response, so every poll fails until the 5s budget expires. Systematic, not flaky. The discriminating evidence is that `internal_server`'s loopback tests — a real axum server, which reads its requests — passed on the same run. The server drains, answers, then shuts the write half down; the test asserts the drained request, so the fix is pinned everywhere rather than believed about one platform |
 
-Finding 11 also exposed why it took two CI rounds to diagnose: `wait_healthy` discarded the
-transport error, so its timeout could say only *that* the server never came up. It now carries
-the last error or status into the message, which is the difference between a CI log that names
-a connection reset and one that names nothing.
+Finding 4 also exposed why the diagnosis needed a whole extra CI round: `wait_healthy` discarded
+the transport error, so its timeout could say only *that* the server never came up. It now
+carries the last error or status into the message, which is the difference between a CI log that
+names a connection reset and one that names nothing.
 
-**Verified the way the other rounds were**, with one honest exception. Findings 1–10 are pinned
-by tests checked by mutation — reverting the fix in place and confirming the new assertion goes
-red. Finding 11's *cause* cannot be reproduced on any machine available here; what is pinned by
+**Verified the way the other rounds were**, with one honest exception. Findings 1–3 are pinned by
+tests checked by mutation — reverting the fix in place and confirming the new assertion goes red.
+Finding 4's *cause* cannot be reproduced on any machine available here; what is pinned by
 mutation is that the drain happens at all, and the RST diagnosis itself stands on the Winsock
 behaviour, the systematic failure shape, and the axum control arm. CI is the adjudicator.
+
+> The commit message on `eab7921` says "nine" job tests where the count is eight — the ninth
+> git-suite failure is finding 3, which shares #2's cause but not its site. The table above is
+> the count that was checked against the run's own failure list.
 
 ### Known gaps left open by this audit
 
