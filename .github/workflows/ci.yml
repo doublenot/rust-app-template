@@ -35,3 +35,8 @@ jobs:
       - run: cargo fmt --check
       - run: cargo clippy --all-targets --locked -- -D warnings
       - run: cargo test --locked
+      # Guards that only matter at release time rot silently otherwise: the
+      # release helper is a shell script, so `cargo test` never exercises it.
+      - name: Test the release helper
+        if: runner.os == 'Linux'
+        run: scripts/test-release.sh

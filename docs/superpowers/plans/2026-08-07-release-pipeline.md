@@ -114,10 +114,16 @@ assert() { # assert <description> <command...>
 }
 
 # A dependency-free crate, so cargo needs no network and finishes instantly.
-# Two fixtures earn their place: `keywords` is an array value inside [package]
-# (a table-scoping regex that stops at the first '[' character truncates there),
-# and [package.metadata.packager] carries a SECOND `version` key holding the same
-# string as the real one (a naive substitution rewrites it).
+#
+# Two fixtures earn their place, and their ORDER is part of the test:
+#
+#   - `keywords` is an array value, placed BEFORE `version` on purpose. A
+#     table-scoping regex that stops at the first '[' character captures a table
+#     truncated at the array, finds no version key in it, and refuses -- so with
+#     the array first this fixture makes that mistake fail the run. Put the array
+#     after `version` and both forms pass, which is why it is where it is.
+#   - [package.metadata.packager] carries a SECOND `version` key holding the same
+#     string as the real one, which a naive substitution rewrites.
 fixture() {
   local d
   d=$(mktemp -d)
@@ -125,9 +131,9 @@ fixture() {
   cat > "$d/Cargo.toml" <<'EOF'
 [package]
 name = "fixture"
-version = "0.1.0"
 edition = "2021"
 keywords = ["release", "test"]
+version = "0.1.0"
 
 [package.metadata.packager]
 product-name = "Fixture"
@@ -296,15 +302,30 @@ Expected: `13 passed, 0 failed`, exit 0.
 
 - [ ] **Step 5: Mutation-check the table scoping**
 
-The `[package.metadata]` assertion is the one that justifies the python edit over
-a one-line `sed`. Prove it can fail. Temporarily replace the python block with:
+Two mutations, because the python edit makes two claims. Restore the original and
+re-run after each.
+
+**(a) Table scoping.** Replace the python block with a naive substitution:
 
 ```bash
 sed -i.bak "s/^version = \".*\"/version = \"$new\"/" Cargo.toml && rm -f Cargo.toml.bak
 ```
 
-Run `scripts/test-release.sh`. Expected: `NOT OK  the [package.metadata] version is untouched`.
-Then restore the python block and re-run to confirm it goes green again.
+Expected: exactly one assertion flips — `NOT OK  the [package.metadata] version is untouched`.
+
+**(b) The line-anchored lookahead.** Change the table regex from
+`r"(?ms)^\[package\]\s*\n.*?(?=^\[|\Z)"` to `r"(?ms)^\[package\][^\[]*"`.
+
+Expected: **6 failures**, starting with `bumps, commits, and tags`.
+
+> **Amended during execution.** Mutation (b) was originally expected to corrupt
+> the manifest. Measured: it does not. The truncating regex captures a short
+> table, finds no `version` key in it, and refuses outright — a loud failure, not
+> silent corruption. It refuses only when the array precedes `version`, so the
+> fixture above places `keywords` first deliberately; with the original ordering
+> (array after `version`) both regex forms pass and the mutation survives
+> undetected. The comment in `release.sh` states this distinction rather than
+> claiming corruption.
 
 - [ ] **Step 6: Wire it into CI so it cannot rot**
 
