@@ -55,3 +55,17 @@ icons = ["icons/icon.png"]
 # target/universal-apple-darwin/release/ and the copy of the other one failed.
 # Paths are resolved from the output directory, and `.exe` is added on Windows.
 binaries = [{ path = "hitch", main = true }]
+
+[package.metadata.packager.macos]
+# Ad-hoc sign the .app BUNDLE, not merely the executable inside it.
+#
+# Gatekeeper validates the bundle. Signing only the binary (which the release
+# workflow does, before packaging copies it into Contents/MacOS/) leaves the
+# bundle with no _CodeSignature at all, and a quarantined download then reports
+# "Hitch is damaged and should be moved to the Trash" -- reported from a real
+# Mac against v0.1.2. cargo-packager runs codesign only when an identity is
+# configured, and "-" is codesign's ad-hoc identity.
+#
+# This does NOT make the app trusted: it is still unnotarized, so macOS still
+# refuses the first launch until the user allows it explicitly. See docs/macos.md.
+signing-identity = "-"
