@@ -599,7 +599,7 @@ working tree is always `<data-dir>/repos/<id>/`; the id charset cannot express
 
 | field | default | meaning |
 |---|---|---|
-| `remote` | `null` | `https://`, `ssh://`, `git://`, `file://`, `git@host:path`, or an absolute local path. `http://` is rejected as `insecure_remote` unless `[git].allow_http`; a URL carrying a password in its userinfo is always rejected, and on `http(s)` a *username* is rejected too — that is where a token is normally carried, and it would end up in this repo's `.git/config` in clear text. Put it on the repo as `credential` instead. `ssh://git@host` and `git@host:path` are unaffected. `null` means a local-only repo: `sync` inits and commits and reports `outcome: "committed"`, while `clone`/`pull`/`push` fail `remote_missing`. |
+| `remote` | `null` | `https://`, `ssh://`, `git://`, `file://`, `git@host:path`, or an absolute local path — absolute by the *host's* rule, so `C:\repos\x.git` or `\\server\share\x.git` on Windows and `/srv/repos/x.git` elsewhere; a leading `/` is only drive-relative on Windows and is refused there. `http://` is rejected as `insecure_remote` unless `[git].allow_http`; a URL carrying a password in its userinfo is always rejected, and on `http(s)` a *username* is rejected too — that is where a token is normally carried, and it would end up in this repo's `.git/config` in clear text. Put it on the repo as `credential` instead. `ssh://git@host` and `git@host:path` are unaffected. `null` means a local-only repo: `sync` inits and commits and reports `outcome: "committed"`, while `clone`/`pull`/`push` fail `remote_missing`. |
 | `remote_name` | `"origin"` | `[A-Za-z0-9._-]{1,64}`. |
 | `branch` | `[git].default_branch` | The one branch this repo tracks. A mutating op on a different checked-out branch fails `branch_mismatch` rather than guessing. |
 | `credential` | `null` | `{"kind":"none"}`, `{"kind":"token","username"?,"token"}`, or `{"kind":"ssh_key","username"?,"private_key_path"\|"private_key","public_key_path"?,"public_key"?,"passphrase"?}`. `username` defaults to `x-access-token` for tokens and `git` for SSH. Exactly one of `private_key_path` / `private_key`. |
@@ -861,7 +861,11 @@ already matches HEAD is a no-op, a push that already landed reports
   explicit `io_failed` rather than a silently mangled path. The §9.2 collision
   check is the filesystem's, not git's, so it is case-insensitive here and on
   macOS and case-sensitive on Linux: a local `Inbox.md` against a remote
-  `inbox.md` refuses on two platforms out of three.
+  `inbox.md` refuses on two platforms out of three. A local-path `remote` must
+  also carry a drive or UNC prefix here (`C:\repos\x.git`,
+  `\\server\share\x.git`): a bare `/srv/repos/x.git` is drive-*relative* on
+  Windows, so it is refused `invalid_request` rather than stored as something
+  that would resolve against whatever the current drive happened to be.
 - **Network integration tests.** Four `#[ignore]`d tests in `src/git/mod.rs`
   cover what an offline CI cannot. Run them by hand:
 

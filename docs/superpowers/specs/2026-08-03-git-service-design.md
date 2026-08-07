@@ -277,7 +277,7 @@ Location `<data-dir>/repos.json`, mode `0600` on unix. **Created only by the fir
 |---|---|---|---|---|
 | `version` | int | yes | — | must be `1`; anything else ⇒ file-level failure (§4.4) |
 | `repos[].id` | string | yes | — | §4.3 |
-| `remote` | string\|null | no | `null` | `https://`, `ssh://`, `git://`, `file://`, `git@host:path`, or an absolute local path. `http://` rejected unless `[git].allow_http`. **Userinfo containing `:` (a password) is rejected** — libgit2 quotes URLs into error strings. `null` ⇒ local-only repo: `sync` inits+commits and reports `outcome: "committed"`; `clone`/`pull`/`push` fail `remote_missing` |
+| `remote` | string\|null | no | `null` | `https://`, `ssh://`, `git://`, `file://`, `git@host:path`, or an absolute local path — absolute by the *host's* rule (`C:\…` or `\\server\share\…` on Windows, `/…` elsewhere); see the amendment below the table. `http://` rejected unless `[git].allow_http`. **Userinfo containing `:` (a password) is rejected** — libgit2 quotes URLs into error strings. `null` ⇒ local-only repo: `sync` inits+commits and reports `outcome: "committed"`; `clone`/`pull`/`push` fail `remote_missing` |
 | `remote_name` | string | no | `"origin"` | `[A-Za-z0-9._-]{1,64}` |
 | `branch` | string | no | `[git].default_branch` | `validate_branch_name` |
 | `credential` | object\|null | no | `null` | §4.6 |
@@ -291,6 +291,19 @@ Location `<data-dir>/repos.json`, mode `0600` on unix. **Created only by the fir
 | `created_at_ms` / `updated_at_ms` | int | no | now | host-maintained; a hand-written file may omit them |
 
 `deny_unknown_fields` everywhere, matching `config.rs`.
+
+> **Amended by the first CI run on Windows.** "An absolute local path" was written as though
+> POSIX's answer were everyone's. `validate_remote` asks `Path::is_absolute`, which on Windows
+> wants a drive or UNC prefix, so `C:\repos\x.git` and `\\server\share\x.git` are accepted there
+> and a bare `/srv/repos/x.git` is refused `invalid_request` — it is drive-*relative*, and a
+> remote is stored now and resolved later, possibly against a different current drive, so
+> storing one would be storing an ambiguity. The converse holds off Windows: `C:\…` parses as a
+> one-character scp host, which §4.2's own length floor rejects. The behaviour was always this;
+> only the sentence was wrong, and the test suite believed the sentence — nine job tests and
+> `validate_remote_accepts_the_documented_forms` hard-coded POSIX roots and failed the first
+> time `windows-latest` ever ran them. Pinned by
+> `registry::tests::validate_remote_accepts_the_documented_forms`, which now asserts the
+> refusal of the foreign form as well as the acceptance of the native one.
 
 ### 4.3 `id` validation
 

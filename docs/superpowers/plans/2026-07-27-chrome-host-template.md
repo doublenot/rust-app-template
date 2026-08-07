@@ -1039,18 +1039,52 @@ mod tests {
     async fn wait_healthy_succeeds_once_server_responds() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
+        let (seen, mut requests) = tokio::sync::mpsc::unbounded_channel();
         tokio::spawn(async move {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
             loop {
-                let (mut sock, _) = listener.accept().await.unwrap();
-                use tokio::io::AsyncWriteExt;
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    return;
+                };
+                // Drain the request before answering it. Closing a socket whose receive
+                // buffer still holds unread bytes is an *abortive* close on Windows -- the
+                // stack sends RST instead of FIN, and the reset outruns the response we just
+                // wrote, so every poll `wait_healthy` makes fails and the 5s budget expires.
+                // This is the whole of why the test failed on windows-latest and nowhere
+                // else; the real child servers this stands in for read their requests.
+                let mut req = Vec::new();
+                loop {
+                    let mut buf = [0u8; 1024];
+                    match sock.read(&mut buf).await {
+                        Ok(0) => break,
+                        Ok(n) => {
+                            req.extend_from_slice(&buf[..n]);
+                            if req.windows(4).any(|w| w == b"\r\n\r\n") {
+                                break;
+                            }
+                        }
+                        Err(_) => break,
+                    }
+                }
+                let _ = seen.send(String::from_utf8_lossy(&req).into_owned());
                 let _ = sock
                     .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 0\r\n\r\n")
                     .await;
+                // FIN, not RST: let the client read what we wrote.
+                let _ = sock.shutdown().await;
             }
         });
         wait_healthy(&format!("http://{addr}/"), Duration::from_secs(5))
             .await
             .unwrap();
+        // Pins the drain above rather than trusting it: the read loop has to have consumed a
+        // whole request for this to arrive, which is the behaviour whose absence made Windows
+        // reset the connection instead of answering it.
+        let req = requests
+            .recv()
+            .await
+            .expect("the health check sent a request");
+        assert!(req.starts_with("GET / HTTP/1.1\r\n"), "got: {req:?}");
     }
 
     #[tokio::test]
@@ -1192,14 +1226,18 @@ pub async fn wait_healthy(url: &str, timeout: Duration) -> Result<(), String> {
         .map_err(|e| e.to_string())?;
     let deadline = tokio::time::Instant::now() + timeout;
     loop {
-        if let Ok(resp) = client.get(url).send().await {
-            if resp.status().as_u16() < 400 {
-                return Ok(());
-            }
-        }
+        // Carried into the timeout message. Without it the operator of a child that will not
+        // come up learns only that it did not, and never whether the port refused, the TLS
+        // handshake failed, or the thing answered 500 every time. Only the attempt that ran
+        // up against the deadline is worth reporting, so it is scoped to the iteration.
+        let last = match client.get(url).send().await {
+            Ok(resp) if resp.status().as_u16() < 400 => return Ok(()),
+            Ok(resp) => format!("last answered {}", resp.status()),
+            Err(e) => format!("last error: {e}"),
+        };
         if tokio::time::Instant::now() >= deadline {
             return Err(format!(
-                "server did not become healthy at {url} within {}s",
+                "server did not become healthy at {url} within {}s ({last})",
                 timeout.as_secs()
             ));
         }
@@ -1207,6 +1245,20 @@ pub async fn wait_healthy(url: &str, timeout: Duration) -> Result<(), String> {
     }
 }
 ```
+
+> **Amended by the first CI run on Windows.** Two changes above, one in the test and one in
+> `wait_healthy` itself. The test's stand-in server wrote its response and dropped the socket
+> without ever reading the request; closing a socket whose receive buffer still holds unread
+> bytes is an abortive close on Windows, so the RST outran the response and every poll failed
+> until the 5s budget expired — systematically, on `windows-latest` only. The discriminating
+> evidence is that `internal_server`'s loopback tests, which run a real axum server that does
+> read its requests, passed on the same run. The server now drains the request, answers, and
+> shuts the write half down with FIN; the test asserts the drained request so the fix is
+> pinned on every platform rather than taken on faith about one nobody here can run.
+>
+> `wait_healthy` discarded the transport error, so its timeout could only ever say that the
+> server did not come up and never why — the reason this took a second CI round to diagnose.
+> It carries the last error or status into the message now.
 
 Note for the `spawn_server` test: `cargo` is on PATH in dev and CI. On Windows `Command::new("cargo")` resolves `cargo.exe` — no special-casing needed.
 

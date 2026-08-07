@@ -666,6 +666,22 @@ git commit -m "feat(git): validate repo ids as lowercase, single-segment, non-re
 
 - [ ] **Step 11: Write the failing tests for remote parsing and validation**
 
+> **Amended by the first CI run on Windows (third round).** Two changes below, both in the
+> blocks this step and Step 13 write:
+>
+> - `validate_remote_accepts_the_documented_forms` asserted that `/srv/repos/x.git` is
+>   accepted, which is true only off Windows. `Path::is_absolute` wants a drive or UNC
+>   prefix there, so a leading `/` is drive-*relative* and the validator refuses it —
+>   correctly, since a remote is stored now and resolved later, possibly against a different
+>   current drive. The row is `cfg!(windows)`-selected and the test now also asserts that the
+>   *other* platform's form is refused, so the platform-dependence is pinned in both
+>   directions instead of assumed away.
+> - `remote_host`'s bracket branch is a `?` rather than a `match`, which is what
+>   `clippy::question_mark` requires as of Rust 1.97 — CI floats on `@stable` and the lint
+>   turned all three matrix legs red. Behaviour is unchanged; the table gains a row for the
+>   unterminated bracket so the arm is not vacuous, because `Some("[::1")` would be a host a
+>   stored credential could bind to that is not the host we would connect to.
+
 Append inside `mod tests`:
 
 ```rust
@@ -679,6 +695,8 @@ Append inside `mod tests`:
             ("git@github.com:acme/notes.git", Some("github.com")),
             ("github.com:acme/notes.git", Some("github.com")),
             ("https://[::1]:8443/x.git", Some("[::1]")),
+            // An unterminated bracket is not a host we can name, so it fails closed too.
+            ("https://[::1/x.git", None),
             // No network host: nothing to bind a credential to, so `None` fails closed.
             ("file:///srv/repos/x.git", None),
             ("/srv/repos/x.git", None),
@@ -701,10 +719,27 @@ Append inside `mod tests`:
             "git://git.example.org/x.git",
             "file:///srv/repos/x.git",
             "git@github.com:acme/notes.git",
-            "/srv/repos/x.git",
+            // "Absolute" is the host filesystem's own answer, not POSIX's: `Path::is_absolute`
+            // wants a drive or UNC prefix on Windows, so a leading `/` is merely
+            // drive-relative there. Only the native form is accepted.
+            if cfg!(windows) {
+                r"C:\repos\x.git"
+            } else {
+                "/srv/repos/x.git"
+            },
         ] {
             assert!(validate_remote(good, false).is_ok(), "rejected {good:?}");
         }
+        // And the other platform's form is refused rather than half-understood. A remote is
+        // stored now and resolved later, possibly against a different current drive, so an
+        // absolute-looking path that this host cannot resolve must not be stored at all.
+        let foreign = if cfg!(windows) {
+            "/srv/repos/x.git"
+        } else {
+            r"C:\repos\x.git"
+        };
+        let e = validate_remote(foreign, false).expect_err("not absolute on this host");
+        assert_eq!(e.code(), GitErrorCode::InvalidRequest);
     }
 
     #[test]
@@ -779,10 +814,7 @@ pub fn remote_host(remote: &str) -> Option<String> {
     };
     let host = if host.starts_with('[') {
         // Bracketed IPv6 literal; the port, if any, follows the ']'.
-        match host.find(']') {
-            Some(j) => &host[..=j],
-            None => return None,
-        }
+        &host[..=host.find(']')?]
     } else {
         before(host, ':')
     };
