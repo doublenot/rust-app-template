@@ -242,11 +242,21 @@ the transport error, so its timeout could say only *that* the server never came 
 carries the last error or status into the message, which is the difference between a CI log that
 names a connection reset and one that names nothing.
 
-**Verified the way the other rounds were**, with one honest exception. Findings 1–3 are pinned by
-tests checked by mutation — reverting the fix in place and confirming the new assertion goes red.
-Finding 4's *cause* cannot be reproduced on any machine available here; what is pinned by
-mutation is that the drain happens at all, and the RST diagnosis itself stands on the Winsock
-behaviour, the systematic failure shape, and the axum control arm. CI is the adjudicator.
+**Verified the way the other rounds were**, with one exception that CI has since closed. Findings
+1–3 are pinned by tests checked by mutation — reverting the fix in place and confirming the new
+assertion goes red. Finding 4's *cause* could not be reproduced on any machine available here:
+what mutation pinned was only that the drain happens at all, and the RST diagnosis itself rested
+on Winsock's documented `closesocket` behaviour, the systematic failure shape, and the axum
+control arm. CI was named the adjudicator and it agreed — `main@8af95cb` is green on all three
+legs, and `windows-latest` ran **378 tests, 373 passed, 0 failed, 5 ignored**, which is the
+previous run's 363 plus exactly the ten that were failing.
+
+Both halves of #2 and #3's premise are **measured on the runner rather than taken from the
+docs**, and by the same run that failed. `Path::is_absolute` is false for a POSIX root there —
+that is what `rejected "/srv/repos/x.git"` says. And it is true for `C:\…`: `resolve_cwd` asks
+the very same predicate, `resolve_cwd_rules` asserts `resolve_cwd(Some(r"C:\abs"), base) ==
+r"C:\abs"`, and that test passed on the run in question. Had the prefix not counted as absolute
+the call would have answered `base.join(r"C:\abs")` and the assertion would have failed with it.
 
 > The commit message on `eab7921` says "nine" job tests where the count is eight — the ninth
 > git-suite failure is finding 3, which shares #2's cause but not its site. The table above is
