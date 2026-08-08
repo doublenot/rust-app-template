@@ -1978,11 +1978,11 @@ mod tests {
 
     #[test]
     fn an_identity_never_leaves_the_hostname_empty_or_padded() {
-        let id = Identity::new("Hitch", "com.example.hitch");
+        let id = Identity::new("Hitch", "co.doublenot.hitch");
         assert_eq!(id.app_name, "Hitch");
-        assert_eq!(id.identifier, "com.example.hitch");
+        assert_eq!(id.identifier, "co.doublenot.hitch");
         // The hostname is the right-hand side of the fallback author email, so an
-        // empty one produces `com.example.hitch@` and git refuses the commit.
+        // empty one produces `co.doublenot.hitch@` and git refuses the commit.
         assert!(!id.hostname.is_empty());
         assert_eq!(id.hostname.trim(), id.hostname);
     }

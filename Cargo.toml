@@ -63,7 +63,7 @@ tempfile = "3"
 
 [package.metadata.packager]
 product-name = "Hitch"
-identifier = "com.example.hitch"
+identifier = "co.doublenot.hitch"
 icons = ["icons/icon.png"]
 # Without this, cargo-packager packages EVERY bin target in the crate, and this
 # one has two: the .deb was shipping `gen_icons` -- a build-time placeholder-icon

@@ -3,7 +3,7 @@
 
 [app]
 name = "Hitch"                          # window title, tray tooltip
-identifier = "com.example.hitch"        # reverse-domain; names the app-data dir
+identifier = "co.doublenot.hitch"       # reverse-domain; names the app-data dir
 url = ""                                # target URL; empty → built-in placeholder page
 
 # Uncomment to start a local server before showing the app.
