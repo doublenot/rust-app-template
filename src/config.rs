@@ -127,6 +127,9 @@ pub enum FieldType {
     Text,
     Boolean,
     Select,
+    /// Rendered masked, never echoed back to the page, and stored in a file the
+    /// host keeps at 0600. For API keys and tokens the user supplies.
+    Password,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -325,6 +328,28 @@ impl AppConfig {
                     FieldType::Text => {
                         if !f.default.is_str() {
                             return Err(format!("text field {:?} default must be a string", f.key));
+                        }
+                        if !f.options.is_empty() {
+                            return Err(format!("field {:?} must not have options", f.key));
+                        }
+                    }
+                    FieldType::Password => {
+                        let Some(d) = f.default.as_str() else {
+                            return Err(format!(
+                                "password field {:?} default must be a string",
+                                f.key
+                            ));
+                        };
+                        // app.toml is committed. A non-empty default is a secret
+                        // in the repository, so refuse it at load time rather
+                        // than trusting anyone to notice.
+                        if !d.is_empty() {
+                            return Err(format!(
+                                "password field {:?} must default to \"\" -- app.toml is \
+                                 committed to the repository, so a non-empty default \
+                                 would publish the secret",
+                                f.key
+                            ));
                         }
                         if !f.options.is_empty() {
                             return Err(format!("field {:?} must not have options", f.key));
@@ -749,6 +774,27 @@ mod tests {
             minimal()
         );
         assert!(AppConfig::from_str(&ok).is_ok());
+    }
+
+    #[test]
+    fn a_password_field_may_not_ship_a_default() {
+        let with_default = |d: &str| {
+            format!(
+                "[app]\nname = \"X\"\nidentifier = \"com.example.x\"\n\
+                 [menu]\nsettings = true\n\
+                 [[settings.fields]]\nkey = \"api_key\"\nlabel = \"API key\"\n\
+                 type = \"password\"\ndefault = \"{d}\"\n"
+            )
+        };
+        // app.toml is committed to the repository. A non-empty default is a
+        // secret published to everyone who can read the repo, so it is refused
+        // at load time rather than left for someone to notice in review.
+        let err = AppConfig::from_str(&with_default("sk-live-abc")).unwrap_err();
+        assert!(err.contains("api_key"), "unexpected error: {err}");
+        assert!(err.contains("committed"), "the error must say why: {err}");
+
+        // Empty is the only acceptable default, and it must still be a string.
+        assert!(AppConfig::from_str(&with_default("")).is_ok());
     }
 
     #[test]

@@ -141,9 +141,34 @@ on the settings page.
 |---|---|---|
 | `key` | string | Field identifier. Must match `[A-Za-z0-9_]+` and be unique across all fields *ignoring case* (`theme` and `Theme` collide, because both become `APP_SETTING_THEME`) — anything else fails validation. Also used to build the field's environment-variable name (see §5). |
 | `label` | string | Human-readable label shown on the settings page. |
-| `type` | string: `"text"` \| `"boolean"` \| `"select"` | Controls both the rendered input and the constraints on `default`/`options` below. |
-| `default` | string, bool, or (for `select`) string | Default value used until the user saves a settings change. Type must match `type`: `text` requires a string default, `boolean` requires a `true`/`false` default, `select` requires a string default. |
+| `type` | string: `"text"` \| `"boolean"` \| `"select"` \| `"password"` | Controls both the rendered input and the constraints on `default`/`options` below. See the note on `password` under the table. |
+| `default` | string, bool, or (for `select`) string | Default value used until the user saves a settings change. Type must match `type`: `text` requires a string default, `boolean` requires a `true`/`false` default, `select` requires a string default. A `password` default must be a string **and must be empty** — see below. |
 | `options` | array of strings | Required and non-empty for `type = "select"` (and `default` must be one of them); must be omitted/empty for `text` and `boolean` — supplying it is a validation error. |
+
+#### `password` fields
+
+For API keys and tokens the user supplies. Three things differ from `text`:
+
+- **It renders masked and is never sent to the page.** `type="password"` only
+  masks pixels; if the stored value were rendered it would sit in the page
+  source, readable from view-source or devtools. The settings page is told
+  whether a secret exists, never what it is.
+- **An empty submission keeps the stored value.** Since the page never has the
+  secret, an untouched input posts `""` — and clearing on empty would destroy
+  the key every time an unrelated setting was saved. The trade-off: a password
+  can be *replaced* from the settings page but not *cleared*. To remove one,
+  edit `settings.json`.
+- **The default must be empty.** `app.toml` is committed to your repository, so
+  a non-empty default publishes the secret to everyone who can read the repo.
+  The host refuses to start rather than let that happen.
+
+`settings.json` is written `0600` on Unix (matching `repos.json`), so other
+users on the machine cannot read it. Windows has no mode bits; the file sits
+under `%APPDATA%`, scoped to the user profile.
+
+The value still reaches the `[server]` child as `APP_SETTING_<KEY>` like any
+other field — fine for a local single-user app, worth thinking about if that
+child ever spawns something untrusted.
 
 ### `[git]` (optional; entire section omitted by default)
 

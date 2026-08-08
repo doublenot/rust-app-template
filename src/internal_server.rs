@@ -176,6 +176,23 @@ fn field_html(f: &crate::config::SettingsField, current: &Value) -> String {
             let v = html_escape(current.as_str().unwrap_or_default());
             format!("<label>{label}<input type=\"text\" data-key=\"{key}\" value=\"{v}\"></label>")
         }
+        // The stored value is deliberately NOT rendered. `type="password"` only
+        // masks what is on screen -- the value would still sit in the page
+        // source, readable from view-source or devtools, which would make the
+        // masking cosmetic. The page is told whether a secret exists, never what
+        // it is, and posting an empty string back means "keep it" (see
+        // `settings::validate_incoming`).
+        FieldType::Password => {
+            let placeholder = if current.as_str().is_some_and(|s| !s.is_empty()) {
+                "stored — leave blank to keep"
+            } else {
+                "not set"
+            };
+            format!(
+                "<label>{label}<input type=\"password\" data-key=\"{key}\" value=\"\" \
+                 autocomplete=\"off\" placeholder=\"{placeholder}\"></label>"
+            )
+        }
         FieldType::Boolean => {
             let checked = if current.as_bool().unwrap_or(false) {
                 " checked"
@@ -265,7 +282,10 @@ async fn api_settings(
             "settings are not enabled".to_string(),
         );
     };
-    match settings::validate_incoming(schema, &body) {
+    // Loaded so a password field can keep its stored value when the page posts
+    // an empty one, which it does whenever the user did not retype the secret.
+    let current = settings::load(schema, &s.settings_file);
+    match settings::validate_incoming(schema, &body, &current) {
         Ok(values) => match settings::save(&s.settings_file, &values) {
             Ok(()) => (StatusCode::NO_CONTENT, String::new()),
             Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
@@ -400,6 +420,33 @@ options = ["light", "dark"]
                 "{path} does not link the favicon"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn a_stored_password_never_reaches_the_page() {
+        // `type="password"` only masks pixels. If the value were rendered it
+        // would sit in the page source, readable from view-source or devtools,
+        // and the masking would be decoration. This is the assertion that keeps
+        // it honest.
+        let f = crate::config::SettingsField {
+            key: "api_key".into(),
+            label: "API key".into(),
+            field_type: FieldType::Password,
+            default: toml::Value::String(String::new()),
+            options: vec![],
+        };
+        let html = field_html(&f, &serde_json::json!("sk-super-secret"));
+        assert!(
+            !html.contains("sk-super-secret"),
+            "the stored secret was rendered into the page: {html}"
+        );
+        assert!(html.contains("type=\"password\""), "not masked: {html}");
+        assert!(html.contains("value=\"\""), "value must be empty: {html}");
+        // The page is told a secret exists, never what it is.
+        assert!(html.contains("leave blank to keep"), "{html}");
+
+        let empty = field_html(&f, &serde_json::json!(""));
+        assert!(empty.contains("not set"), "{empty}");
     }
 
     #[tokio::test]

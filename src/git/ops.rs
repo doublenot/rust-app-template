@@ -1847,9 +1847,14 @@ pub fn settings_apply_back(
         return Ok(());
     }
 
+    // Loaded before validation as well as after: `validate_incoming` needs the
+    // current values so a `password` field arriving empty keeps the local
+    // secret rather than being cleared. See the caveat in settings.rs about
+    // password fields and settings sync.
+    let before_values = settings::load(&sc.schema, &sc.settings_file);
     let validated = serde_json::from_slice::<serde_json::Value>(&after)
         .map_err(|e| e.to_string())
-        .and_then(|incoming| settings::validate_incoming(&sc.schema, &incoming));
+        .and_then(|incoming| settings::validate_incoming(&sc.schema, &incoming, &before_values));
 
     let rejected = match validated {
         Ok(values) => {
