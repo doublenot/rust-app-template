@@ -427,7 +427,7 @@ Three placeholders reach the installers. Replace all three:
 
 | what | where | why it matters |
 |---|---|---|
-| `icons/icon.png` | repo root | 512×512, drawn by `src/bin/gen_icons.rs` as two interlocking rings. It is the tray icon, the window icon on Linux and Windows, and the installer icon — one file for all of them. Rerun `cargo run --bin gen_icons` only to restore the placeholder. |
+| `icons/icon.png` **and** `icons/icon.ico` | repo root | Both are written by `cargo run --bin gen_icons`, which draws the placeholder (two interlocking rings). The PNG is the tray icon, the window icon on Linux and Windows, and the installer icon; the ICO is compiled into the Windows `.exe` by `build.rs` and is what Explorer and desktop shortcuts show. **Regenerate both together** — point `gen_icons` at your own artwork, or replace the PNG and rerun it to rebuild the ICO. |
 | `authors` | `Cargo.toml` `[package]` | Becomes the `.deb`'s `Maintainer:`. Debian requires it, and leaving it out ships `Maintainer:` **empty** rather than absent — dpkg then warns on install and on every later dpkg run on that machine. Format is `Name <email>`. |
 | `identifier` | `app.toml` `[app]` | Names the per-user data directory (§6) and the macOS bundle id. |
 

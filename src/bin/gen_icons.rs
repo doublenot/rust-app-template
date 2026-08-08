@@ -67,4 +67,62 @@ fn main() {
     std::fs::create_dir_all("icons").unwrap();
     img.save("icons/icon.png").unwrap();
     println!("wrote icons/icon.png");
+
+    write_ico(&img);
+}
+
+/// Windows needs a real `.ico` — a desktop shortcut takes its icon from the
+/// resource compiled into the `.exe`, and the resource compiler will not accept
+/// a PNG file. Without it Explorer draws the generic application icon, even
+/// though the taskbar and title bar look right (those come from the page
+/// favicon, which is a different mechanism entirely).
+///
+/// Assembled by hand rather than through another crate: an ICO is a 6-byte
+/// header, a 16-byte directory entry per size, and the image payloads. Windows
+/// has accepted PNG payloads since Vista, so every entry is just the PNG the
+/// `image` crate already produces.
+fn write_ico(src: &RgbaImage) {
+    // Explorer picks the nearest size and scales; supplying the ones it actually
+    // asks for (small icons, list view, tiles, jumbo) avoids it scaling 512 down
+    // to 16 and turning the rings to mush.
+    const SIZES: [u32; 6] = [16, 32, 48, 64, 128, 256];
+
+    let pngs: Vec<Vec<u8>> = SIZES
+        .iter()
+        .map(|&s| {
+            let scaled = image::imageops::resize(src, s, s, image::imageops::FilterType::Lanczos3);
+            let mut buf = std::io::Cursor::new(Vec::new());
+            scaled
+                .write_to(&mut buf, image::ImageFormat::Png)
+                .expect("PNG encode");
+            buf.into_inner()
+        })
+        .collect();
+
+    let mut out = Vec::new();
+    out.extend_from_slice(&0u16.to_le_bytes()); // reserved
+    out.extend_from_slice(&1u16.to_le_bytes()); // 1 = icon (2 would be a cursor)
+    out.extend_from_slice(&(SIZES.len() as u16).to_le_bytes());
+
+    // Payloads start after the header and the whole directory.
+    let mut offset = 6 + 16 * SIZES.len() as u32;
+    for (&size, png) in SIZES.iter().zip(&pngs) {
+        // 256 is encoded as 0: the field is one byte, so 256 does not fit.
+        let dim = if size == 256 { 0u8 } else { size as u8 };
+        out.push(dim); // width
+        out.push(dim); // height
+        out.push(0); // palette size; 0 for truecolour
+        out.push(0); // reserved
+        out.extend_from_slice(&1u16.to_le_bytes()); // colour planes
+        out.extend_from_slice(&32u16.to_le_bytes()); // bits per pixel
+        out.extend_from_slice(&(png.len() as u32).to_le_bytes());
+        out.extend_from_slice(&offset.to_le_bytes());
+        offset += png.len() as u32;
+    }
+    for png in &pngs {
+        out.extend_from_slice(png);
+    }
+
+    std::fs::write("icons/icon.ico", &out).unwrap();
+    println!("wrote icons/icon.ico ({} sizes)", SIZES.len());
 }

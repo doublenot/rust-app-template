@@ -50,6 +50,14 @@ openssl-sys = { version = "0.9", features = ["vendored"] }
 [target.'cfg(windows)'.dependencies]
 winreg = "0.55"
 
+# Host-gated, not target-gated: build-dependency cfgs are evaluated against the
+# machine running the build, and this is only usable where a resource compiler
+# exists. The release matrix builds Windows on a Windows runner, so it is present
+# where it matters; build.rs degrades to "no icon" anywhere else rather than
+# failing.
+[target.'cfg(windows)'.build-dependencies]
+winresource = "0.1"
+
 [dev-dependencies]
 tempfile = "3"
 

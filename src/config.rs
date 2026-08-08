@@ -752,6 +752,53 @@ mod tests {
     }
 
     #[test]
+    fn the_windows_icon_resource_is_a_valid_multi_size_ico() {
+        // build.rs compiles this into the .exe, and Explorer takes a desktop
+        // shortcut's icon from there. The taskbar and title bar do not -- those
+        // come from the page favicon -- so a broken .ico is invisible everywhere
+        // except a Windows desktop, on a platform this machine cannot check.
+        let ico = include_bytes!("../icons/icon.ico");
+        assert_eq!(&ico[0..2], &[0, 0], "reserved field must be zero");
+        assert_eq!(
+            u16::from_le_bytes([ico[2], ico[3]]),
+            1,
+            "type must be 1; 2 would make it a cursor"
+        );
+        let count = u16::from_le_bytes([ico[4], ico[5]]) as usize;
+        assert!(
+            count >= 4,
+            "want several sizes so Explorer picks rather than rescales; got {count}"
+        );
+
+        for i in 0..count {
+            let e = 6 + 16 * i;
+            assert_eq!(ico[e], ico[e + 1], "entry {i} is not square");
+            // 0 means 256: the field is one byte, so 256 does not fit in it.
+            let dim = if ico[e] == 0 { 256u32 } else { ico[e] as u32 };
+            let len = u32::from_le_bytes(ico[e + 8..e + 12].try_into().unwrap()) as usize;
+            let off = u32::from_le_bytes(ico[e + 12..e + 16].try_into().unwrap()) as usize;
+            assert!(off + len <= ico.len(), "entry {i} points past the file");
+
+            let payload = &ico[off..off + len];
+            assert_eq!(
+                &payload[..8],
+                b"\x89PNG\r\n\x1a\n",
+                "entry {i} is not a PNG payload"
+            );
+            // The directory and the PNG must agree. If they disagree Windows
+            // believes the directory, picks this entry for a size it is not, and
+            // draws a rescaled mess.
+            let w = u32::from_be_bytes(payload[16..20].try_into().unwrap());
+            let h = u32::from_be_bytes(payload[20..24].try_into().unwrap());
+            assert_eq!(
+                (w, h),
+                (dim, dim),
+                "entry {i}: directory claims {dim}x{dim}, PNG is {w}x{h}"
+            );
+        }
+    }
+
+    #[test]
     fn the_crate_names_an_author_so_the_deb_gets_a_maintainer() {
         // cargo-packager writes the .deb's `Maintainer:` from CARGO_PKG_AUTHORS.
         // Omitting `authors` does NOT omit the field: cargo reports an absent
