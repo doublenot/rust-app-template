@@ -6,15 +6,15 @@ rust-version = "1.85"
 default-run = "hitch"
 description = "Desktop app template: a native Rust shell that renders your web app in the Chrome you already have"
 license = "MIT"
-# REPLACE THIS, like `identifier` in app.toml. It is not cosmetic: cargo-packager
-# writes the .deb's `Maintainer:` from here, and Debian requires that field.
+# Becomes the .deb's `Maintainer:`, so a fork must set its own -- like
+# `identifier` in app.toml. Debian's format is `Name <email>`.
 #
-# Leaving it out does not omit the field -- cargo reports an absent `authors` as
-# an empty list, so the control file gets `Maintainer:` with nothing after it.
-# dpkg warns on install, copies the malformed record into /var/lib/dpkg/status,
-# and then warns again on every later dpkg run on that machine. Debian's format
-# is `Name <email>`.
-authors = ["Example Author <author@example.com>"]
+# Not optional, and not safe to simply delete: cargo reports an absent `authors`
+# as an empty list rather than as nothing, so the control file gets `Maintainer:`
+# with an empty value instead of omitting it. dpkg warns on install, copies the
+# malformed record into /var/lib/dpkg/status, and then warns on every later dpkg
+# run on that machine.
+authors = ["Ilya Shindyapin <ilya@doublenot.co>"]
 
 [dependencies]
 anyhow = "1"
