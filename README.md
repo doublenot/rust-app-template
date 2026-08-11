@@ -85,8 +85,17 @@ and opens Chrome in app mode against the configured (or placeholder) page.
 ## 3. Configuration reference
 
 All configuration lives in `app.toml` at the repo root and is embedded into
-the binary at compile time via `include_str!` — editing it requires a
-rebuild (`cargo build` / `cargo run`), there is no runtime config reload.
+the binary at compile time via `include_str!`.
+
+**Debug builds re-read it from the source tree at startup**, so editing
+`app.toml` and re-running picks the change up without a rebuild — which matters
+when iterating on a settings schema or a menu. It logs `config: reloaded …` when
+what it read differs from the embedded copy, and falls back to the embedded copy
+if the file is missing or unreadable.
+
+**Release builds always use the embedded copy.** A shipped binary is
+self-contained and cannot be reconfigured by dropping a file beside it, and
+there is no runtime reload — a change still needs a restart.
 Unknown keys anywhere in the file are rejected (`deny_unknown_fields`), so
 typos fail loudly instead of being silently ignored.
 
@@ -445,6 +454,28 @@ platform-native formats available on the host you build on — e.g. `.deb`/
 AppImage on Linux, `.msi`/NSIS on Windows, `.app`/`.dmg` on macOS. It does
 not cross-compile installers for other OSes; build on each target OS (or
 use the release workflow's CI matrix) to get all of them.
+
+### Making it yours
+
+```bash
+cargo run --bin rename -- notes-app "Notes" com.example.notes
+```
+
+Rewrites the app's identity in the three files that hold it — `Cargo.toml`
+(package name, `default-run`, `product-name`, `identifier`, the packager's
+`binaries` path), `app.toml` (`[app].name`, `[app].identifier`) and `Cargo.lock`
+(the package entry, without which every `--locked` build fails).
+
+It deliberately does **not** sweep the repository. `README.md` is prose about the
+template, and the `com.example.*` strings in the tests are fixtures —
+`com.example` is the domain reserved for examples, and a fixture that looks like
+real identity is worse than one that obviously does not.
+
+The display name and identifier are each declared **twice**, in `Cargo.toml` for
+the installers and `app.toml` for the running host, because `cargo-packager`
+reads one and the app reads the other and neither can interpolate from the
+other. That duplication cannot be removed, so instead it cannot drift:
+`config::tests::the_two_manifests_agree_on_identity` fails if the two disagree.
 
 ### Before you ship
 

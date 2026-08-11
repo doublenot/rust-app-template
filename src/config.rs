@@ -234,8 +234,52 @@ impl AppConfig {
         Ok(cfg)
     }
 
+    /// Release builds always use the copy compiled in by `include_str!`, so a
+    /// shipped binary is self-contained and cannot be reconfigured by dropping a
+    /// file next to it.
+    ///
+    /// Debug builds read `app.toml` from the source tree instead, because every
+    /// change to it otherwise costs a full rebuild — and iterating on a settings
+    /// schema or a menu means changing it constantly. `CARGO_MANIFEST_DIR` is
+    /// baked in at compile time, so this reads the same file that would have
+    /// been embedded, not something in the current directory.
+    ///
+    /// A debug build with an unreadable or absent `app.toml` falls back to the
+    /// embedded copy rather than failing: the embedded one is what a release
+    /// would have used, so falling back can only make debug behave *more* like
+    /// release.
     pub fn load() -> Result<Self, String> {
-        Self::from_str(EMBEDDED_CONFIG)
+        Self::from_str(&Self::source())
+    }
+
+    #[cfg(debug_assertions)]
+    fn source() -> String {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("app.toml");
+        match std::fs::read_to_string(&path) {
+            Ok(text) => {
+                if text != EMBEDDED_CONFIG {
+                    // Worth saying out loud: the running config is not the one
+                    // compiled in, so anything reported about it refers to disk.
+                    eprintln!(
+                        "config: reloaded {} (differs from the embedded copy)",
+                        path.display()
+                    );
+                }
+                text
+            }
+            Err(e) => {
+                eprintln!(
+                    "config: {} unreadable ({e}), using the embedded copy",
+                    path.display()
+                );
+                EMBEDDED_CONFIG.to_string()
+            }
+        }
+    }
+
+    #[cfg(not(debug_assertions))]
+    fn source() -> String {
+        EMBEDDED_CONFIG.to_string()
     }
 
     pub fn settings_enabled(&self) -> bool {
@@ -774,6 +818,86 @@ mod tests {
             minimal()
         );
         assert!(AppConfig::from_str(&ok).is_ok());
+    }
+
+    #[test]
+    fn the_two_manifests_agree_on_identity() {
+        // The app's display name and identifier are declared twice: app.toml
+        // for the running host, Cargo.toml's packager metadata for the
+        // installers. Nothing can interpolate between them -- cargo-packager
+        // reads Cargo.toml, the host reads app.toml -- so the duplication is
+        // structural. This is what stops it drifting: rename them together
+        // (`cargo run --bin rename`) or this fails.
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let cargo = std::fs::read_to_string(root.join("Cargo.toml")).unwrap();
+        let app = AppConfig::from_str(&std::fs::read_to_string(root.join("app.toml")).unwrap())
+            .expect("app.toml parses");
+
+        let packager = cargo
+            .split("[package.metadata.packager]")
+            .nth(1)
+            .expect("Cargo.toml has a [package.metadata.packager] table");
+        let value_of = |key: &str| -> String {
+            packager
+                .lines()
+                .take_while(|l| !l.starts_with("[package.metadata.packager."))
+                .find_map(|l| l.trim().strip_prefix(&format!("{key} = ")))
+                .unwrap_or_else(|| panic!("no {key} in [package.metadata.packager]"))
+                .trim()
+                .trim_matches('"')
+                .to_string()
+        };
+
+        assert_eq!(
+            value_of("product-name"),
+            app.app.name,
+            "Cargo.toml product-name and app.toml [app].name disagree"
+        );
+        assert_eq!(
+            value_of("identifier"),
+            app.app.identifier,
+            "Cargo.toml identifier and app.toml [app].identifier disagree -- \
+             the installer and the data directory would use different names"
+        );
+    }
+
+    #[test]
+    fn a_debug_build_reads_app_toml_from_disk() {
+        // The whole point of the reload: in a debug build the running config
+        // comes from the file, so editing it does not need a rebuild. In a
+        // release build it must come from the embedded copy, so a shipped binary
+        // cannot be reconfigured by dropping a file beside it.
+        let on_disk = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("app.toml"),
+        )
+        .expect("app.toml is readable from the manifest dir");
+
+        let src = AppConfig::source();
+        if cfg!(debug_assertions) {
+            assert_eq!(src, on_disk, "debug builds must read app.toml from disk");
+        } else {
+            assert_eq!(
+                src, EMBEDDED_CONFIG,
+                "release builds must use the embedded copy"
+            );
+        }
+        // Either way it has to parse -- a reload that produced an invalid config
+        // would turn a typo into a failure to start.
+        AppConfig::from_str(&src).expect("the config source parses");
+    }
+
+    #[test]
+    fn the_embedded_copy_matches_the_file_on_disk() {
+        // include_str! and the disk file are the same bytes, so debug and
+        // release builds agree unless someone has edited app.toml since the last
+        // compile -- which is exactly the situation the reload exists to serve.
+        // Asserting it here means CI, which always builds fresh, catches a
+        // committed app.toml that fails to parse or drifts from what ships.
+        let on_disk = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("app.toml"),
+        )
+        .unwrap();
+        assert_eq!(on_disk, EMBEDDED_CONFIG);
     }
 
     #[test]
