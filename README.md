@@ -82,6 +82,16 @@ This builds the host, validates the embedded `app.toml`, starts the
 internal loopback server, optionally launches and health-checks `[server]`,
 and opens Chrome in app mode against the configured (or placeholder) page.
 
+To open Chrome's devtools alongside the app:
+
+```bash
+APP_DEVTOOLS=1 cargo run
+```
+
+Per run rather than a config key, so it cannot be committed on by accident.
+Only the exact value `1` enables it — `APP_DEVTOOLS=0` reads as off. It works in
+release builds too: diagnosing one is exactly when it is wanted.
+
 ## 3. Configuration reference
 
 All configuration lives in `app.toml` at the repo root and is embedded into
@@ -330,6 +340,10 @@ subdirectory named after `[app].identifier`:
 | Windows | `%APPDATA%` |
 | macOS | `~/Library/Application Support` |
 | Linux | `~/.local/share` |
+
+The tray menu's **Open Logs** entry opens `logs/` in your file manager. It sits
+above *Restart App* on purpose: the logs are what to look at before restarting
+something that is misbehaving.
 
 Under `<base>/<identifier>/` (the `RuntimePaths` the host computes at
 startup):

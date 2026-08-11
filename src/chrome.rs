@@ -65,6 +65,15 @@ pub fn find_chrome() -> Option<PathBuf> {
     find_first_existing(&candidates(), |p| p.is_file())
 }
 
+/// Split out from `launch_args` so it can be tested without touching process
+/// environment, which is global and would race the other tests.
+///
+/// Exactly `"1"` rather than "any value": `APP_DEVTOOLS=0` and `APP_DEVTOOLS=`
+/// both read as off, which is what someone disabling it will write.
+fn devtools_requested(value: Option<&std::ffi::OsStr>) -> bool {
+    value.is_some_and(|v| v == "1")
+}
+
 pub fn launch_args(url: &str, profile_dir: &Path, width: u32, height: u32) -> Vec<OsString> {
     let mut user_data_dir = OsString::from("--user-data-dir=");
     user_data_dir.push(profile_dir.as_os_str());
@@ -75,6 +84,13 @@ pub fn launch_args(url: &str, profile_dir: &Path, width: u32, height: u32) -> Ve
         "--no-default-browser-check".into(),
         format!("--window-size={width},{height}").into(),
     ];
+    // Opt-in per run rather than a config key, so it cannot be committed on by
+    // accident: `APP_DEVTOOLS=1 cargo run`. Not restricted to debug builds --
+    // diagnosing a release build is exactly when it is wanted, and the page can
+    // already reach everything devtools would show it.
+    if devtools_requested(std::env::var_os("APP_DEVTOOLS").as_deref()) {
+        args.push("--auto-open-devtools-for-tabs".into());
+    }
     // WM_CLASS is how a Linux desktop matches a window to its `.desktop` entry,
     // and so to its icon and its taskbar grouping. cargo-packager names that file
     // after the main binary (`hitch.desktop`), so the class has to be that exact
@@ -161,6 +177,32 @@ mod tests {
         let found = find_first_existing(&paths, |p| p.ends_with("b") || p.ends_with("c"));
         assert_eq!(found, Some(PathBuf::from("/b")));
         assert_eq!(find_first_existing(&paths, |_| false), None);
+    }
+
+    #[test]
+    fn devtools_is_off_unless_explicitly_asked_for() {
+        use std::ffi::OsStr;
+        assert!(devtools_requested(Some(OsStr::new("1"))));
+        // Everything else is off, including the values someone reaches for to
+        // turn it back off.
+        assert!(!devtools_requested(None));
+        assert!(!devtools_requested(Some(OsStr::new("0"))));
+        assert!(!devtools_requested(Some(OsStr::new(""))));
+        assert!(!devtools_requested(Some(OsStr::new("true"))));
+    }
+
+    #[test]
+    fn the_devtools_flag_is_absent_from_a_normal_launch() {
+        // The flag opens a devtools pane over the app on every window. Shipping
+        // it on by accident would be very visible, so assert the default.
+        let args: Vec<String> = launch_args("http://x/", Path::new("/p"), 800, 600)
+            .iter()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        assert!(
+            !args.iter().any(|a| a.contains("devtools")),
+            "devtools flag present by default: {args:?}"
+        );
     }
 
     #[test]

@@ -311,6 +311,33 @@ fn run(
                     Some(tray::TrayAction::OpenUrl(url)) => {
                         let _ = open::that(url);
                     }
+                    // The directory rather than a file: which log matters
+                    // depends on what went wrong, and the host cannot know.
+                    // Created first — it exists as soon as anything has logged,
+                    // but opening a path that does not exist yet would look like
+                    // the menu entry is broken.
+                    Some(tray::TrayAction::OpenLogs) => {
+                        let dir = &app.paths.logs_dir;
+                        if let Err(e) = std::fs::create_dir_all(dir) {
+                            dialog(
+                                &app.cfg.app.name,
+                                &format!(
+                                    "Cannot create the log directory:\n{}\n\n{e}",
+                                    dir.display()
+                                ),
+                            );
+                        } else if let Err(e) = open::that(dir) {
+                            // No file manager, or a headless session. Showing the
+                            // path is still useful — it is what the user needs.
+                            dialog(
+                                &app.cfg.app.name,
+                                &format!(
+                                    "Logs are in:\n{}\n\nCould not open it: {e}",
+                                    dir.display()
+                                ),
+                            );
+                        }
+                    }
                     None => {}
                 }
             }

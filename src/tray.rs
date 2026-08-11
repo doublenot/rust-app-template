@@ -9,6 +9,10 @@ pub enum TrayAction {
     OpenUrl(String),
     Settings,
     GitSync,
+    /// Opens the log directory in the desktop's file manager. The logs are the
+    /// first thing anyone wants when the app will not start, and until now the
+    /// only way to find them was to read §6 of the README.
+    OpenLogs,
     Restart,
     Quit,
 }
@@ -42,6 +46,9 @@ pub fn menu_model(
     if show_sync {
         out.push(Entry::Action(TrayAction::GitSync, "Sync now".to_string()));
     }
+    // Above Restart deliberately: restarting is the thing someone reaches for
+    // when it is misbehaving, and the logs are what they should look at first.
+    out.push(Entry::Action(TrayAction::OpenLogs, "Open Logs".to_string()));
     out.push(Entry::Action(
         TrayAction::Restart,
         "Restart App".to_string(),
@@ -177,6 +184,37 @@ mod tests {
     }
 
     #[test]
+    fn open_logs_sits_above_restart() {
+        // Ordering is the point: someone whose app is misbehaving reaches for
+        // Restart, and the logs are what they should look at first.
+        let m = menu_model(&menu_cfg(), "My App", true, true, true);
+        let logs = m
+            .iter()
+            .position(|e| matches!(e, Entry::Action(TrayAction::OpenLogs, _)))
+            .expect("no Open Logs entry");
+        let restart = m
+            .iter()
+            .position(|e| matches!(e, Entry::Action(TrayAction::Restart, _)))
+            .expect("no Restart entry");
+        assert!(logs < restart, "Open Logs must come before Restart: {m:?}");
+    }
+
+    #[test]
+    fn open_logs_is_present_even_in_the_most_minimal_menu() {
+        // Unlike Settings and Sync, it is not conditional on a feature: the logs
+        // exist for every configuration, including the one that is failing to
+        // start.
+        let bare = MenuSection {
+            settings: false,
+            items: vec![],
+        };
+        let m = menu_model(&bare, "App", false, false, false);
+        assert!(m
+            .iter()
+            .any(|e| matches!(e, Entry::Action(TrayAction::OpenLogs, _))));
+    }
+
+    #[test]
     fn full_model_order() {
         let m = menu_model(&menu_cfg(), "My App", true, true, true);
         let expected = vec![
@@ -187,6 +225,7 @@ mod tests {
             ),
             Entry::Action(TrayAction::Settings, "Settings…".to_string()),
             Entry::Action(TrayAction::GitSync, "Sync now".to_string()),
+            Entry::Action(TrayAction::OpenLogs, "Open Logs".to_string()),
             Entry::Action(TrayAction::Restart, "Restart App".to_string()),
             Entry::Separator,
             Entry::Action(TrayAction::Quit, "Quit".to_string()),
@@ -202,6 +241,7 @@ mod tests {
         };
         let m = menu_model(&empty, "X", false, false, false);
         let expected = vec![
+            Entry::Action(TrayAction::OpenLogs, "Open Logs".to_string()),
             Entry::Action(TrayAction::Restart, "Restart App".to_string()),
             Entry::Separator,
             Entry::Action(TrayAction::Quit, "Quit".to_string()),
@@ -222,6 +262,7 @@ mod tests {
             m,
             vec![
                 Entry::Action(TrayAction::GitSync, "Sync now".to_string()),
+                Entry::Action(TrayAction::OpenLogs, "Open Logs".to_string()),
                 Entry::Action(TrayAction::Restart, "Restart App".to_string()),
                 Entry::Separator,
                 Entry::Action(TrayAction::Quit, "Quit".to_string()),
